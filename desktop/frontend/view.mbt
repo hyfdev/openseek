@@ -54,16 +54,18 @@ fn setting_row(
 }
 
 ///|
-/// A titled run of settings rows under an uppercase heading, mirroring the
-/// Skills page's "Installed" / "Mooncakes registry" sections.
-fn settings_group(title : String, rows : Array[@html.Html]) -> @html.Html {
-  let children : Array[@html.Html] = [
-    @html.div(class="settings-group-title", title),
-  ]
-  for row in rows {
-    children.push(row)
-  }
-  @html.div(class="settings-group", children)
+/// A titled card of rows: an accent-tinted icon and heading above a bordered
+/// surface, the design system's settings section. Shared with the Skills
+/// page so the two pages read as siblings.
+fn settings_group(
+  icon_markup : String,
+  title : String,
+  rows : Array[@html.Html],
+) -> @html.Html {
+  @html.div(class="settings-group", [
+    @html.div(class="settings-group-head", [icon(icon_markup), @html.h2(title)]),
+    @html.div(class="settings-group-card", rows),
+  ])
 }
 
 ///|
@@ -1011,7 +1013,7 @@ fn transcript_item_view(
         )
       }
       @html.div(class="msg", [
-        @html.div(class="avatar agent", "✦"),
+        @html.div(class="avatar agent", [icon(icon_logo)]),
         @html.div(class="msg-body", [
           @html.div(class="msg-role", "openseek"),
           content,
@@ -1063,7 +1065,7 @@ fn streaming_response_view(
   on_open : (String) -> @cmd.Cmd,
 ) -> @html.Html {
   @html.div(class="msg streaming", [
-    @html.div(class="avatar agent", "✦"),
+    @html.div(class="avatar agent", [icon(icon_logo)]),
     @html.div(class="msg-body", [
       @html.div(class="msg-role", "openseek"),
       @html.div(
@@ -1085,7 +1087,7 @@ fn transcript_view(
   if conv.messages.is_empty() {
     items.push(
       @html.div(class="empty", [
-        @html.div(class="empty-badge", "✦"),
+        @html.div(class="empty-badge", [icon(icon_logo)]),
         @html.div(class="empty-title", "What should we build?"),
         @html.div(
           class="empty-sub",
@@ -1701,9 +1703,9 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
     )
   }
   let groups : Array[@html.Html] = [
-    settings_group("Model", model_rows),
-    settings_group("API", api_rows),
-    settings_group("Interface", [
+    settings_group(icon_sparkle, "Model", model_rows),
+    settings_group(icon_key, "API", api_rows),
+    settings_group(icon_layout, "Interface", [
       setting_row(
         "Notification corner",
         [corner_select(dispatch, model.notification_corner)],
@@ -1715,7 +1717,7 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
         desc="Where the editor panel docks its file tree.",
       ),
     ]),
-    settings_group("Updates", [
+    settings_group(icon_sync, "Updates", [
       setting_row(
         "Update channel",
         [channel_select(dispatch, model.update_channel)],
@@ -1767,11 +1769,12 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
         ),
       )
     }
-    groups.push(settings_group("Engine", engine_rows))
+    groups.push(settings_group(icon_terminal, "Engine", engine_rows))
   }
   @html.section(class="settings-page", [
     @html.div(class="settings-page-inner", [
       @html.div(class="settings-header", [
+        @html.div(class="page-eyebrow", "Preferences"),
         @html.h1("Settings"),
         @html.div(
           class="settings-subtitle",
@@ -1904,37 +1907,38 @@ fn skill_matches(query : String, fields : Array[String]) -> Bool {
 fn skills_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
   let sections : Array[@html.Html] = [
     @html.div(class="skills-header", [
+      @html.div(class="page-eyebrow", "Library"),
       @html.h1("Skills"),
       @html.div(
         class="skills-subtitle",
         "Playbooks the agent reads when a task matches. Skills apply to new chats.",
       ),
     ]),
-    @html.input(
-      input_type=@html.InputType::Search,
-      value=model.skills_query,
-      placeholder="Search skills",
-      on_input=dispatch.map(value => SkillsQueryChanged(value)),
-      attrs=@html.Attrs::build().class("skills-search"),
-    ),
+    @html.div(class="skills-search", [
+      icon(icon_search),
+      @html.input(
+        input_type=@html.InputType::Search,
+        value=model.skills_query,
+        placeholder="Search skills…",
+        on_input=dispatch.map(value => SkillsQueryChanged(value)),
+      ),
+    ]),
   ]
   if !model.skills_notice.is_empty() {
     sections.push(@html.div(class="skills-notice danger", model.skills_notice))
   }
-  sections.push(@html.div(class="skills-heading", "Installed"))
-  let mut listed = 0
+  let installed_rows : Array[@html.Html] = []
   for skill in model.installed_skills {
     if skill_matches(model.skills_query, [
         skill.name,
         skill.description,
         skill.source,
       ]) {
-      sections.push(installed_skill_row(dispatch, model, skill))
-      listed = listed + 1
+      installed_rows.push(installed_skill_row(dispatch, model, skill))
     }
   }
-  if listed == 0 {
-    sections.push(
+  if installed_rows.is_empty() {
+    installed_rows.push(
       @html.div(
         class="skills-empty",
         if model.installed_skills.is_empty() {
@@ -1945,28 +1949,27 @@ fn skills_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
       ),
     )
   }
-  sections.push(@html.div(class="skills-heading", "Mooncakes registry"))
+  sections.push(settings_group(icon_extensions, "Installed", installed_rows))
+  let market_rows : Array[@html.Html] = []
   match model.skills_catalog {
     CatalogIdle | CatalogLoading =>
-      sections.push(
+      market_rows.push(
         @html.div(class="skills-empty", "Loading the skill catalog…"),
       )
     CatalogFailed(message) =>
-      sections.push(@html.div(class="skills-empty danger", message))
+      market_rows.push(@html.div(class="skills-empty danger", message))
     CatalogReady(items) => {
-      let mut shown = 0
       for item in items {
         if skill_matches(model.skills_query, [
             item.name,
             item.description,
             item.author,
           ]) {
-          sections.push(market_skill_row(dispatch, model, item))
-          shown = shown + 1
+          market_rows.push(market_skill_row(dispatch, model, item))
         }
       }
-      if shown == 0 {
-        sections.push(
+      if market_rows.is_empty() {
+        market_rows.push(
           @html.div(
             class="skills-empty",
             if items.is_empty() {
@@ -1979,6 +1982,7 @@ fn skills_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
       }
     }
   }
+  sections.push(settings_group(icon_package, "Mooncakes registry", market_rows))
   @html.section(class="skills-page", [
     @html.div(class="skills-page-inner", sections),
   ])
@@ -2127,7 +2131,6 @@ fn topbar_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
       ),
     )
   }
-  items.push(@html.span(class="topbar-icon", "✦"))
   items.push(
     @html.span(
       class="topbar-title",

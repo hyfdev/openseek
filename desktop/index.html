@@ -1120,12 +1120,6 @@
         margin-left: 0;
       }
 
-      .topbar-icon {
-        color: var(--accent);
-        font-size: 14px;
-        line-height: 1;
-      }
-
       .topbar-title {
         min-width: 0;
         max-width: 52%;
@@ -1369,8 +1363,10 @@
         background: var(--accent-soft);
         border: 1px solid var(--accent-line);
         color: var(--accent);
-        font-size: 24px;
-        line-height: 1;
+      }
+      .empty-badge .icon {
+        width: 30px;
+        height: 30px;
       }
       .empty-title {
         font-size: 16px;
@@ -2214,19 +2210,28 @@
       .settings-page-inner {
         display: grid;
         align-content: start;
-        gap: 18px;
+        gap: 24px;
         max-width: 720px;
         margin: 0 auto;
       }
 
+      /* the design's page header: mono eyebrow, then a large tight title */
+      .page-eyebrow {
+        color: var(--ink-3);
+        font-size: 10.5px;
+        font-weight: 500;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
       .settings-header {
         display: grid;
-        gap: 6px;
-        margin-bottom: 6px;
+        gap: 7px;
+        margin-bottom: 4px;
       }
 
       .settings-header h1 {
-        font-size: 22px;
+        font-size: 26px;
         letter-spacing: -0.02em;
       }
 
@@ -2240,40 +2245,57 @@
 
       .settings-subtitle {
         color: var(--ink-3);
-        font-size: 13px;
+        font-size: 12.5px;
       }
 
       .settings {
         display: grid;
         align-content: start;
-        gap: 20px;
+        gap: 26px;
       }
 
+      /* a section: accent icon + heading above a bordered surface card */
       .settings-group {
         display: grid;
-        gap: 4px;
+        gap: 7px;
       }
 
-      .settings-group-title {
-        color: var(--ink-3);
-        font-size: 10.5px;
-        font-weight: 500;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-        margin-bottom: 2px;
+      .settings-group-head {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+      }
+
+      .settings-group-head .icon {
+        width: 15px;
+        height: 15px;
+        color: var(--accent);
+      }
+
+      .settings-group-head h2 {
+        font-size: 14px;
+        letter-spacing: -0.01em;
+        white-space: nowrap;
+      }
+
+      .settings-group-card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 2px 18px;
       }
 
       .setting-row {
         display: flex;
-        gap: 14px;
+        gap: 16px;
         align-items: center;
         justify-content: space-between;
-        padding: 9px 2px;
-        border-radius: var(--radius-sm);
+        padding: 14px 0;
       }
 
-      .setting-row:hover {
-        background: var(--surface-2);
+      .setting-row + .setting-row,
+      .settings-group-card .skill-row + .skill-row {
+        border-top: 1px solid var(--line-2);
       }
 
       .setting-row.stack {
@@ -2291,12 +2313,12 @@
 
       .setting-name {
         font-size: 13px;
-        font-weight: 600;
       }
 
       .setting-desc {
-        color: var(--ink-2);
-        font-size: 12px;
+        color: var(--ink-3);
+        font-size: 11.5px;
+        line-height: 1.5;
       }
 
       /* A row's controls sit on one line, hugging the right edge; a lone
@@ -2335,11 +2357,20 @@
         letter-spacing: -0.01em;
       }
 
+      /* Fields signal focus like the design does — the border tints accent —
+         instead of growing a heavy outline ring. */
       input:focus,
       textarea:focus,
       select:focus {
-        outline: 2px solid var(--accent);
-        outline-offset: 1px;
+        outline: none;
+        border-color: var(--accent);
+      }
+
+      /* Settings controls sit inside a card, so they read best compact. */
+      .setting-control select,
+      .setting-control input {
+        padding: 7px 10px;
+        font-size: 12.5px;
       }
 
       /* ---------- skills page ---------- */
@@ -2353,30 +2384,59 @@
       .skills-page-inner {
         display: grid;
         align-content: start;
-        gap: 12px;
+        gap: 20px;
         max-width: 720px;
         margin: 0 auto;
       }
 
       .skills-header {
         display: grid;
-        gap: 6px;
-        margin-bottom: 6px;
+        gap: 7px;
+        margin-bottom: 4px;
       }
 
       .skills-header h1 {
-        font-size: 22px;
+        font-size: 26px;
         letter-spacing: -0.02em;
       }
 
       .skills-subtitle {
         color: var(--ink-3);
-        font-size: 13px;
+        font-size: 12.5px;
       }
 
+      /* the design's search field: an icon and a bare input on a surface */
       .skills-search {
-        padding: 10px 12px;
-        margin-bottom: 8px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        max-width: 420px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        padding: 9px 13px;
+        color: var(--ink-3);
+      }
+
+      .skills-search:focus-within {
+        border-color: var(--accent-line);
+      }
+
+      .skills-search .icon {
+        width: 15px;
+        height: 15px;
+      }
+
+      .skills-search input {
+        flex: 1;
+        border: none;
+        background: transparent;
+        padding: 0;
+        border-radius: 0;
+      }
+
+      .skills-search input:focus {
+        outline: none;
       }
 
       .skill-check {
@@ -2388,35 +2448,25 @@
       .skill-avatar {
         display: grid;
         place-items: center;
-        width: 34px;
-        height: 34px;
+        width: 30px;
+        height: 30px;
         flex-shrink: 0;
         border: 1px solid var(--line);
-        border-radius: 10px;
+        border-radius: 8px;
         background: var(--surface-2);
-        color: var(--ink-3);
-        font-size: 15px;
+        color: var(--ink-2);
       }
 
-      .skills-heading {
-        color: var(--ink-3);
-        font-size: 10.5px;
-        font-weight: 500;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-        margin-top: 6px;
+      .skill-avatar .icon {
+        width: 15px;
+        height: 15px;
       }
 
       .skill-row {
         display: flex;
-        gap: 14px;
+        gap: 13px;
         align-items: center;
-        padding: 9px 2px;
-        border-radius: var(--radius-sm);
-      }
-
-      .skill-row:hover {
-        background: var(--surface-2);
+        padding: 13px 0;
       }
 
       .skill-info {
@@ -2428,13 +2478,13 @@
 
       .skill-name {
         font-size: 13px;
-        font-weight: 600;
         overflow-wrap: anywhere;
       }
 
       .skill-desc {
-        color: var(--ink-2);
-        font-size: 12px;
+        color: var(--ink-3);
+        font-size: 11.5px;
+        line-height: 1.5;
       }
 
       .skill-meta {
@@ -2451,6 +2501,10 @@
       .skills-notice {
         color: var(--ink-3);
         font-size: 12px;
+      }
+
+      .settings-group-card .skills-empty {
+        padding: 14px 0;
       }
 
       .pill {
