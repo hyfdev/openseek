@@ -71,9 +71,15 @@ fn UpdateChannelPayload::to_channel(
 /// each kind is worth a different amount of noise: `broken` can only be the
 /// publisher's fault (toast material), `malformed` also happens under
 /// captive portals (log material), `unreachable` is routine offline life.
+/// An available release carries an optional actionable reason when this
+/// installation itself cannot be replaced.
 priv enum CheckUpdateReply {
   UpToDate
-  Available(version~ : String, installable~ : Bool)
+  Available(
+    version~ : String,
+    installable~ : Bool,
+    unavailable_reason~ : String?
+  )
   Unreachable(reason~ : String)
   Malformed(reason~ : String)
   Broken(version~ : String, reason~ : String)
@@ -83,8 +89,18 @@ priv enum CheckUpdateReply {
 impl ToJson for CheckUpdateReply with fn to_json(self) {
   match self {
     UpToDate => { "kind": "up_to_date" }
-    Available(version~, installable~) =>
-      { "kind": "available", "version": version, "installable": installable }
+    Available(version~, installable~, unavailable_reason~) => {
+      let unavailable_reason = match unavailable_reason {
+        Some(reason) => Json::string(reason)
+        None => Json::null()
+      }
+      {
+        "kind": "available",
+        "version": version,
+        "installable": installable,
+        "unavailable_reason": unavailable_reason,
+      }
+    }
     Unreachable(reason~) => { "kind": "unreachable", "reason": reason }
     Malformed(reason~) => { "kind": "malformed", "reason": reason }
     Broken(version~, reason~) =>
@@ -94,8 +110,10 @@ impl ToJson for CheckUpdateReply with fn to_json(self) {
 
 ///|
 /// Ask the channel's manifest for a newer release. `installable` reports
-/// whether `download_update` would work here: a real signed .app bundle
-/// with a package published for this platform.
+/// whether `download_update` would work here: a real signed .app bundle in a
+/// replaceable location, with a package published for this platform. Only a
+/// failed installation preflight carries `unavailable_reason`; a platform
+/// without a package remains the existing informational fallback.
 async fn check_update_op(
   state : UpdateState,
   payload : UpdateChannelPayload,
@@ -122,11 +140,18 @@ async fn check_update_op(
     error => raise error
   }
   guard info is Some(info) else { return UpToDate }
+  let unavailable_reason = if info.artifact is Some(_) &&
+    state.work_dir is Some(_) &&
+    state.bundle_path is Some(bundle) {
+    @update.self_update_unavailable_reason(bundle_path=bundle)
+  } else {
+    None
+  }
   let installable = info.artifact is Some(_) &&
     state.work_dir is Some(_) &&
-    state.bundle_path is Some(bundle) &&
-    @update.can_self_update(bundle_path=bundle)
-  Available(version=info.version, installable~)
+    state.bundle_path is Some(_) &&
+    unavailable_reason is None
+  Available(version=info.version, installable~, unavailable_reason~)
 }
 
 ///|

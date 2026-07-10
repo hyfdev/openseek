@@ -115,12 +115,41 @@ pub async fn check_for_update(
 }
 
 ///|
-/// Whether this installation can swap a downloaded bundle in by itself:
-/// it must be a real .app bundle signed by a Developer ID team — the same
-/// requirement `stage_update` enforces, checked here so a "can I install"
-/// answer never turns into a download that was doomed from the start.
-pub async fn can_self_update(bundle_path~ : String) -> Bool {
-  team_identifier(bundle_path) is Some(_)
+/// The actionable explanation shared by the capability check and the final
+/// apply-time check when the running bundle's directory cannot be changed.
+const BundleReplacementFailureMessage : String = "OpenSeek cannot replace the app in its current location. Move OpenSeek Desktop.app to Applications, reopen it, and try again."
+
+///|
+/// Why `bundle_path` cannot be renamed within its current directory. Rename
+/// permission belongs to the parent directory, not to the bundle itself; both
+/// write and search access are required. A read-only filesystem reports an
+/// error rather than `false`, so every non-cancellation failure has the same
+/// concise, actionable user-facing answer.
+async fn bundle_replacement_failure(bundle_path : String) -> String? {
+  let parent = @path.Path(bundle_path).dirname().to_string()
+  let replaceable = (@fs.can_write(parent) && @fs.can_execute(parent)) catch {
+    error if @async.is_being_cancelled() => raise error
+    _ => false
+  }
+  if replaceable {
+    None
+  } else {
+    Some(BundleReplacementFailureMessage)
+  }
+}
+
+///|
+/// Why this installation cannot swap a downloaded bundle in by itself, or
+/// None when it can: it must be a real .app bundle signed by a Developer ID
+/// team and its containing directory must permit replacement. This is a UI
+/// preflight only; `apply_staged` checks the directory again immediately
+/// before touching the running bundle.
+pub async fn self_update_unavailable_reason(bundle_path~ : String) -> String? {
+  if team_identifier(bundle_path) is Some(_) {
+    bundle_replacement_failure(bundle_path)
+  } else {
+    Some("The running OpenSeek bundle is not Developer ID signed.")
+  }
 }
 
 ///|

@@ -8,11 +8,11 @@ import {
 // Values
 pub async fn apply_staged(staged_app~ : String, bundle_path~ : String) -> Unit
 
-pub async fn can_self_update(bundle_path~ : String) -> Bool
-
 pub async fn check_for_update(current~ : String, channel~ : UpdateChannel) -> UpdateInfo?
 
 pub async fn cleanup_leftovers(work_dir~ : String, bundle_path~ : String) -> Unit
+
+pub async fn self_update_unavailable_reason(bundle_path~ : String) -> String?
 
 pub async fn stage_update(UpdateInfo, work_dir~ : String, bundle_path~ : String) -> StagedUpdate
 

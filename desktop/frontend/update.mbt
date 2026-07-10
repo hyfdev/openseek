@@ -810,11 +810,15 @@ fn update_msg(
         return (@cmd.none, model)
       }
       match result {
-        CheckFound(version~, installable~) =>
-          (
-            @cmd.none,
-            { ..model, update_ux: UpdateAvailable(version~, installable~) },
-          )
+        CheckFound(version~, installable~, unavailable_reason~) => {
+          let (cmd, next) = if !installable &&
+            unavailable_reason is Some(reason) {
+            model.notify_error(dispatch, reason)
+          } else {
+            (@cmd.none, model)
+          }
+          (cmd, { ..next, update_ux: UpdateAvailable(version~, installable~) })
+        }
         CheckUpToDate =>
           (
             @cmd.none,
@@ -919,12 +923,15 @@ fn update_msg(
         (@cmd.none, model)
       }
     UpdateFailed(message~) => {
-      // Download or swap failed: say why, and put the button back so the
-      // user can retry.
+      // A failed download can be retried. A failed swap means the preflight
+      // no longer considers this location replaceable, so withdraw the
+      // button until a fresh check says otherwise. Both failures say why.
       let (cmd, next) = model.notify_error(dispatch, message)
       let update_ux = match next.update_ux {
-        DownloadingUpdate(version~) | RestartingForUpdate(version~) =>
+        DownloadingUpdate(version~) =>
           UpdateAvailable(version~, installable=true)
+        RestartingForUpdate(version~) =>
+          UpdateAvailable(version~, installable=false)
         other => other
       }
       (cmd, { ..next, update_ux, })
@@ -3378,13 +3385,65 @@ test "a startup check surfaces an installable release as the Update button" {
   let (_, model) = update(
     dispatch,
     UpdateCheckFinished(
-      result=CheckFound(version="0.2.0", installable=true),
+      result=CheckFound(
+        version="0.2.0",
+        installable=true,
+        unavailable_reason=None,
+      ),
       explicit=false,
     ),
     test_model(),
   )
   assert_true(
     model.update_ux is UpdateAvailable(version="0.2.0", installable=true),
+  )
+  assert_eq(model.notifications.length(), 0)
+}
+
+///|
+test "an unavailable startup update reports why without offering Update" {
+  let dispatch = test_dispatch()
+  let model = test_model()
+  let msg = UpdateCheckFinished(
+    result=CheckFound(
+      version="0.2.0",
+      installable=false,
+      unavailable_reason=Some("Move OpenSeek Desktop.app to Applications."),
+    ),
+    explicit=false,
+  )
+  let (_, first) = update(dispatch, msg, model)
+  let (_, replayed) = update(dispatch, msg, model)
+  for result in [first, replayed] {
+    assert_true(
+      result.update_ux is UpdateAvailable(version="0.2.0", installable=false),
+    )
+    assert_eq(result.notifications.length(), 1)
+    inspect(
+      result.notifications[0].message,
+      content="Move OpenSeek Desktop.app to Applications.",
+    )
+    assert_eq(result.notification_seq, 1)
+  }
+}
+
+///|
+test "a package-less release stays informational" {
+  let dispatch = test_dispatch()
+  let (_, model) = update(
+    dispatch,
+    UpdateCheckFinished(
+      result=CheckFound(
+        version="0.2.0",
+        installable=false,
+        unavailable_reason=None,
+      ),
+      explicit=false,
+    ),
+    test_model(),
+  )
+  assert_true(
+    model.update_ux is UpdateAvailable(version="0.2.0", installable=false),
   )
   assert_eq(model.notifications.length(), 0)
 }
@@ -3495,6 +3554,26 @@ test "a failed download says why and restores the offer" {
 }
 
 ///|
+test "a failed apply says why and withdraws the offer" {
+  let dispatch = test_dispatch()
+  let restarting = {
+    ..test_model(),
+    update_ux: RestartingForUpdate(version="0.2.0"),
+  }
+  let msg = UpdateFailed(message="the app location became read-only")
+  let (_, first) = update(dispatch, msg, restarting)
+  let (_, replayed) = update(dispatch, msg, restarting)
+  for failed in [first, replayed] {
+    assert_eq(failed.notifications.length(), 1)
+    assert_true(failed.notifications[0].message.contains("read-only"))
+    assert_eq(failed.notification_seq, 1)
+    assert_true(
+      failed.update_ux is UpdateAvailable(version="0.2.0", installable=false),
+    )
+  }
+}
+
+///|
 test "a stale check reply cannot clobber a download in flight" {
   let dispatch = test_dispatch()
   let downloading = {
@@ -3532,9 +3611,23 @@ test "check_update replies decode by kind" {
   )
   assert_true(
     decode_update_check(
-      "{\"kind\":\"available\",\"version\":\"0.2.0\",\"installable\":true}",
+      "{\"kind\":\"available\",\"version\":\"0.2.0\",\"installable\":true,\"unavailable_reason\":null}",
     )
-    is Some(CheckFound(version="0.2.0", installable=true)),
+    is Some(
+      CheckFound(version="0.2.0", installable=true, unavailable_reason=None)
+    ),
+  )
+  assert_true(
+    decode_update_check(
+      "{\"kind\":\"available\",\"version\":\"0.2.0\",\"installable\":false,\"unavailable_reason\":\"move the app\"}",
+    )
+    is Some(
+      CheckFound(
+        version="0.2.0",
+        installable=false,
+        unavailable_reason=Some("move the app")
+      )
+    ),
   )
   // The host always writes `installable` on an `available` reply; one
   // without it is malformed rather than "not installable".

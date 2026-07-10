@@ -52,10 +52,15 @@ priv enum UpdateUx {
 ///|
 /// A decoded `check_update` reply. Kinds mirror the wire contract; see the
 /// host's `CheckUpdateReply` for what each means and how loud it deserves
-/// to be.
+/// to be. `unavailable_reason` is present only when this installation failed
+/// the host's replacement preflight; package-less platforms stay quiet.
 priv enum UpdateCheck {
   CheckUpToDate
-  CheckFound(version~ : String, installable~ : Bool)
+  CheckFound(
+    version~ : String,
+    installable~ : Bool,
+    unavailable_reason~ : String?
+  )
   CheckUnreachable(reason~ : String)
   CheckMalformed(reason~ : String)
   CheckBroken(version~ : String, reason~ : String)
@@ -77,7 +82,13 @@ fn decode_update_check(text : String) -> UpdateCheck? {
         @jsonx.json_bool(reply, "installable") is Some(installable) else {
         return None
       }
-      Some(CheckFound(version~, installable~))
+      Some(
+        CheckFound(
+          version~,
+          installable~,
+          unavailable_reason=@jsonx.json_text(reply, "unavailable_reason"),
+        ),
+      )
     }
     "unreachable" => reason.map(reason => CheckUnreachable(reason~))
     "malformed" => reason.map(reason => CheckMalformed(reason~))

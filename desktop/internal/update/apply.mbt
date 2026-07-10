@@ -30,6 +30,9 @@ pub async fn apply_staged(staged_app~ : String, bundle_path~ : String) -> Unit {
   guard @fs.exists(staged_app) else {
     raise UpdateError("the staged update disappeared; restart to try again")
   }
+  if bundle_replacement_failure(bundle_path) is Some(reason) {
+    raise UpdateError(reason)
+  }
   let aside = aside_path(bundle_path)
   remove_tree(aside)
   @fs.rename(bundle_path, aside) catch {

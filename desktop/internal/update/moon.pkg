@@ -7,6 +7,7 @@ import {
   "moonbitlang/core/debug",
   "moonbitlang/core/string",
   "moonbitlang/x/crypto",
+  "moonbitlang/x/path",
 }
 
 warnings = "+missing_doc+test_unqualified_package+unnecessary_annotation+unnecessary_view_op+ambiguous_range_direction+unqualified_local_using"
