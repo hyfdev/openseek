@@ -122,27 +122,17 @@ fn desktop_entry_source() -> String {
 }
 
 ///|
-fn icon_source() -> String {
-  let source =
-    #|<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
-    #|  <rect width="256" height="256" rx="48" fill="#1a1b26"/>
-    #|  <circle cx="128" cy="128" r="64" fill="none" stroke="#7aa2f7" stroke-width="16"/>
-    #|  <circle cx="128" cy="128" r="20" fill="#7aa2f7"/>
-    #|</svg>
-    #|
-  source
-}
-
-///|
 async fn write_bundle_metadata(ws : @packaging.Workspace) -> Unit {
   @packaging.write_text(ws.at(AppDirPath + "/AppRun"), apprun_source())
   @packaging.write_text(
     ws.at(AppDirPath + "/openseek-desktop.desktop"),
     desktop_entry_source(),
   )
-  @packaging.write_text(
+  // Checked-in icon: the design-system mark on the accent squircle (full-bleed
+  // variant; the macOS package carries the margined one).
+  @packaging.copy_file(
+    ws.at("package/linux/appicon.svg"),
     ws.at(AppDirPath + "/openseek-desktop.svg"),
-    icon_source(),
   )
   // appimagetool uses .DirIcon as the AppImage's embedded icon.
   @packaging.run_checked(

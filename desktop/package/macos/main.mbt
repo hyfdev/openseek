@@ -213,6 +213,13 @@ async fn copy_bundle_files(ws : @packaging.Workspace) -> Unit {
     ws.at(AppAssetDir + "/frontend.js"),
   )
   @packaging.copy_file(ws.at("viewer.css"), ws.at(AppAssetDir + "/viewer.css"))
+  // Checked-in icns built from appicon.svg (the design-system mark on the
+  // accent squircle). Regenerate with rsvg-convert at the iconset sizes and
+  // `iconutil -c icns` when the mark changes.
+  @packaging.copy_file(
+    ws.at("package/macos/AppIcon.icns"),
+    ws.at(ResourcesPath + "/AppIcon.icns"),
+  )
   // The codicon font is served at the site root (`/codicon.ttf`), so it sits
   // next to `viewer.css` rather than under `fonts/`.
   @packaging.copy_file(
@@ -368,6 +375,7 @@ fn info_plist_source() -> String {
     $|  <key>CFBundleDevelopmentRegion</key><string>en</string>
     $|  <key>CFBundleDisplayName</key><string>OpenSeek Desktop</string>
     $|  <key>CFBundleExecutable</key><string>openseek-desktop</string>
+    $|  <key>CFBundleIconFile</key><string>AppIcon</string>
     $|  <key>CFBundleIdentifier</key><string>\{AppBundleIdentifier}</string>
     $|  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     $|  <key>CFBundleName</key><string>OpenSeek Desktop</string>
