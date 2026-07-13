@@ -137,16 +137,18 @@ After the webview connects, the host fetches the hosted release manifest
 `internal/version` for the version it compares against) in the background.
 On macOS, when the manifest lists a `macos-arm64` package and the running
 bundle is Developer ID signed, the host downloads the zip, checks its
-sha256 against the manifest, extracts it, and verifies the new bundle's
-code signature carries the same team — only then does a sticky toast offer
-"restart and update". Clicking it swaps the bundle on disk (macOS allows
-renaming a running .app; the old one is parked as `<name>.app.old` and
-removed on the next launch), the window closes through the normal path,
-and `main` relaunches the new bundle via `open -n` after the run loop
-exits. Anything less than that fully verified path — other platforms, dev
-binaries, ad-hoc signatures, a failed download — degrades to a toast that
-opens the release page in the browser, and every check failure just means
-no toast at all.
+sha256 against the manifest, extracts it, and verifies that the new bundle is
+notarized and has a valid code signature from the same team — only then does a
+sticky toast offer "restart and update". The updater never removes the
+`com.apple.quarantine` attribute to bypass Gatekeeper. Clicking the toast swaps
+the bundle on disk (macOS allows renaming a running .app; the old one is parked
+as `<name>.app.old` and removed on the next launch), the window closes through
+the normal path, and `main` relaunches the new bundle via `open -n` after the
+run loop exits. If the current installation cannot be replaced, the Update
+button is not shown; a check or installation failure is reported in the
+bottom-right notification area. Anything less than the fully verified path —
+other platforms, dev binaries, or ad-hoc signatures — degrades to a toast that
+opens the release page in the browser.
 
 ## Prerequisites
 
@@ -338,7 +340,13 @@ The target machine also needs Microsoft WebView2 Runtime installed.
 
 `package/macos` runs all of the above (including the codegen bootstrap),
 builds the `openseek` engine from the monorepo's `cmd/openseek` source, and
-produces a signed `dist/OpenSeek Desktop.app` plus a zip:
+produces a signed app plus two distribution artifacts:
+
+- `dist/OpenSeek Desktop-macos-arm64.dmg` is for first-time installation. It
+  contains the app and an `/Applications` shortcut so users can install by
+  dragging the app into Applications.
+- `dist/OpenSeek Desktop-macos-arm64.zip` carries the same app for in-app
+  updates.
 
 ```sh
 moon run --target native package/macos
@@ -355,9 +363,9 @@ host initializes a writable copy under the per-user runtime directory before
 setting `MOON_HOME` for the engine.
 
 By default the bundle is ad-hoc signed: it runs on the build machine, but
-Gatekeeper quarantines it everywhere else. For distribution, sign with a
-Developer ID Application identity (hardened runtime and a secure timestamp
-are applied automatically) and optionally notarize:
+it is not a distributable build that Gatekeeper will trust on another machine.
+For distribution, sign with a Developer ID Application identity (hardened
+runtime and a secure timestamp are applied automatically) and notarize:
 
 ```sh
 # one-time: xcrun notarytool store-credentials openseek \
@@ -367,9 +375,14 @@ moon run --target native package/macos -- \
   --notarize openseek
 ```
 
-`--notarize` submits the zip with `notarytool --wait`, staples the ticket to
-the app, and rebuilds the zip; without it the app is signed but unnotarized
-(Gatekeeper still warns on other machines).
+`--notarize` submits only the signed DMG with `notarytool --wait`. Apple scans
+the DMG and its nested app in that single submission. After approval, the
+packager staples and validates tickets on both the built app and the DMG, then
+creates the final updater ZIP from that stapled app. The ZIP is therefore only
+a transport for the notarized app and is not submitted separately. Without
+`--notarize`, neither artifact is notarized; without `--sign`, the app is only
+ad-hoc signed and the DMG container is unsigned. Such outputs are not intended
+for distribution.
 
 ## Package (Linux)
 

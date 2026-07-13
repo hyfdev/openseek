@@ -5,6 +5,12 @@ const AppPath : String = "dist/OpenSeek Desktop.app"
 const ZipPath : String = "dist/OpenSeek Desktop-macos-arm64.zip"
 
 ///|
+const DmgPath : String = "dist/OpenSeek Desktop-macos-arm64.dmg"
+
+///|
+const DmgStagingPath : String = "dist/OpenSeek Desktop-dmg-root"
+
+///|
 const ContentsPath : String = AppPath + "/Contents"
 
 ///|
@@ -185,6 +191,8 @@ async fn assemble_macos_cef_runtime(
 async fn reset_bundle_dirs(ws : @packaging.Workspace) -> Unit {
   @packaging.remove_path_if_exists(ws.at(AppPath))
   @packaging.remove_path_if_exists(ws.at(ZipPath))
+  @packaging.remove_path_if_exists(ws.at(DmgPath))
+  @packaging.remove_path_if_exists(ws.at(DmgStagingPath))
   @packaging.ensure_dir(ws.at(MacOSPath))
   @packaging.ensure_dir(ws.at(ResourcesPath))
   @packaging.ensure_dir(ws.at(AppAssetDir))
@@ -648,7 +656,7 @@ priv struct SignConfig {
 fn package_command() -> @argparse.Command {
   Command(
     "package/macos",
-    about="Build the macOS app bundle and zip archive.",
+    about="Build the macOS app bundle, DMG, and zip archive.",
     options=[
       OptionArg(
         "sign",
@@ -763,8 +771,57 @@ async fn zip_app(ws : @packaging.Workspace) -> Unit {
 }
 
 ///|
-/// Notarize and staple when `--notarize` named a keychain profile. The zip is
-/// rebuilt afterwards so the distributed archive carries the stapled ticket.
+async fn create_dmg(ws : @packaging.Workspace, sign : SignConfig) -> Unit {
+  @packaging.remove_path_if_exists(ws.at(DmgStagingPath))
+  @packaging.ensure_dir(ws.at(DmgStagingPath))
+  // ditto preserves the signed bundle's metadata while placing it beside the
+  // conventional /Applications shortcut used by drag-to-install DMGs.
+  @packaging.run_checked(
+    "ditto",
+    [AppPath, DmgStagingPath + "/OpenSeek Desktop.app"],
+    dir=ws.dir(),
+  )
+  @packaging.run_checked(
+    "ln",
+    ["-s", "/Applications", DmgStagingPath + "/Applications"],
+    dir=ws.dir(),
+  )
+  @packaging.run_checked(
+    "hdiutil",
+    [
+      "create",
+      "-volname",
+      "OpenSeek Desktop",
+      "-srcfolder",
+      DmgStagingPath,
+      "-format",
+      "UDZO",
+      "-ov",
+      DmgPath,
+    ],
+    dir=ws.dir(),
+  )
+  @packaging.remove_path_if_exists(ws.at(DmgStagingPath))
+  if sign.identity is Some(identity) {
+    @packaging.run_checked(
+      "codesign",
+      ["--force", "--timestamp", "--sign", identity, DmgPath],
+      dir=ws.dir(),
+    )
+    @packaging.run_checked(
+      "codesign",
+      ["--verify", "--strict", "--verbose=2", DmgPath],
+      dir=ws.dir(),
+    )
+  }
+  @packaging.run_checked("hdiutil", ["verify", DmgPath], dir=ws.dir())
+}
+
+///|
+/// Submit only the signed DMG when `--notarize` names a keychain profile.
+/// Apple records tickets for the outer image and its nested app in that one
+/// submission, so both artifacts can be stapled and validated before the
+/// updater zip is built from the now-stapled source app.
 async fn notarize_if_configured(
   ws : @packaging.Workspace,
   sign : SignConfig,
@@ -772,19 +829,30 @@ async fn notarize_if_configured(
   guard sign.notary_profile is Some(profile) else { return }
   @packaging.run_checked(
     "xcrun",
-    ["notarytool", "submit", ZipPath, "--keychain-profile", profile, "--wait"],
+    ["notarytool", "submit", DmgPath, "--keychain-profile", profile, "--wait"],
     dir=ws.dir(),
   )
+  @packaging.run_checked("xcrun", ["stapler", "staple", DmgPath], dir=ws.dir())
   @packaging.run_checked("xcrun", ["stapler", "staple", AppPath], dir=ws.dir())
-  @packaging.remove_path_if_exists(ws.at(ZipPath))
-  zip_app(ws)
+  @packaging.run_checked(
+    "xcrun",
+    ["stapler", "validate", DmgPath],
+    dir=ws.dir(),
+  )
+  @packaging.run_checked(
+    "xcrun",
+    ["stapler", "validate", AppPath],
+    dir=ws.dir(),
+  )
+  @packaging.run_checked("hdiutil", ["verify", DmgPath], dir=ws.dir())
 }
 
 ///|
-async fn sign_and_zip(ws : @packaging.Workspace, sign : SignConfig) -> Unit {
+async fn sign_and_package(ws : @packaging.Workspace, sign : SignConfig) -> Unit {
   sign_app(ws, sign)
-  zip_app(ws)
+  create_dmg(ws, sign)
   notarize_if_configured(ws, sign)
+  zip_app(ws)
 }
 
 ///|
@@ -797,8 +865,9 @@ async fn main {
   reset_bundle_dirs(ws)
   copy_bundle_files(ws)
   write_bundle_metadata(ws)
-  sign_and_zip(ws, sign)
+  sign_and_package(ws, sign)
   println("generated \{ws.at(AppPath)}")
+  println("generated \{ws.at(DmgPath)}")
   println("generated \{ws.at(ZipPath)}")
   println(
     "release with scripts/publish-release.sh — it uploads the zip to openseek-api and publishes the version",

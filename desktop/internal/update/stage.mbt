@@ -1,9 +1,9 @@
 // Downloading and verifying a macOS update bundle. Staging is the paranoid
 // half of self-update: nothing here touches the running bundle, and nothing
 // gets handed to apply until the archive digest matched the manifest and
-// the extracted bundle carries a valid signature from the same Developer ID
-// team as the running app — a compromised download source can therefore
-// nudge, but not install.
+// the extracted bundle carries a valid notarized signature from the same
+// Developer ID team as the running app — a compromised download source can
+// therefore nudge, but not install.
 
 ///|
 /// A staging or apply failure, with a user-facing message.
@@ -35,8 +35,8 @@ fn staging_dir(work_dir : String) -> String {
 
 ///|
 /// Download `info`'s platform package into the staging directory, verify
-/// its digest and code signature, and return the staged bundle. The running
-/// bundle must be signed by a real team (an ad-hoc dev build never
+/// its digest, code signature, and notarization, and return the staged bundle.
+/// The running bundle must be signed by a real team (an ad-hoc dev build never
 /// self-updates), and the staged bundle must be signed by the same one.
 pub async fn stage_update(
   info : UpdateInfo,
@@ -58,13 +58,16 @@ pub async fn stage_update(
   let extract_dir = staging + "/extract"
   run_tool("ditto", ["-x", "-k", archive, extract_dir])
   let app_path = extracted_app(extract_dir)
-  // The zip may carry quarantine attributes; the bundle is notarized, but
-  // stripping them keeps the relaunch from stopping at a Gatekeeper prompt.
-  // Best-effort: a failure only means the prompt shows once.
-  ignore(@process.run("xattr", ["-dr", "com.apple.quarantine", app_path]))
   run_tool("codesign", ["--verify", "--deep", "--strict", app_path])
   guard team_identifier(app_path) is Some(new_team) && new_team == team else {
     raise UpdateError("the downloaded bundle is signed by a different team")
+  }
+  run_tool("codesign", [
+    "--verify", "--check-notarization", "--test-requirement", "=notarized", app_path,
+  ]) catch {
+    UpdateError(message) =>
+      raise UpdateError("the downloaded bundle is not notarized: \{message}")
+    error => raise error
   }
   { version: info.version, app_path }
 }

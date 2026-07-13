@@ -339,19 +339,20 @@ jobs:
           done
           exit 1
 
-      # No --sign argument, so the bundle is ad-hoc signed: fine for
-      # debugging, but downloads are quarantined by Gatekeeper on other
-      # machines — clear it before launching:
-      #   xattr -dr com.apple.quarantine "OpenSeek Desktop.app"
+      # No --sign or --notarize argument, so the app is only ad-hoc signed,
+      # the DMG container is unsigned, and neither artifact is intended for
+      # end-user distribution.
       # Unstamped — no OPENSEEK_CLIENT_TOKEN in CI; see the Linux job's note.
-      - name: Build the app bundle
+      - name: Build the macOS artifacts
         run: moon -C desktop run --target native package/macos
 
-      - name: Upload app artifact
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: OpenSeek-Desktop-macos-arm64
-          path: desktop/dist/OpenSeek Desktop-macos-arm64.zip
+          path: |
+            desktop/dist/OpenSeek Desktop-macos-arm64.zip
+            desktop/dist/OpenSeek Desktop-macos-arm64.dmg
           if-no-files-found: error
 
   desktop-windows:
