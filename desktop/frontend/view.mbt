@@ -225,9 +225,6 @@ fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
     ),
   )
   if !model.workspaces_collapsed {
-    for control in add_workspace_controls(dispatch, model) {
-      rows.push(control)
-    }
     for path in model.workspaces {
       rows.push(workspace_row(dispatch, model, path))
       let before = rows.length()
@@ -415,40 +412,6 @@ fn workspace_row(
       icon(icon_add),
     ),
   ])
-}
-
-///|
-/// The rows under the "Workspaces" heading that back its ＋ control: the ＋
-/// asks the host for the system folder chooser; on platforms without one it
-/// opens this manual path input instead (Enter submits, Escape closes).
-/// Either way the host validates the directory and the updated registry
-/// comes back through `WorkspacesLoaded`.
-fn add_workspace_controls(
-  dispatch : @cmd.Emit[Msg],
-  model : Model,
-) -> Array[@html.Html] {
-  let controls : Array[@html.Html] = []
-  if model.workspace_input is Some(text) {
-    controls.push(
-      @html.div(class="workspace-add", [
-        @html.input(
-          input_type=@html.InputType::Text,
-          value=text,
-          placeholder="/path/to/project",
-          autofocus=true,
-          on_input=dispatch.map(value => WorkspaceInput(value)),
-          attrs=@html.Attrs::build().on_keydown(event => {
-            match event.key() {
-              "Enter" => dispatch(AddWorkspace)
-              "Escape" => dispatch(ToggleWorkspaceInput)
-              _ => @cmd.none
-            }
-          }),
-        ),
-      ]),
-    )
-  }
-  controls
 }
 
 ///|
@@ -1628,6 +1591,8 @@ fn update_check_controls(
 }
 
 ///|
+
+///|
 fn wsl_select(dispatch : @cmd.Emit[Msg], enabled : Bool) -> @html.Html {
   @html.select(on_change=dispatch.map(value => WslModeChanged(value)), [
     @html.option(value="native", selected=!enabled, "Windows (native)"),
@@ -1750,19 +1715,25 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
         desc="Where the editor panel docks its file tree.",
       ),
     ]),
-    settings_group("Updates", [
-      setting_row(
-        "Update channel",
-        [channel_select(dispatch, model.update_channel)],
-        desc="Staging serves pre-release builds for testing.",
-      ),
-      setting_row(
-        "Check for updates",
-        update_check_controls(dispatch, model),
-        desc="Current version: \{@version.AppVersion}.",
-      ),
-    ]),
   ]
+  // Self-update swaps the bundle under the desktop process; from a browser
+  // the section could only break the app for whoever is at the machine.
+  if model.is_desktop {
+    groups.push(
+      settings_group("Updates", [
+        setting_row(
+          "Update channel",
+          [channel_select(dispatch, model.update_channel)],
+          desc="Staging serves pre-release builds for testing.",
+        ),
+        setting_row(
+          "Check for updates",
+          update_check_controls(dispatch, model),
+          desc="Current version: \{@version.AppVersion}.",
+        ),
+      ]),
+    )
+  }
   // WSL is Windows-only; elsewhere the section would be dead weight.
   if model.is_windows {
     let engine_rows : Array[@html.Html] = [
@@ -2276,10 +2247,31 @@ fn view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
   if model.update_ux is ConfirmingRestart(version~) {
     children.push(update_confirm_modal(dispatch, version))
   }
+  if model.workspace_picker is Some(picker) {
+    children.push(workspace_picker_modal(dispatch, picker))
+  }
+  // A lost connection covers everything: with no event stream and every API
+  // call failing, the app behind it can do nothing, so an honest dead-end
+  // beats a half-broken UI.
+  if model.bridge is BridgeLost(message) {
+    children.push(bridge_lost_overlay(message))
+  }
   @html.div(
     class=if model.sidebar_open { "app" } else { "app sidebar-collapsed" },
     children,
   )
+}
+
+///|
+/// The full-screen card shown when the bridge is lost: a plain explanation
+/// and what to do; the only action here is the instruction itself.
+fn bridge_lost_overlay(message : String) -> @html.Html {
+  @html.div(class="bridge-lost-backdrop", [
+    @html.div(class="bridge-lost-card", [
+      @html.div(class="bridge-lost-title", "Disconnected"),
+      @html.div(class="bridge-lost-body", message),
+    ]),
+  ])
 }
 
 ///|
@@ -2307,6 +2299,155 @@ fn update_confirm_modal(
       ]),
     ]),
   ])
+}
+
+///|
+/// The in-app folder picker behind the sidebar's "Add a workspace", shaped
+/// like a system chooser: a clickable breadcrumb for the current directory
+/// (each segment navigates up to that level — there is no ".." row), a
+/// folder list that navigates on click, and a de-emphasized go-to-path
+/// field for typing a location directly (Enter navigates, which also
+/// validates; Escape closes). It renders the host machine's directories
+/// whichever gateway serves the page, so desktop and browser share the one
+/// flow. Clicks inside must not bubble to the backdrop, whose click closes
+/// the picker.
+fn workspace_picker_modal(
+  dispatch : @cmd.Emit[Msg],
+  picker : WorkspacePicker,
+) -> @html.Html {
+  let rows : Array[@html.Html] = []
+  for name in picker.entries {
+    rows.push(
+      @html.div(
+        class="picker-row",
+        on_click=dispatch(
+          WorkspacePickerNavigate(joined_path(picker.path, name)),
+        ),
+        [
+          @html.span(class="picker-row-icon", icon(icon_folder)),
+          @html.span(class="picker-row-name", name),
+        ],
+      ),
+    )
+  }
+  if picker.entries.length() == 0 {
+    rows.push(
+      @html.div(
+        class="picker-empty",
+        if picker.loading {
+          "Loading…"
+        } else {
+          "No subfolders"
+        },
+      ),
+    )
+  }
+  let children : Array[@html.Html] = [
+    @html.div(class="modal-title", "Add a workspace"),
+    picker_breadcrumbs(dispatch, picker),
+  ]
+  if picker.error is Some(message) {
+    children.push(@html.div(class="picker-error", message))
+  }
+  children.push(@html.div(class="picker-list", rows))
+  children.push(
+    @html.div(class="picker-goto", [
+      @html.input(
+        input_type=@html.InputType::Text,
+        value=picker.input,
+        placeholder="Go to path…",
+        on_input=dispatch.map(value => WorkspacePickerInput(value)),
+        attrs=@html.Attrs::build().on_keydown(event => {
+          match event.key() {
+            "Enter" => dispatch(WorkspacePickerNavigate(picker.input))
+            "Escape" => dispatch(WorkspacePickerClose)
+            _ => @cmd.none
+          }
+        }),
+      ),
+    ]),
+  )
+  children.push(
+    @html.div(class="modal-actions", [
+      @html.button(on_click=dispatch(WorkspacePickerClose), "Cancel"),
+      @html.button(
+        class="primary",
+        on_click=dispatch(WorkspacePickerConfirm),
+        if picker.path.is_empty() {
+          "Add this folder"
+        } else {
+          "Add \u{201c}\{workspace_label(picker.path)}\u{201d}"
+        },
+      ),
+    ]),
+  )
+  @html.div(class="modal-backdrop", on_click=dispatch(WorkspacePickerClose), [
+    @html.div(
+      class="modal picker-modal",
+      attrs=@html.Attrs::build().on_click(event => {
+        event.stop_propagation()
+        @cmd.none
+      }),
+      children,
+    ),
+  ])
+}
+
+///|
+/// The current directory as a clickable trail: every ancestor is a button
+/// that navigates back up to it, the way a system chooser's path bar works.
+/// Windows paths keep their drive segment as the trail's root; POSIX paths
+/// root at "/".
+fn picker_breadcrumbs(
+  dispatch : @cmd.Emit[Msg],
+  picker : WorkspacePicker,
+) -> @html.Html {
+  let crumbs : Array[@html.Html] = []
+  let windows = picker.path.contains("\\")
+  let sep = if windows { "\\" } else { "/" }
+  fn push_crumb(label : String, target : String, current : Bool) -> Unit {
+    if crumbs.length() > 0 {
+      crumbs.push(@html.span(class="picker-crumb-sep", "›"))
+    }
+    crumbs.push(
+      @html.button(
+        class=if current { "picker-crumb current" } else { "picker-crumb" },
+        on_click=dispatch(WorkspacePickerNavigate(target)),
+        label,
+      ),
+    )
+  }
+
+  let segments : Array[String] = []
+  for part in picker.path.split(sep) {
+    if !part.is_empty() {
+      segments.push("\{part}")
+    }
+  }
+  if !windows {
+    push_crumb("/", "/", segments.length() == 0)
+  }
+  // A Windows root must survive into every ancestor target: a bare `C:` is
+  // drive-relative (it resolves against that drive's current directory),
+  // so the drive crumb targets `C:\`; a UNC path keeps its `\\server`
+  // prefix so ancestors stay absolute.
+  let unc = windows && picker.path.has_prefix("\\\\")
+  let mut prefix = ""
+  for index, segment in segments {
+    prefix = if windows && index == 0 {
+      if unc {
+        "\\\\" + segment
+      } else {
+        segment + "\\"
+      }
+    } else if prefix.has_suffix(sep) {
+      prefix + segment
+    } else {
+      prefix + sep + segment
+    }
+    push_crumb(segment, prefix, index == segments.length() - 1)
+  }
+  @html.div(class="picker-crumbs", crumbs)
 }
 
 ///|

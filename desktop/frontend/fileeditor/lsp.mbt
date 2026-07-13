@@ -107,7 +107,7 @@ async fn request_hover(
   payload["path"] = path.0
   payload["line"] = line
   payload["character"] = character
-  @interop.bridge_request("hover", payload.to_value())
+  @interop.bridge_request("lsp.hover", payload.to_value())
 }
 
 ///|
@@ -184,7 +184,7 @@ fn request_diagnostics(
 async fn request_lsp_open(path~ : @pathx.Absolute) -> @js.Value {
   let payload = @js.Object::new()
   payload["path"] = path.0
-  @interop.bridge_request("lsp_open", payload.to_value())
+  @interop.bridge_request("lsp.open", payload.to_value())
 }
 
 ///|

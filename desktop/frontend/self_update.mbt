@@ -106,7 +106,7 @@ fn check_for_updates(
       let payload = @js.Object::new()
       payload["channel"] = channel.wire()
       let result = try {
-        let reply = @interop.bridge_request("check_update", payload.to_value())
+        let reply = @interop.bridge_request("update.check", payload.to_value())
         match decode_update_check(@interop.reply_json_text(reply)) {
           Some(result) => result
           None => CheckUnreachable(reason="the host answered unintelligibly")
@@ -131,7 +131,7 @@ fn download_update(
       let payload = @js.Object::new()
       payload["channel"] = channel.wire()
       let _ : @js.Value = @interop.bridge_request(
-        "download_update",
+        "update.download",
         payload.to_value(),
       ) catch {
         error => {

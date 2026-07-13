@@ -669,7 +669,7 @@ pub fn update(
             continue
           }
           let tab = tabs[index]
-          if stat.sig.is_empty() {
+          guard stat.sig is Some(current_sig) else {
             // The file is gone. The tab stays as the user's bookmark; the
             // notice replaces the document if it is the one on screen.
             if !(tab.state is TabDeleted) {
@@ -680,40 +680,40 @@ pub fn update(
                 cmds.push(clear_document())
               }
             }
-          } else {
-            let changed = match tab.state {
-              // The loaded baseline says whether the disk moved on.
-              TabLoaded(sig~, ..) => sig != stat.sig
-              // A deleted file whose signature came back: it reappeared.
-              TabDeleted => true
-              // A read is already in flight; its reply carries a fresh
-              // signature anyway.
-              TabLoading => false
-              // Withheld tabs carry no baseline to compare against (see
-              // `TabState`); they refresh on explicit re-open instead.
-              TabBinary | TabOversized => false
-            }
-            if changed {
-              if state.active == Some(tab.path) {
-                // The document on screen reloads eagerly (scroll kept —
-                // `FileLoaded` sees the previous content). The tab keeps its
-                // loaded state so that restore has its baseline.
-                cmds.push(
-                  read_file(
-                    dispatch,
-                    state.session,
-                    tab.path,
-                    tab.name,
-                    range=None,
-                    workspace=ctx.workspace,
-                  ),
-                )
-              } else {
-                // Background tabs just remember they are behind; activation
-                // reloads them. A build storm therefore costs one read, not
-                // one per open tab.
-                tabs[index] = { ..tab, stale: true }
-              }
+            continue
+          }
+          let changed = match tab.state {
+            // The loaded baseline says whether the disk moved on.
+            TabLoaded(sig~, ..) => sig != current_sig
+            // A deleted file whose signature came back: it reappeared.
+            TabDeleted => true
+            // A read is already in flight; its reply carries a fresh
+            // signature anyway.
+            TabLoading => false
+            // Withheld tabs carry no baseline to compare against (see
+            // `TabState`); they refresh on explicit re-open instead.
+            TabBinary | TabOversized => false
+          }
+          if changed {
+            if state.active == Some(tab.path) {
+              // The document on screen reloads eagerly (scroll kept —
+              // `FileLoaded` sees the previous content). The tab keeps its
+              // loaded state so that restore has its baseline.
+              cmds.push(
+                read_file(
+                  dispatch,
+                  state.session,
+                  tab.path,
+                  tab.name,
+                  range=None,
+                  workspace=ctx.workspace,
+                ),
+              )
+            } else {
+              // Background tabs just remember they are behind; activation
+              // reloads them. A build storm therefore costs one read, not
+              // one per open tab.
+              tabs[index] = { ..tab, stale: true }
             }
           }
         }
@@ -1079,11 +1079,11 @@ test "StatsLoaded marks deletions, reloads the active change, stales the rest" {
     StatsLoaded(session="desktop-test", stats=[
       // The active file changed: reloaded eagerly, so its tab stays loaded
       // (the baseline the scroll-keeping reload compares against).
-      { path: Relative("a.mbt"), sig: "9:0" },
+      { path: Relative("a.mbt"), sig: Some("9:0") },
       // A background file changed: only marked stale.
-      { path: Relative("b.mbt"), sig: "9:0" },
+      { path: Relative("b.mbt"), sig: Some("9:0") },
       // Deleted: the tab flips to the deleted notice state.
-      { path: Relative("c.mbt"), sig: "" },
+      { path: Relative("c.mbt"), sig: None },
     ]),
     state,
     test_ctx(),
@@ -1096,7 +1096,7 @@ test "StatsLoaded marks deletions, reloads the active change, stales the rest" {
   let (_, same) = update(
     emit,
     StatsLoaded(session="desktop-test", stats=[
-      { path: Relative("b.mbt"), sig: "9:0" },
+      { path: Relative("b.mbt"), sig: Some("9:0") },
     ]),
     { ..next, tabs: [loaded_tab("b.mbt", "b.mbt")], active: None },
     test_ctx(),
@@ -1106,7 +1106,7 @@ test "StatsLoaded marks deletions, reloads the active change, stales the rest" {
   // A reply from another conversation is dropped.
   let (_, other) = update(
     emit,
-    StatsLoaded(session="other", stats=[{ path: Relative("a.mbt"), sig: "" }]),
+    StatsLoaded(session="other", stats=[{ path: Relative("a.mbt"), sig: None }]),
     state,
     test_ctx(),
   )
@@ -1131,7 +1131,7 @@ test "a deleted tab whose file reappears reloads on the next stats" {
   let (_, next) = update(
     emit,
     StatsLoaded(session="desktop-test", stats=[
-      { path: Relative("a.mbt"), sig: "3:0" },
+      { path: Relative("a.mbt"), sig: Some("3:0") },
     ]),
     state,
     test_ctx(),

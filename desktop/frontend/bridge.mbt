@@ -1,8 +1,44 @@
-// The engine-host bridge: typed access to the ops and events the desktop
-// host (`internal/host`) exposes through proton's injected
-// `globalThis.__MoonBit__` object. Ops are promise-returning calls on
-// `__MoonBit__.openseek`; engine progress arrives as `openseek.*` events on
-// `__MoonBit__.events` and is decoded here into messages.
+// The engine-host bridge: typed access to the host's methods and
+// notifications (docs/remote-protocol.md). Methods go through
+// `@interop.bridge_request`; notifications arrive either as `openseek.*`
+// proton events (the desktop window) or as JSON-RPC notifications on the
+// page's WebSocket (a browser through the relay), and both feed the same
+// decoders below.
+
+///|
+/// Wire the host's notification stream into messages, once, over whichever
+/// transport this origin uses.
+fn install_bridge(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+  if @interop.using_proton_bridge() {
+    install_proton_bridge(dispatch, 0)
+  } else {
+    connect_ws(dispatch, failures=0)
+  }
+}
+
+///|
+/// Route one notification to its decoder. `agent.connected` is the
+/// readiness/resync signal on both transports: it re-fires on every
+/// reconnect (and engine-pump restart), and the refetches BridgeReady
+/// triggers — including `agent.runs` — rebuild whatever was missed.
+fn bridge_msg(method_ : String, payload : Map[String, Json]) -> Msg? {
+  match method_ {
+    "agent.connected" => Some(BridgeReady)
+    "agent.started" => started_msg(payload)
+    "agent.event" => engine_msg(payload)
+    "agent.error" => error_msg(payload)
+    "agent.finished" => finished_msg(payload)
+    "lsp.diagnostics" => diagnostics_msg(payload)
+    "fs.changed" => fs_changed_msg(payload)
+    _ => None
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The desktop window: the injected proton bridge.
+
+///|
+let bridge_events_wired : Ref[Bool] = Ref(false)
 
 ///|
 /// Both bridge handles, present only when the surface the frontend relies
@@ -11,9 +47,8 @@ fn bridge_handles() -> (@js.Value, @js.Value)? {
   guard @interop.openseek_api() is Some(api) &&
     @interop.moonbit_bridge_root() is Some(root) &&
     @interop.js_prop(root, "events") is Some(events) &&
-    @interop.js_prop(api, "connect") is Some(_) &&
-    @interop.js_prop(api, "start") is Some(_) &&
-    @interop.js_prop(api, "cancel") is Some(_) &&
+    @interop.js_prop(api, "host.connect") is Some(_) &&
+    @interop.js_prop(api, "agent.start") is Some(_) &&
     @interop.js_prop(events, "on") is Some(_) else {
     return None
   }
@@ -21,44 +56,36 @@ fn bridge_handles() -> (@js.Value, @js.Value)? {
 }
 
 ///|
-let bridge_events_wired : Ref[Bool] = Ref(false)
-
-///|
-/// Wait for lepus to inject the bridge (it loads alongside this bundle),
-/// wire the engine-host event stream into messages once, and report
-/// readiness. The 25ms retries add up to ~3 seconds before the bridge is
+/// Wait for proton to inject the bridge (it loads alongside this bundle),
+/// wire the notification events into messages once, and open the host
+/// connection. The 25ms retries add up to ~3 seconds before the bridge is
 /// declared unavailable.
-fn install_bridge(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
-  install_bridge_attempt(dispatch, 0)
-}
-
-///|
-fn install_bridge_attempt(dispatch : @cmd.Emit[Msg], attempt : Int) -> @cmd.Cmd {
+fn install_proton_bridge(dispatch : @cmd.Emit[Msg], attempt : Int) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     guard bridge_handles() is Some((api, events)) else {
       if attempt > 120 {
         scheduler.add(dispatch(BridgeUnavailable("Bridge unavailable")))
       } else {
         scheduler.add(
-          @cmd.delay(install_bridge_attempt(dispatch, attempt + 1), 25),
+          @cmd.delay(install_proton_bridge(dispatch, attempt + 1), 25),
         )
       }
       return
     }
     if !bridge_events_wired.val {
       bridge_events_wired.val = true
-      wire_engine_events(scheduler, dispatch, events)
-      open_engine_host(scheduler, dispatch, api)
+      wire_proton_events(scheduler, dispatch, events)
+      open_host_connection(scheduler, dispatch, api)
     }
   })
 }
 
 ///|
-/// Open the engine host: a single long-lived call whose task group owns the
-/// persistent `--serve` engine process. The promise only settles if the
-/// host stops; starts then fail with a clear error, so the rejection itself
-/// carries no extra signal.
-fn open_engine_host(
+/// Open the host's notification subscription: a single long-lived call
+/// whose lifetime is the webview's. The promise only settles if the host
+/// stops, so the rejection itself carries no extra signal beyond
+/// "unavailable".
+fn open_host_connection(
   scheduler : &@cmd.Scheduler,
   dispatch : @cmd.Emit[Msg],
   api : @js.Value,
@@ -66,7 +93,7 @@ fn open_engine_host(
   @js.async_run(() => {
     let _ : @js.Value = @interop.js_method_promise(
       api,
-      "connect",
+      "host.connect",
       @js.Object::new().to_value(),
     ).wait() catch {
       error => {
@@ -80,7 +107,7 @@ fn open_engine_host(
 }
 
 ///|
-fn wire_engine_events(
+fn wire_proton_events(
   scheduler : &@cmd.Scheduler,
   dispatch : @cmd.Emit[Msg],
   events : @js.Value,
@@ -97,28 +124,127 @@ fn wire_engine_events(
     ])
   }
 
-  on("openseek.started", started_msg)
-  on("openseek.event", engine_msg)
-  on("openseek.error", error_msg)
-  on("openseek.finished", finished_msg)
-  on("openseek.connected", connected_msg)
-  on("openseek.diagnostics", diagnostics_msg)
-  on("openseek.fs_changed", fs_changed_msg)
+  for
+    method_ in (
+      [
+        "agent.connected", "agent.started", "agent.event", "agent.error", "agent.finished",
+        "lsp.diagnostics", "fs.changed",
+      ] : Array[String]) {
+    on("openseek." + method_, payload => bridge_msg(method_, payload))
+  }
   // Emitted by proton itself (not the openseek extension) when the user
-  // clicks a system notification; the payload is the run id the host stamped
-  // on the notification.
+  // clicks a system notification; the payload is the run id the host
+  // stamped on the notification. Desktop-only by nature.
   on("proton.notification_clicked", notification_clicked_msg)
 }
 
 ///|
-/// A lepus event's payload as JSON fields. Payloads cross the bridge as
+/// A proton event's payload as JSON fields. Payloads cross the bridge as
 /// structured clones of the host's JSON, so the round trip back through
-/// JSON is lossless; an event without a decodable payload is dropped.
+/// JSON is lossless; an event without a decodable payload is dropped —
+/// except a payload-less notification, which reads as empty fields
+/// (`agent.connected` carries none).
 fn event_payload(event : @js.Value) -> Map[String, Json]? {
-  guard @interop.js_prop(event, "payload") is Some(payload) else { return None }
+  guard @interop.js_prop(event, "payload") is Some(payload) else {
+    return Some(Map([]))
+  }
   let json = payload.to_json() catch { _ => return None }
   guard json is Object(fields) else { return None }
   Some(fields)
+}
+
+// ---------------------------------------------------------------------------
+// A browser: JSON-RPC over the page's WebSocket, with reconnection.
+
+///|
+/// Consecutive connection losses before the user is told the host is
+/// unreachable. The loop keeps reconnecting regardless; the next
+/// `agent.connected` restores the UI.
+const WsLostAfter = 3
+
+///|
+/// Open the page's WebSocket and keep it alive: every close schedules a
+/// reconnect with backoff, and a successful connection (the host's
+/// `agent.connected`) resets the failure count.
+fn connect_ws(dispatch : @cmd.Emit[Msg], failures~ : Int) -> @cmd.Cmd {
+  @cmd.custom_cmd(scheduler => {
+    let counter : Ref[Int] = Ref(failures)
+    @interop.ws_connect(
+      on_notification=(method_, params) => {
+        if method_ == "agent.connected" {
+          counter.val = 0
+        }
+        if bridge_msg(method_, params) is Some(msg) {
+          scheduler.add(dispatch(msg))
+        }
+      },
+      on_down=() => {
+        let next = counter.val + 1
+        if next == WsLostAfter {
+          scheduler.add(
+            dispatch(
+              BridgeUnavailable(
+                "Can't reach OpenSeek. Make sure OpenSeek is running, then reopen this page.",
+              ),
+            ),
+          )
+        }
+        scheduler.add(
+          @cmd.delay(connect_ws(dispatch, failures=next), reconnect_delay(next)),
+        )
+      },
+    )
+  })
+}
+
+///|
+/// Reconnect backoff: quick first retries, settling at 15s so an
+/// overnight-idle page keeps probing without hammering.
+fn reconnect_delay(failures : Int) -> Int {
+  match failures {
+    0 | 1 => 1_000
+    2 => 2_000
+    3 => 4_000
+    4 => 8_000
+    _ => 15_000
+  }
+}
+
+///|
+/// Resync the in-flight runs after a (re)connect: `agent.runs` returns each
+/// live run's `agent.started` params, replayed through the same decoder, so
+/// a page that joined mid-run learns the run's identity and can cancel or
+/// steer it. The reply is the complete in-flight set, so it also settles the
+/// other direction — `RunsSettled` follows with every live id, and any run
+/// this client still shows that the host no longer has ended while the
+/// client was away. Nothing is dispatched when the op fails: a missing
+/// answer says nothing about the runs.
+fn fetch_runs(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+  @cmd.custom_cmd(scheduler => {
+    @js.async_run(() => {
+      let reply = @interop.bridge_request(
+        "agent.runs",
+        @js.Object::new().to_value(),
+      ) catch {
+        _ => return
+      }
+      let json = @json.parse(@interop.reply_json_text(reply)) catch {
+        _ => return
+      }
+      guard json is { "runs": Array(runs), .. } else { return }
+      let live : Array[Int] = []
+      for item in runs {
+        guard item is Object(fields) else { continue }
+        if @jsonx.json_int(fields, "run_id") is Some(run_id) {
+          live.push(run_id)
+        }
+        if started_msg(fields) is Some(msg) {
+          scheduler.add(dispatch(msg))
+        }
+      }
+      scheduler.add(dispatch(RunsSettled(live~)))
+    })
+  })
 }
 
 ///|
@@ -141,6 +267,7 @@ fn started_msg(payload : Map[String, Json]) -> Msg? {
       model~,
       max_steps~,
       cwd=@jsonx.json_text(payload, "cwd").map(path => Absolute(path)),
+      task=@jsonx.json_text(payload, "task"),
     ),
   )
 }
@@ -186,11 +313,6 @@ fn finished_msg(payload : Map[String, Json]) -> Msg? {
     return None
   }
   Some(Finished(run_id~, status~, answer=@jsonx.json_text(payload, "answer")))
-}
-
-///|
-fn connected_msg(_payload : Map[String, Json]) -> Msg? {
-  Some(BridgeReady)
 }
 
 ///|
@@ -258,7 +380,7 @@ fn start_openseek(
   )
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
-      let _ : @js.Value = @interop.bridge_request("start", payload) catch {
+      let _ : @js.Value = @interop.bridge_request("agent.start", payload) catch {
         error => {
           scheduler.add(
             dispatch(
@@ -371,7 +493,7 @@ async fn refresh_sessions_into(
   dispatch : @cmd.Emit[Msg],
 ) -> Unit noraise {
   let reply = @interop.bridge_request(
-    "list_sessions",
+    "session.list",
     @js.Object::new().to_value(),
   ) catch {
     error => {
@@ -399,7 +521,7 @@ fn open_session(
       let payload = @js.Object::new()
       payload["session"] = session_id
       @interop.set_trimmed(payload, "workspace", workspace)
-      let reply = @interop.bridge_request("load_session", payload.to_value()) catch {
+      let reply = @interop.bridge_request("session.load", payload.to_value()) catch {
         error => {
           scheduler.add(
             dispatch(
@@ -460,7 +582,7 @@ async fn steer_delivered(text : String, run_id : Int) -> Bool {
   let payload = @js.Object::new()
   payload["text"] = text
   payload["run_id"] = run_id
-  let reply = @interop.bridge_request("steer", payload.to_value())
+  let reply = @interop.bridge_request("agent.steer", payload.to_value())
   @interop.js_prop(reply, "steered") is Some(flag) &&
   (@js.Cast::into(flag) : Bool?) is Some(true)
 }
@@ -500,7 +622,10 @@ fn compact_openseek(
   )
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
-      let _ : @js.Value = @interop.bridge_request("compact", payload.to_value()) catch {
+      let _ : @js.Value = @interop.bridge_request(
+        "agent.compact",
+        payload.to_value(),
+      ) catch {
         error => {
           // Routed by session, not as a generic Error: the rejection must
           // also clear the conversation's queued/compacting notice, which
@@ -526,7 +651,10 @@ fn cancel_openseek(dispatch : @cmd.Emit[Msg], run_id : Int) -> @cmd.Cmd {
     @js.async_run(() => {
       let payload = @js.Object::new()
       payload["run_id"] = run_id
-      let _ : @js.Value = @interop.bridge_request("cancel", payload.to_value()) catch {
+      let _ : @js.Value = @interop.bridge_request(
+        "agent.cancel",
+        payload.to_value(),
+      ) catch {
         error => {
           scheduler.add(
             dispatch(
@@ -553,7 +681,7 @@ fn apply_update(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let _ : @js.Value = @interop.bridge_request(
-        "apply_update",
+        "update.apply",
         @js.Object::new().to_value(),
       ) catch {
         error => {
@@ -596,10 +724,10 @@ fn open_file(
     @js.async_run(() => {
       let payload = @js.Object::new()
       payload["session"] = session
-      payload["cwd"] = workspace_token(cwd)
+      @interop.set_trimmed(payload, "cwd", workspace_token(cwd))
       payload["path"] = path
       let _ : @js.Value = @interop.bridge_request(
-        "open_path",
+        "host.open_path",
         payload.to_value(),
       ) catch {
         error => {

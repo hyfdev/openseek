@@ -55,7 +55,7 @@ pub(all) enum FileIndex {
 
 pub(all) struct FileStat {
   path : @pathx.Relative
-  sig : String
+  sig : String?
 }
 
 pub struct ModelUri(String)

@@ -47,12 +47,10 @@ fn viewer_css_sources() -> Array[String] {
 }
 
 ///|
-/// The vendored codicon icon font `codicon.css`'s `@font-face` loads at the
-/// site root (`url("/codicon.ttf")`), exactly like the editor's own web
-/// build serves it. Proton resolves `/codicon.ttf` against the
-/// `proton://app/` origin and maps it to the asset directory root, so the
-/// desktop ships the upstream CSS unmodified and just places the font next
-/// to `viewer.css`.
+/// The vendored codicon icon font, placed next to `viewer.css` in the asset
+/// directory. The upstream `codicon.css` loads it from the site root;
+/// `build_viewer_stylesheet` rewrites that reference to be
+/// stylesheet-relative so it also resolves under a path prefix.
 const CodiconFontSource : String = "viewer/browser/view/codicon/codicon.ttf"
 
 ///|
@@ -401,7 +399,14 @@ pub async fn build_viewer_stylesheet(ws : Workspace) -> Unit {
       raise PackageError("viewer stylesheet not found: \{absolute}")
     }
     css.write_string("/* " + source + " */\n")
-    let text = @asyncfs.read_file(absolute).text()
+    // The upstream codicon @font-face loads from the site root
+    // (`url("/codicon.ttf")`), which breaks when the app is served under a
+    // path prefix (a relay's `/d/<device>/`). The font ships next to
+    // viewer.css in every deployment, so a stylesheet-relative URL
+    // resolves correctly everywhere.
+    let text = @asyncfs.read_file(absolute)
+      .text()
+      .replace_all(old="url(\"/codicon.ttf\")", new="url(\"codicon.ttf\")")
     css.write_string(text)
     if !text.has_suffix("\n") {
       css.write_string("\n")

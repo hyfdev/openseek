@@ -20,7 +20,10 @@ fn read_directory(
       payload["session"] = session
       payload["path"] = path.0
       @interop.set_workspace(payload, workspace)
-      let reply = @interop.bridge_request("read_directory", payload.to_value()) catch {
+      let reply = @interop.bridge_request(
+        "fs.read_directory",
+        payload.to_value(),
+      ) catch {
         error => {
           scheduler.add(
             dispatch(
@@ -62,7 +65,7 @@ fn list_files(
       let payload = @js.Object::new()
       payload["session"] = session
       @interop.set_workspace(payload, workspace)
-      let reply = @interop.bridge_request("list_files", payload.to_value()) catch {
+      let reply = @interop.bridge_request("fs.list_files", payload.to_value()) catch {
         _ => {
           scheduler.add(dispatch(FileIndexFailed(session~)))
           return
@@ -115,7 +118,7 @@ pub fn read_file(
       payload["session"] = session
       payload["path"] = path.0
       @interop.set_workspace(payload, workspace)
-      let reply = @interop.bridge_request("read_file", payload.to_value()) catch {
+      let reply = @interop.bridge_request("fs.read_file", payload.to_value()) catch {
         error => {
           scheduler.add(
             dispatch(
@@ -222,7 +225,7 @@ fn stat_files(
       payload["session"] = session
       payload["paths"] = paths.map(path => path.0)
       @interop.set_workspace(payload, workspace)
-      let reply = @interop.bridge_request("stat_files", payload.to_value()) catch {
+      let reply = @interop.bridge_request("fs.stat_files", payload.to_value()) catch {
         _ => return
       }
       guard decode_file_stats(@interop.reply_json_text(reply)) is Some(stats) else {
@@ -241,32 +244,40 @@ fn decode_file_stats(text : String) -> Array[FileStat]? {
   let stats : Array[FileStat] = []
   for item in items {
     guard item is Object(fields) else { continue }
-    // Both fields are always on the wire; `sig` is "" for a file the host
-    // could not stat.
     guard @jsonx.json_text(fields, "path") is Some(path) && !path.is_empty() else {
       continue
     }
-    guard @jsonx.json_text(fields, "sig") is Some(sig) else { continue }
-    stats.push({ path: Relative(path), sig })
+    // `sig` is absent for a file the host could not stat — a deleted file.
+    stats.push({ path: Relative(path), sig: @jsonx.json_text(fields, "sig") })
   }
   Some(stats)
 }
 
 ///|
-/// Point the host's workspace watcher at `session`'s workspace (`""` parks
-/// it). Fire-and-forget: there is no reply worth folding, and a failure just
-/// means no live updates until the next reconciliation re-sends.
+/// Point the host's workspace watcher at `session`'s workspace, or park it
+/// (`fs.unwatch`) when the panel no longer needs one. Fire-and-forget:
+/// there is no reply worth folding, and a failure just means no live
+/// updates until the next reconciliation re-sends.
 fn watch_workspace(session : String, workspace~ : @pathx.Absolute?) -> @cmd.Cmd {
   @cmd.custom_cmd(_scheduler => {
     @js.async_run(() => {
-      let payload = @js.Object::new()
-      payload["session"] = session
-      @interop.set_workspace(payload, workspace)
-      let _ : @js.Value = @interop.bridge_request(
-        "watch_workspace",
-        payload.to_value(),
-      ) catch {
-        _ => return
+      if session.is_empty() {
+        let _ : @js.Value = @interop.bridge_request(
+          "fs.unwatch",
+          @js.Object::new().to_value(),
+        ) catch {
+          _ => return
+        }
+      } else {
+        let payload = @js.Object::new()
+        payload["session"] = session
+        @interop.set_workspace(payload, workspace)
+        let _ : @js.Value = @interop.bridge_request(
+          "fs.watch",
+          payload.to_value(),
+        ) catch {
+          _ => return
+        }
       }
     })
   })

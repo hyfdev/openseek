@@ -959,25 +959,108 @@
         background: transparent;
       }
 
-      /* The manual path input behind "Add workspace", shown only when the
-         platform has no system folder chooser. */
-      .workspace-add {
-        margin-top: 4px;
-        padding: 0 2px;
+      /* The in-app folder picker behind "Add a workspace" (extends the
+         confirmation-modal styles). */
+      .picker-modal {
+        width: min(520px, calc(100vw - 48px));
       }
-      .workspace-add input {
+      .picker-crumbs {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 1px;
+        margin-top: 12px;
+        padding: 4px 6px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--surface-2);
+        min-height: 20px;
+      }
+      .picker-crumb {
+        padding: 2px 6px;
+        border: none;
+        border-radius: var(--radius-sm);
+        background: transparent;
+        color: var(--ink-2);
+        font: inherit;
+        font-size: 12.5px;
+        cursor: pointer;
+        max-width: 160px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .picker-crumb:hover {
+        background: var(--surface);
+        color: var(--ink);
+      }
+      .picker-crumb.current {
+        color: var(--ink);
+        font-weight: 600;
+      }
+      .picker-crumb-sep {
+        color: var(--ink-3, var(--ink-2));
+        font-size: 12px;
+        user-select: none;
+      }
+      .picker-list {
+        margin-top: 10px;
+        height: 280px;
+        overflow-y: auto;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+      }
+      .picker-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 10px;
+        font-size: 13px;
+        color: var(--ink);
+        cursor: pointer;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      .picker-row:hover {
+        background: var(--surface-2);
+      }
+      .picker-row-icon {
+        display: inline-flex;
+        flex: none;
+        color: var(--ink-2);
+      }
+      .picker-row-name {
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .picker-goto {
+        margin-top: 8px;
+      }
+      .picker-goto input {
         width: 100%;
-        padding: 5px 8px;
+        box-sizing: border-box;
+        padding: 4px 8px;
         border: 1px solid var(--line);
         border-radius: var(--radius-sm);
         background: var(--surface);
-        color: var(--ink);
+        color: var(--ink-2);
         font: inherit;
         font-size: 12px;
       }
-      .workspace-add input:focus {
+      .picker-goto input:focus {
         outline: none;
         border-color: var(--accent);
+        color: var(--ink);
+      }
+      .picker-empty {
+        padding: 10px;
+        font-size: 12.5px;
+        color: var(--ink-2);
+      }
+      .picker-error {
+        margin-top: 8px;
+        font-size: 12.5px;
+        color: var(--del);
       }
 
       /* The collapsed group holding archived conversations, at the tail of
@@ -2527,6 +2610,36 @@
           opacity: 1;
           transform: none;
         }
+      }
+
+      /* Full-screen dead-end shown when the gateway connection is lost. */
+      .bridge-lost-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 80;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background: color-mix(in srgb, var(--ink) 32%, transparent);
+      }
+      .bridge-lost-card {
+        width: min(440px, 100%);
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        box-shadow: var(--shadow-pop);
+      }
+      .bridge-lost-title {
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--ink);
+      }
+      .bridge-lost-body {
+        margin-top: 10px;
+        font-size: 13px;
+        line-height: 1.6;
+        color: var(--ink-2);
       }
 
       /* ---------- confirmation modal ---------- */

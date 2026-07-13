@@ -1,12 +1,32 @@
-// The engine-host bridge's calling core: locate the API object proton
-// injects, call one op, and normalize failures and replies. Shared by every
-// frontend package that talks to the host (the main package's engine/session
-// commands, the file editor's fs ops), so it lives beside the raw JS helpers
-// rather than in any one feature package.
+// The engine-host calling core: one `bridge_request` for every frontend
+// package that talks to the host, routed by origin. A `proton://` page is
+// the desktop window and calls the injected `__MoonBit__.openseek` op
+// directly; any other origin is a browser reached through a relay and sends
+// the same method over the page's WebSocket (docs/remote-protocol.md). The
+// method names and payloads are identical either way — callers and reply
+// decoders cannot tell the transports apart.
 
 ///|
 priv suberror BridgeError {
   BridgeError(String)
+}
+
+///|
+impl Show for BridgeError with fn output(self, logger) {
+  match self {
+    BridgeError(message) => logger.write_string(message)
+  }
+}
+
+///|
+/// Whether this page is the desktop webview (served from `proton://app/`,
+/// where the `__MoonBit__` bridge is injected) as opposed to a browser.
+pub fn using_proton_bridge() -> Bool {
+  guard js_prop(@js.globalThis, "location") is Some(location) else {
+    return false
+  }
+  (@js.Cast::into((location.get_with_string("protocol") : @js.Value)) : String?)
+  is Some("proton:")
 }
 
 ///|
@@ -17,13 +37,18 @@ pub fn openseek_api() -> @js.Value? {
 }
 
 ///|
-/// Call one engine-host op and wait for its reply. Raises when the bridge
-/// is missing, the call throws, or the op rejects.
+/// Call one engine-host method and wait for its reply. Raises when the
+/// transport is missing/down, the call throws, or the host rejects the
+/// method.
 pub async fn bridge_request(op : String, payload : @js.Value) -> @js.Value {
-  guard openseek_api() is Some(api) && js_prop(api, op) is Some(_) else {
-    raise BridgeError("OpenSeek bridge unavailable")
+  if using_proton_bridge() {
+    guard openseek_api() is Some(api) && js_prop(api, op) is Some(_) else {
+      raise BridgeError("OpenSeek bridge unavailable")
+    }
+    js_method_promise(api, op, payload).wait()
+  } else {
+    ws_request(op, payload)
   }
-  js_method_promise(api, op, payload).wait()
 }
 
 ///|

@@ -20,7 +20,7 @@ fn read_workspace_symbols(
       payload["query"] = query
       @interop.set_workspace(payload, workspace)
       let reply = @interop.bridge_request(
-        "workspace_symbols",
+        "lsp.workspace_symbols",
         payload.to_value(),
       ) catch {
         _ => {

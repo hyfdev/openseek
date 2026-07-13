@@ -337,6 +337,13 @@ priv struct Model {
   // the user's default distro; `wsl_engine` empty means `openseek` on the
   // distro's PATH. All three persist to localStorage as they change.
   is_windows : Bool
+  // Whether this page is the desktop window (the proton webview) rather than
+  // a browser reached through a relay. Probed once at startup, like
+  // `is_windows`. Gates the self-update flow: applying an update swaps the
+  // bundle under the desktop process and relaunches through the window's
+  // close path — from a browser tab, `window.close()` exits nothing, and the
+  // update would yank the app out from under whoever is at the machine.
+  is_desktop : Bool
   wsl_enabled : Bool
   wsl_distro : String
   wsl_engine : String
@@ -381,8 +388,8 @@ priv struct Model {
   // Where "New chat" lands: a registered workspace path, or "" for the
   // default scratch store. Follows the conversation last opened or created.
   active_workspace : String
-  // The sidebar's add-workspace input text; None while the input is closed.
-  workspace_input : String?
+  // The in-app folder picker behind "Add a workspace"; None while closed.
+  workspace_picker : WorkspacePicker?
   // Whether the transcript is scrolled to its bottom. Streaming output only
   // auto-follows while this holds — scrolling up to read history must not be
   // yanked back down by the next delta. Maintained by a DOM scroll watcher;
@@ -441,6 +448,40 @@ priv struct Model {
 priv struct Launcher {
   open : Bool
   apps : LauncherApps
+}
+
+///|
+/// The in-app folder picker's state: the host directory currently shown,
+/// its parent (None at the filesystem root), its subdirectories, and the
+/// editable path field. `loading` marks a browse in flight; `error` keeps a
+/// failed navigation's message beside the previous listing, which stays
+/// usable. `generation` numbers the latest browse request — against a
+/// remote gateway replies can finish out of order, and only the newest
+/// one's reply may land, or a slow older listing would move the picker
+/// back and Confirm would register the wrong directory.
+priv struct WorkspacePicker {
+  path : String
+  entries : Array[String]
+  input : String
+  loading : Bool
+  error : String?
+  generation : Int
+}
+
+///|
+
+///|
+/// A picker that just opened: nothing browsed yet, first listing (the home
+/// directory) on its way.
+fn opening_workspace_picker() -> WorkspacePicker {
+  {
+    path: "",
+    entries: [],
+    input: "",
+    loading: true,
+    error: None,
+    generation: 1,
+  }
 }
 
 ///|
@@ -597,17 +638,28 @@ priv enum Msg {
   // The registered workspaces — the reply to `list_workspaces` and to a
   // successful add/remove alike.
   WorkspacesLoaded(Array[String])
-  // Ask the host for the system folder chooser; its pick is registered
-  // directly. Falls back to `OpenWorkspaceInput` on platforms without one.
+  // Open the in-app folder picker (browsing starts at the host's home
+  // directory). The picker renders host-side listings, so it works the
+  // same against the embedded gateway and a remote one.
   PickWorkspace
-  // Open the sidebar's manual add-workspace input.
-  OpenWorkspaceInput
-  // Close (or reopen) the sidebar's add-workspace input.
-  ToggleWorkspaceInput
-  // The add-workspace input's text changed.
-  WorkspaceInput(String)
-  // Submit the add-workspace input: register its path with the host.
-  AddWorkspace
+  // Browse into a directory: a subdirectory row, the parent, or the typed
+  // path field on Enter.
+  WorkspacePickerNavigate(String)
+  // One directory's listing came back from the host; `generation` names
+  // the browse request it answers, so a stale reply is dropped.
+  WorkspacePickerLoaded(
+    path~ : String,
+    entries~ : Array[String],
+    generation~ : Int
+  )
+  // A navigation failed; the message shows in the picker and the previous
+  // listing stays usable.
+  WorkspacePickerFailed(message~ : String, generation~ : Int)
+  // The picker's path field changed.
+  WorkspacePickerInput(String)
+  // Register the picker's current directory and close it.
+  WorkspacePickerConfirm
+  WorkspacePickerClose
   // Detach a workspace: only the registry entry goes away — the directory
   // and the sessions inside it stay, so re-adding restores them.
   RemoveWorkspace(String)
@@ -650,13 +702,21 @@ priv enum Msg {
   LaunchApp(String)
   // The host accepted a prompt: `session` routes the event to its
   // conversation, and everything after a `started` routes by `run_id`.
+  // `task` is the prompt text — a client that did not send it (another
+  // window, a mid-run join) has no other live source for the prompt bubble.
   Started(
     run_id~ : Int,
     session~ : String,
     model~ : String,
     max_steps~ : Int,
-    cwd~ : @pathx.Absolute?
+    cwd~ : @pathx.Absolute?,
+    task~ : String?
   )
+  // The complete in-flight run set, from an `agent.runs` resync. Any
+  // conversation still showing an open run this set lacks ended while the
+  // client was away — its terminal event is gone for good (reconnect =
+  // resync; transients are not replayed), so this is what closes it.
+  RunsSettled(live~ : Array[Int])
   // A stream event from `run_id`'s engine. `session` is the conversation the
   // host stamped on it (`None` when the payload carries no stamp): idle
   // events (the compaction lifecycle, background notices) route by it,
@@ -746,6 +806,7 @@ fn initial_model() -> Model {
     api_provider: Openseek,
     custom_api_url: "",
     is_windows: host_is_windows(),
+    is_desktop: @interop.using_proton_bridge(),
     wsl_enabled: false,
     wsl_distro: "",
     wsl_engine: "",
@@ -760,7 +821,7 @@ fn initial_model() -> Model {
     archived: [],
     workspaces: [],
     active_workspace: "",
-    workspace_input: None,
+    workspace_picker: None,
     transcript_pinned: true,
     screen: Chat,
     skills_catalog: CatalogIdle,

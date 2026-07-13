@@ -565,22 +565,57 @@ fn update_msg(
         ]),
         model,
       )
-    BridgeReady =>
-      (
-        // The installed skills also feed the composer's `$` completion, so they
-        // are fetched on connect rather than only when the Skills page opens.
-        // The startup update check rides here too: settings (the channel)
-        // load synchronously at Init, so they are in by bridge time.
-        @cmd.batch([
-          fetch_sessions(dispatch),
-          fetch_installed_skills(dispatch),
-          fetch_archived(dispatch),
-          fetch_workspaces(dispatch),
+    BridgeReady => {
+      // The installed skills also feed the composer's `$` completion, so they
+      // are fetched on connect rather than only when the Skills page opens.
+      // The startup update check rides here too: settings (the channel)
+      // load synchronously at Init, so they are in by bridge time.
+      let commands = [
+        fetch_sessions(dispatch),
+        // In-flight runs, so a page that joined (or reconnected) mid-run
+        // learns each live run's identity — the resync half of the
+        // protocol's reconnect story (docs/remote-protocol.md).
+        fetch_runs(dispatch),
+        fetch_installed_skills(dispatch),
+        fetch_archived(dispatch),
+        fetch_workspaces(dispatch),
+      ]
+      // Self-update is the desktop window's alone (see `is_desktop`); a
+      // browser never checks, so its update UI never materializes.
+      if model.is_desktop {
+        commands.push(
           check_for_updates(dispatch, model.update_channel, explicit=false),
-        ]),
+        )
+      }
+      // The resync's other half: whatever landed while this client was away
+      // (another client's prompts, items a still-running turn completed, a
+      // finished run's verdict) exists only in the store. Reads happen
+      // exactly where this client was absent: the conversation on screen
+      // re-reads now, every other one re-reads when opened (`OpenSession`
+      // always reloads). An in-flight user load keeps right of way.
+      let reload = match model.find_conversation(model.active_session) {
+        Some(conv) if conv.has_begun() && model.loading_session.is_empty() =>
+          Some(model.active_session)
+        _ => None
+      }
+      if reload is Some(session_id) {
+        commands.push(
+          open_session(
+            dispatch,
+            session_id,
+            workspace=model.session_workspace(session_id),
+          ),
+        )
+      }
+      (
+        @cmd.batch(commands),
         {
           ..model,
           bridge: Connected,
+          loading_session: match reload {
+            Some(session_id) => session_id
+            None => model.loading_session
+          },
           // An unusable endpoint routes straight to Settings — the composer
           // could do nothing anyway.
           screen: if model.api_ready() {
@@ -590,6 +625,7 @@ fn update_msg(
           },
         },
       )
+    }
     BridgeUnavailable(message) =>
       (@cmd.none, { ..model, bridge: BridgeLost(message) })
     SettingsLoaded(
@@ -1214,30 +1250,88 @@ fn update_msg(
         { ..model, workspaces: paths, conversations, active_workspace },
       )
     }
-    PickWorkspace => (pick_workspace(dispatch), model)
-    OpenWorkspaceInput => (@cmd.none, { ..model, workspace_input: Some("") })
-    ToggleWorkspaceInput =>
+    PickWorkspace => {
+      let picker = opening_workspace_picker()
       (
-        @cmd.none,
-        {
-          ..model,
-          workspace_input: if model.workspace_input is Some(_) {
-            None
-          } else {
-            Some("")
-          },
-        },
+        browse_directory(dispatch, "", generation=picker.generation),
+        { ..model, workspace_picker: Some(picker) },
       )
-    WorkspaceInput(text) =>
-      (@cmd.none, { ..model, workspace_input: Some(text) })
-    AddWorkspace => {
-      let path = model.workspace_input.unwrap_or("").trim().to_owned()
-      if path.is_empty() {
-        (@cmd.none, model)
-      } else {
-        (add_workspace(dispatch, path), { ..model, workspace_input: None })
-      }
     }
+    WorkspacePickerNavigate(path) =>
+      match model.workspace_picker {
+        Some(picker) => {
+          let generation = picker.generation + 1
+          (
+            browse_directory(dispatch, path, generation~),
+            {
+              ..model,
+              workspace_picker: Some({ ..picker, loading: true, generation }),
+            },
+          )
+        }
+        None => (@cmd.none, model)
+      }
+    WorkspacePickerLoaded(path~, entries~, generation~) =>
+      // A listing for a picker the user already closed — or one answering
+      // a navigation that has since been superseded — is dropped. The
+      // go-to field clears on arrival: the breadcrumb shows the location,
+      // and the field is for typing the next jump.
+      match model.workspace_picker {
+        Some(picker) if picker.generation == generation =>
+          (
+            @cmd.none,
+            {
+              ..model,
+              workspace_picker: Some({
+                path,
+                entries,
+                input: "",
+                loading: false,
+                error: None,
+                generation,
+              }),
+            },
+          )
+        _ => (@cmd.none, model)
+      }
+    WorkspacePickerFailed(message~, generation~) =>
+      match model.workspace_picker {
+        Some(picker) if picker.generation == generation =>
+          (
+            @cmd.none,
+            {
+              ..model,
+              workspace_picker: Some({
+                ..picker,
+                loading: false,
+                error: Some(message),
+              }),
+            },
+          )
+        _ => (@cmd.none, model)
+      }
+    WorkspacePickerInput(text) =>
+      match model.workspace_picker {
+        Some(picker) =>
+          (
+            @cmd.none,
+            { ..model, workspace_picker: Some({ ..picker, input: text }) },
+          )
+        None => (@cmd.none, model)
+      }
+    WorkspacePickerConfirm =>
+      match model.workspace_picker {
+        // Confirm registers the directory the host last listed — always
+        // something it confirmed exists — never raw field text; Enter in
+        // the field navigates (and validates) first.
+        Some(picker) if !picker.path.is_empty() =>
+          (
+            add_workspace(dispatch, picker.path),
+            { ..model, workspace_picker: None },
+          )
+        _ => (@cmd.none, model)
+      }
+    WorkspacePickerClose => (@cmd.none, { ..model, workspace_picker: None })
     RemoveWorkspace(path) => (remove_workspace(dispatch, path), model)
     WorkspaceFailed(message) =>
       model.notify_error(dispatch, "Workspace error: \{message}")
@@ -1290,16 +1384,34 @@ fn update_msg(
           { ..model, screen: Chat, loading_session: "", completion: None },
         )
       } else if model.find_conversation(session_id) is Some(conv) {
-        // The conversation already has live client state — it may well still
-        // be running — so switching is just a change of focus. A switch lands
-        // at the new conversation's tail, so the transcript re-pins.
+        // Switching focus; the transcript re-pins at the tail. The store is
+        // also re-read behind the switch — the local copy may date from
+        // before a reconnect, or another client may be driving this
+        // conversation — and the current view stays on screen while the
+        // reply is in flight. A conversation that never began has nothing
+        // stored to read.
         (
-          scroll_transcript_after_render(),
+          if conv.has_begun() {
+            @cmd.batch([
+              scroll_transcript_after_render(),
+              open_session(
+                dispatch,
+                session_id,
+                workspace=model.session_workspace(session_id),
+              ),
+            ])
+          } else {
+            scroll_transcript_after_render()
+          },
           {
             ..model.activate(session_id),
             screen: Chat,
             transcript_pinned: true,
-            loading_session: "",
+            loading_session: if conv.has_begun() {
+              session_id
+            } else {
+              ""
+            },
             completion: None,
             active_workspace: workspace_token(conv.workspace),
           },
@@ -1321,12 +1433,27 @@ fn update_msg(
     SessionLoaded(session=session_id, items~) =>
       if model.loading_session != session_id {
         (@cmd.none, model)
-      } else if model.find_conversation(session_id) is Some(conv) &&
-        conv.is_running() {
-        // A run that started in this conversation while the load was in flight
-        // wins; dropping the reply keeps the live state intact.
-        (@cmd.none, { ..model, loading_session: "" })
       } else {
+        // The store's transcript replaces the local copy wholesale — the
+        // store is the single source of truth for completed items, and
+        // nothing is ever synthesized on top of a loaded transcript, so
+        // duplicates are impossible by construction. Live client-side state
+        // (run phase, streaming buffers, pending steers, the composer
+        // draft) rides across untouched. The one hole: a prompt sent in the
+        // same instant the snapshot was taken may be missing from it — its
+        // own `started` event re-establishes the run, and the next reload
+        // brings the bubble.
+        let conv = match model.find_conversation(session_id) {
+          Some(conv) => { ..conv, messages: items }
+          None =>
+            {
+              ..empty_conversation(
+                session_id,
+                workspace=model.session_workspace(session_id),
+              ),
+              messages: items,
+            }
+        }
         (
           // The host derives the resumed workspace from the session id, so
           // the branch probe sends no cwd.
@@ -1335,15 +1462,7 @@ fn update_msg(
             fetch_branch(dispatch, session_id, None),
           ]),
           {
-            ..model
-            .replace_conversation({
-              ..empty_conversation(
-                session_id,
-                workspace=model.session_workspace(session_id),
-              ),
-              messages: items,
-            })
-            .activate(session_id),
+            ..model.replace_conversation(conv).activate(session_id),
             transcript_pinned: true,
             loading_session: "",
             completion: None,
@@ -1399,39 +1518,103 @@ fn update_msg(
         { ..model, launcher: { ..model.launcher, open: false } },
       )
     }
-    Started(run_id~, session~, model=selected_model, max_steps~, cwd~) =>
-      if model.find_conversation(session) is Some(conv) {
-        let updated = model.replace_conversation({
-          ..conv,
-          run: Open(run_id~, stage=Opened),
-          last_run_id: Some(run_id),
-          // A started run always reports its directory, but a malformed
-          // event decodes as `None`; keeping the previous root beats
-          // forgetting one we already knew.
-          cwd: if cwd is Some(_) {
-            cwd
-          } else {
-            conv.cwd
-          },
-        })
-        // The run's workspace directory now exists, so the branch chip can be
-        // probed (and refreshed — a rerun may follow a checkout).
-        let branch_cmd = fetch_branch(dispatch, session, cwd)
-        // Sync the global model/step settings only when this start belongs to
-        // the conversation on screen. A slow background start (the user switched
-        // chats mid-spawn) must not overwrite settings the user has since
-        // changed for the now-active conversation.
-        if session == model.active_session {
+    Started(run_id~, session~, model=selected_model, max_steps~, cwd~, task~) => {
+      // A run another client started may reach us with no local conversation
+      // for its session (an `agent.runs` resync on a fresh page, or a live
+      // start for a session this client never opened): materialize one, so
+      // the run is trackable — streamable, cancellable, steerable — from
+      // every client, not just the one that sent the prompt. A run this
+      // client sent is already `Starting` when its `started` arrives (the
+      // send handler flips the phase before the request leaves); anything
+      // else is another client's run.
+      let (conv, foreign) = match model.find_conversation(session) {
+        Some(conv) => (conv, !conv.is_running())
+        None =>
           (
-            branch_cmd,
-            { ..updated, selected_model, max_steps: max_steps.to_string() },
+            empty_conversation(
+              session,
+              workspace=model.session_workspace(session),
+            ),
+            true,
           )
-        } else {
-          (branch_cmd, updated)
-        }
-      } else {
-        (@cmd.none, model)
       }
+      // The prompt bubble: the sender appended its own copy when it sent; a
+      // materialized (empty) conversation starts from the pushed `task`. An
+      // existing transcript is never appended to — the reload below brings
+      // the store's copy, so duplicates are impossible by construction.
+      let conv = match task {
+        Some(task) if foreign && conv.messages.is_empty() && !task.is_empty() =>
+          conv.append_item(User, task)
+        _ => conv
+      }
+      let updated = model.replace_conversation({
+        ..conv,
+        run: Open(run_id~, stage=Opened),
+        last_run_id: Some(run_id),
+        // A started run always reports its directory, but a malformed
+        // event decodes as `None`; keeping the previous root beats
+        // forgetting one we already knew.
+        cwd: if cwd is Some(_) {
+          cwd
+        } else {
+          conv.cwd
+        },
+      })
+      // The run's workspace directory now exists, so the branch chip can be
+      // probed (and refreshed — a rerun may follow a checkout).
+      let commands = [fetch_branch(dispatch, session, cwd)]
+      // A foreign run means the store holds items this client never saw —
+      // the prompt at least. The conversation on screen re-reads it now; a
+      // background one re-reads when opened (`OpenSession` always reloads).
+      // An in-flight user load keeps right of way.
+      let updated = if foreign &&
+        session == updated.active_session &&
+        updated.loading_session.is_empty() {
+        commands.push(
+          open_session(
+            dispatch,
+            session,
+            workspace=updated.session_workspace(session),
+          ),
+        )
+        { ..updated, loading_session: session }
+      } else {
+        updated
+      }
+      // Sync the global model/step settings only when this start belongs to
+      // the conversation on screen. A slow background start (the user switched
+      // chats mid-spawn) must not overwrite settings the user has since
+      // changed for the now-active conversation.
+      if session == updated.active_session {
+        (
+          @cmd.batch(commands),
+          { ..updated, selected_model, max_steps: max_steps.to_string() },
+        )
+      } else {
+        (@cmd.batch(commands), updated)
+      }
+    }
+    RunsSettled(live~) => {
+      // A conversation still showing an open run the host no longer has: the
+      // run ended while this client was away, and its terminal event will
+      // never be replayed, so the phase settles here. How it ended is
+      // unknowable (`ended=None`); the verdict text lives in the store and
+      // arrives through the usual reads — the active conversation reloads at
+      // `BridgeReady`, the rest when opened. Only `Open` phases settle: a
+      // `Starting` one belongs to a send still in flight, whose own
+      // `started` (or failure) is coming.
+      let settled = model.conversations.map(conv => {
+        match conv.run {
+          Open(run_id~, ..) if !live.contains(run_id) =>
+            {
+              ..conv.clear_streams().sweep_pending_steers(),
+              run: NoRun(ended=None),
+            }
+          _ => conv
+        }
+      })
+      (@cmd.none, { ..model, conversations: settled })
+    }
     Engine(run_id, event, session~) => {
       // Compaction and background notices happen between turns, so their
       // events arrive after the run that owned `run_id` cleared
@@ -1913,7 +2096,7 @@ test "open session is a no-op for the current session" {
 }
 
 ///|
-test "open session switches to a live conversation without reloading it" {
+test "open session keeps live state on screen while re-reading the store" {
   let dispatch = test_dispatch()
   let background = {
     ..empty_conversation("desktop-bg"),
@@ -1925,9 +2108,11 @@ test "open session switches to a live conversation without reloading it" {
   let (_, once) = update(dispatch, OpenSession("desktop-bg"), model)
   let (_, twice) = update(dispatch, OpenSession("desktop-bg"), model)
   inspect(once.active_session, content="desktop-bg")
-  // The live state survives the switch: no reload, nothing reset.
+  // The live state stays on screen; the store re-read happens behind it
+  // (this client may have been absent for part of this conversation).
   inspect(once.active().streaming_response, content="mid-stream")
   inspect(once.active().is_running(), content="true")
+  inspect(once.loading_session, content="desktop-bg")
   // The previous conversation is still running in the background.
   guard once.find_conversation("desktop-test") is Some(old) else {
     fail("expected the old conversation to survive")
@@ -2059,7 +2244,7 @@ test "session loaded swaps the active conversation onto the stored session" {
 }
 
 ///|
-test "session loaded is dropped only when that conversation is running" {
+test "session loaded adopts the store transcript and keeps live run state" {
   let dispatch = test_dispatch()
   let model = { ..running_model(), loading_session: "desktop-stored" }
   let items : Array[@transcript.TranscriptItem] = [
@@ -2076,15 +2261,22 @@ test "session loaded is dropped only when that conversation is running" {
     fail("expected the running conversation to survive")
   }
   inspect(live.is_running(), content="true")
-  // A stale load reply for the running conversation itself is dropped.
-  let model = { ..running_model(), loading_session: "desktop-test" }
+  // A load reply for the running conversation itself adopts the store's
+  // transcript — the source of truth for completed items — while the live
+  // run state (phase, streaming buffers) rides across untouched.
+  let streaming = running_model().replace_conversation({
+    ..running_conversation(),
+    streaming_response: "mid-step",
+  })
   let (_, same) = update(
     dispatch,
     SessionLoaded(session="desktop-test", items~),
-    model,
+    { ..streaming, loading_session: "desktop-test" },
   )
-  inspect(same.active().messages.length(), content="0")
+  inspect(same.active().messages.length(), content="1")
+  inspect(same.active().messages[0].content, content="stored")
   inspect(same.active().is_running(), content="true")
+  inspect(same.active().streaming_response, content="mid-step")
 }
 
 ///|
@@ -2098,6 +2290,7 @@ test "started routes by session and records the host's workspace" {
       model="deepseek-v4-pro",
       max_steps=1000,
       cwd=Some(Absolute("/home/u/Documents/OpenSeek/desktop-test")),
+      task=None,
     ),
     test_model(),
   )
@@ -2109,10 +2302,13 @@ test "started routes by session and records the host's workspace" {
   guard next.active().run is Open(run_id=7, ..) else {
     fail("expected the run id to be recorded")
   }
+  // A run this client did not send: the store gained its prompt, so the
+  // on-screen conversation re-reads it.
+  inspect(next.loading_session, content="desktop-test")
 }
 
 ///|
-test "started for an unknown session leaves the model alone" {
+test "started for an unknown session materializes its conversation" {
   let dispatch = test_dispatch()
   let (_, next) = update(
     dispatch,
@@ -2122,11 +2318,59 @@ test "started for an unknown session leaves the model alone" {
       model="deepseek-v4-pro",
       max_steps=1000,
       cwd=None,
+      task=Some("fix the flaky test"),
     ),
     test_model(),
   )
+  // Another client's run is now trackable here: cancellable, steerable,
+  // and its events route to a real conversation.
+  guard next.find_conversation("desktop-ghost") is Some(ghost) else {
+    fail("expected the foreign run's conversation to materialize")
+  }
+  inspect(ghost.is_running(), content="true")
+  guard ghost.run is Open(run_id=7, ..) else {
+    fail("expected the run id to be recorded")
+  }
+  // The pushed prompt becomes the bubble — a materialized conversation has
+  // no other live source for it.
+  inspect(ghost.messages.length(), content="1")
+  inspect(ghost.messages[0].content, content="fix the flaky test")
+  // Focus stays where the user is.
+  inspect(next.active_session, content="desktop-test")
   inspect(next.active().is_running(), content="false")
-  inspect(next.conversations.length(), content="1")
+}
+
+///|
+test "runs settled closes runs the host no longer has, sparing live and starting ones" {
+  let dispatch = test_dispatch()
+  // A run that ended while this client was away: its terminal event is
+  // gone for good, so only the `agent.runs` reply can close it.
+  let stale = {
+    ..empty_conversation("desktop-stale"),
+    run: Open(run_id=9, stage=AtStep(Some(4))),
+    streaming_response: "mid-step",
+  }
+  // A send still in flight has no run id yet; its own `started` (or
+  // failure) is coming and must be the one to settle it.
+  let starting = { ..empty_conversation("desktop-starting"), run: Starting }
+  let model = running_model()
+    .replace_conversation(stale)
+    .replace_conversation(starting)
+  let (_, next) = update(dispatch, RunsSettled(live=[7]), model)
+  // Run 7 is still in flight on the host: untouched.
+  inspect(next.active().is_running(), content="true")
+  guard next.find_conversation("desktop-stale") is Some(settled) else {
+    fail("expected the stale conversation")
+  }
+  inspect(settled.is_running(), content="false")
+  inspect(settled.streaming_response, content="")
+  guard settled.run is NoRun(ended=None) else {
+    fail("expected the stale run to settle without a verdict")
+  }
+  guard next.find_conversation("desktop-starting") is Some(sending) else {
+    fail("expected the starting conversation")
+  }
+  assert_true(sending.run is Starting)
 }
 
 ///|

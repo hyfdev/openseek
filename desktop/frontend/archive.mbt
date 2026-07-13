@@ -13,7 +13,7 @@ fn fetch_archived(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
       // A host without the op (or without a session store) just reads as an
       // empty Archived group.
       let reply = @interop.bridge_request(
-        "archived_sessions",
+        "session.list_archived",
         @js.Object::new().to_value(),
       ) catch {
         _ => return
@@ -32,12 +32,12 @@ fn fetch_archived(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
 
 ///|
 fn archive_session(dispatch : @cmd.Emit[Msg], session : String) -> @cmd.Cmd {
-  archive_action(dispatch, "archive_session", session)
+  archive_action(dispatch, "session.archive", session)
 }
 
 ///|
 fn unarchive_session(dispatch : @cmd.Emit[Msg], session : String) -> @cmd.Cmd {
-  archive_action(dispatch, "unarchive_session", session)
+  archive_action(dispatch, "session.unarchive", session)
 }
 
 ///|
@@ -69,7 +69,7 @@ fn archive_action(
       // The record moved between the live and archived stores; the sidebar's
       // live list is stale until re-fetched.
       let sessions = @interop.bridge_request(
-        "list_sessions",
+        "session.list",
         @js.Object::new().to_value(),
       ) catch {
         error => {

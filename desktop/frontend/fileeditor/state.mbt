@@ -81,11 +81,11 @@ pub(all) struct RememberedTabs {
 }
 
 ///|
-/// One file's decoded `stat_files` result: its current mtime signature, or
-/// `""` when the file is missing.
+/// One file's decoded `fs.stat_files` result: its current mtime signature,
+/// absent when the file is missing.
 pub(all) struct FileStat {
   path : @pathx.Relative
-  sig : String
+  sig : String?
 }
 
 ///|

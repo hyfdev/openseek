@@ -13,6 +13,7 @@ import {
   "justjavac/proton@0.1.10",
   "tonyfettes/platform@0.1.1",
   "tonyfettes/xlog@0.4.0",
+  "hackwaly/moonback@0.7.0",
 }
 
 readme = "README.md"

@@ -8,7 +8,7 @@ fn fetch_skills_catalog(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
-        "skills_catalog",
+        "skills.catalog",
         @js.Object::new().to_value(),
       ) catch {
         error => {
@@ -36,7 +36,7 @@ fn fetch_installed_skills(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
-        "skills_installed",
+        "skills.installed",
         @js.Object::new().to_value(),
       ) catch {
         error => {
@@ -77,7 +77,7 @@ fn install_skill(
         payload["package_path"] = item.package_path
       }
       let _ : @js.Value = @interop.bridge_request(
-        "skill_install",
+        "skills.install",
         payload.to_value(),
       ) catch {
         error => {
@@ -103,7 +103,7 @@ fn uninstall_skill(dispatch : @cmd.Emit[Msg], id : String) -> @cmd.Cmd {
       let payload = @js.Object::new()
       payload["id"] = id
       let _ : @js.Value = @interop.bridge_request(
-        "skill_uninstall",
+        "skills.uninstall",
         payload.to_value(),
       ) catch {
         error => {

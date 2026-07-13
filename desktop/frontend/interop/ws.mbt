@@ -1,0 +1,215 @@
+// The browser transport: JSON-RPC 2.0 over the page's WebSocket
+// (docs/remote-protocol.md). Requests are correlated by a client-scoped id
+// against a pending map; notifications go to the handler the main package
+// installed. The connection is a process-wide singleton — `bridge_request`
+// is called from every feature package, and they all mean "the page's one
+// connection to its host".
+
+///|
+/// One live (or connecting) WebSocket session.
+priv struct RpcSession {
+  socket : @js.Value
+  // id → the `Promise.withResolvers()` record of the awaiting request.
+  pending : Map[Int, @js.Value]
+  mut next_id : Int
+  mut open_ : Bool
+}
+
+///|
+/// The page's connection; None before `ws_connect` (or on a proton page,
+/// which never calls it).
+let active_session : Ref[RpcSession?] = Ref(None)
+
+///|
+/// The document base path — everything up to and including the last `/` of
+/// the page's own pathname. The WebSocket URL is built relative to it so a
+/// relay that serves the app under `/d/<device>/` keeps that prefix. This
+/// is the one thing the relay's path scheme needs from the frontend.
+fn api_base() -> String {
+  guard js_prop(@js.globalThis, "location") is Some(location) else {
+    return "/"
+  }
+  let pathname : String? = @js.Cast::into(
+    (location.get_with_string("pathname") : @js.Value),
+  )
+  guard pathname is Some(pathname) && !pathname.is_empty() else { return "/" }
+  match pathname.rev_find("/") {
+    Some(index) => pathname[:index + 1].to_owned()
+    None => "/"
+  }
+}
+
+///|
+/// The page's protocol WebSocket URL: same origin, document-relative path,
+/// `ws`/`wss` following `http`/`https`.
+fn ws_url() -> String? {
+  guard js_prop(@js.globalThis, "location") is Some(location) else {
+    return None
+  }
+  guard (
+      @js.Cast::into((location.get_with_string("host") : @js.Value)) : String?)
+    is Some(host) &&
+    !host.is_empty() else {
+    return None
+  }
+  let protocol : String? = @js.Cast::into(
+    (location.get_with_string("protocol") : @js.Value),
+  )
+  let scheme = if protocol is Some("https:") { "wss://" } else { "ws://" }
+  Some(scheme + host + api_base() + "api/v1/ws")
+}
+
+///|
+/// Open (or replace) the page's connection. `on_notification` receives every
+/// host-pushed notification's method and params; `on_down` fires once when
+/// the socket closes for any reason — the caller owns backoff and calls
+/// `ws_connect` again. Requests issued while down fail fast with a
+/// user-facing message.
+pub fn ws_connect(
+  on_notification~ : (String, Map[String, Json]) -> Unit,
+  on_down~ : () -> Unit,
+) -> Unit {
+  guard ws_url() is Some(url) else {
+    on_down()
+    return
+  }
+  let ctor : @js.Value = @js.globalThis.get_with_string("WebSocket")
+  let socket : @js.Value = ctor.new([url])
+  let session : RpcSession = {
+    socket,
+    pending: Map([]),
+    next_id: 1,
+    open_: false,
+  }
+  active_session.val = Some(session)
+  socket.set_with_string("onopen", (_event : @js.Value) => session.open_ = true)
+  socket.set_with_string("onmessage", (event : @js.Value) => {
+    handle_message(session, event, on_notification)
+  })
+  socket.set_with_string("onclose", (_event : @js.Value) => {
+    session.open_ = false
+    reject_all(session, "OpenSeek connection lost")
+    // Only the current session reports down — a replaced socket's late
+    // close must not double-trigger the reconnect loop.
+    if active_session.val is Some(current) && physical_equal(current, session) {
+      active_session.val = None
+      on_down()
+    }
+  })
+}
+
+///|
+/// Send one request over the page's connection and wait for its reply.
+async fn ws_request(op : String, payload : @js.Value) -> @js.Value {
+  guard active_session.val is Some(session) && session.open_ else {
+    raise BridgeError("OpenSeek connection is down")
+  }
+  let id = session.next_id
+  session.next_id += 1
+  let frame = @js.Object::new()
+  frame["jsonrpc"] = "2.0"
+  frame["id"] = id
+  frame["method"] = op
+  frame["params"] = payload
+  let text = json_text(frame.to_value())
+  let promise_ctor : @js.Value = @js.globalThis.get_with_string("Promise")
+  let deferred : @js.Value = promise_ctor.apply_with_string(
+    "withResolvers",
+    ([] : Array[@js.Value]),
+  )
+  session.pending[id] = deferred
+  let _ : @js.Value = session.socket.apply_with_string("send", [
+    @js.Value::cast_from(text),
+  ])
+  let promise : @js.Promise = @js.Value::cast(
+    (deferred.get_with_string("promise") : @js.Value),
+  )
+  promise.wait()
+}
+
+///|
+/// Route one inbound frame: a response settles its pending request; a
+/// notification goes to the handler. Anything else is a peer bug and is
+/// dropped.
+fn handle_message(
+  session : RpcSession,
+  event : @js.Value,
+  on_notification : (String, Map[String, Json]) -> Unit,
+) -> Unit {
+  guard js_prop(event, "data") is Some(data) &&
+    (@js.Cast::into(data) : String?) is Some(text) else {
+    return
+  }
+  let envelope = @js.Value::from_json_string(text) catch { _ => return }
+  if js_prop(envelope, "method") is Some(method_value) {
+    guard (@js.Cast::into(method_value) : String?) is Some(method_) else {
+      return
+    }
+    let params = match js_prop(envelope, "params") {
+      Some(params) => params.to_json() catch { _ => return }
+      None => Json::empty_object()
+    }
+    guard params is Object(fields) else { return }
+    on_notification(method_, fields)
+    return
+  }
+  guard js_prop(envelope, "id") is Some(id_value) &&
+    (@js.Cast::into(id_value) : Int?) is Some(id) else {
+    return
+  }
+  // A reply for a request this session no longer tracks (settled twice, or
+  // raced a reconnect) has no one waiting.
+  guard session.pending.get(id) is Some(deferred) else { return }
+  session.pending.remove(id)
+  match js_prop(envelope, "error") {
+    Some(error_value) => {
+      let message = match (error_value.to_json() catch { _ => Json::null() }) {
+        { "message": String(message), .. } => message
+        _ => "request failed"
+      }
+      settle(deferred, "reject", js_error(message))
+    }
+    None => {
+      let result = match js_prop(envelope, "result") {
+        Some(result) => result
+        // A result-less success settles as an empty reply, which
+        // `reply_json_text` reads as `{}`.
+        None => @js.Object::new().to_value()
+      }
+      settle(deferred, "resolve", result)
+    }
+  }
+}
+
+///|
+/// Fail every in-flight request — the socket is gone; callers surface the
+/// message wherever the op's error lands.
+fn reject_all(session : RpcSession, message : String) -> Unit {
+  for _, deferred in session.pending {
+    settle(deferred, "reject", js_error(message))
+  }
+  session.pending.clear()
+}
+
+///|
+fn settle(deferred : @js.Value, way : String, value : @js.Value) -> Unit {
+  let _ : @js.Value = deferred.apply_with_string(way, [value])
+}
+
+///|
+fn js_error(message : String) -> @js.Value {
+  let ctor : @js.Value = @js.globalThis.get_with_string("Error")
+  ctor.new([message])
+}
+
+///|
+/// `JSON.stringify(value)` — request payloads are plain data objects, so
+/// the round trip through text is lossless.
+fn json_text(value : @js.Value) -> String {
+  let json : @js.Value = @js.globalThis.get_with_string("JSON")
+  let text : @js.Value = json.apply_with_string("stringify", [value])
+  match (@js.Cast::into(text) : String?) {
+    Some(text) => text
+    None => "{}"
+  }
+}

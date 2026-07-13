@@ -1,0 +1,27 @@
+import {
+  "openseek_desktop/internal/applauncher",
+  "openseek_desktop/internal/engine",
+  "openseek_desktop/internal/home",
+  "openseek_desktop/internal/jsonrpc",
+  "openseek_desktop/internal/jsonx",
+  "openseek_desktop/internal/lsp",
+  "openseek_desktop/internal/moonbit",
+  "openseek_desktop/internal/pathx",
+  "openseek_desktop/internal/platform",
+  "openseek_desktop/internal/skillmarket",
+  "openseek_desktop/internal/update",
+  "openseek_desktop/internal/uri",
+  "openseek_desktop/internal/version",
+  "moonbitlang/async",
+  "moonbitlang/async/fs",
+  "moonbitlang/async/os_error",
+  "moonbitlang/async/process",
+  "moonbitlang/async/semaphore",
+  "moonbitlang/core/json",
+  "moonbitlang/x/path",
+  "tonyfettes/xlog",
+}
+
+warnings = "+test_unqualified_package+unnecessary_annotation+unnecessary_view_op+ambiguous_range_direction+unqualified_local_using"
+
+supported_targets = "+native"
