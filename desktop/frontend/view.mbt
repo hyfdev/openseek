@@ -84,7 +84,9 @@ fn model_select(dispatch : @cmd.Emit[Msg], selected : String) -> @html.Html {
 
 ///|
 fn conversation_title(conv : Conversation) -> String {
-  for item in conv.messages {
+  // Visible items, so a conversation titles itself the moment its prompt is
+  // sent (the overlay bubble) rather than only once the store commits it.
+  for item in conv.visible_items() {
     if item.kind is User {
       // A prompt sent with chips titles by what was typed (or, chips alone,
       // by their labels) — never by the raw `<user_mentions>` envelope.
@@ -1068,7 +1070,12 @@ fn transcript_view(
   on_open : (String) -> @cmd.Cmd,
 ) -> @html.Html {
   let items : Array[@html.Html] = []
-  if conv.messages.is_empty() {
+  // The durable transcript plus the not-yet-committed overlay (the just-sent
+  // prompt, a step's settled text): one list, rendered through one folding
+  // pass, so an item neither moves nor restyles when its commit lands and it
+  // migrates from overlay to durable.
+  let visible = conv.visible_items()
+  if visible.is_empty() {
     items.push(
       @html.div(class="empty", [
         @html.div(class="empty-badge", "✦"),
@@ -1088,11 +1095,10 @@ fn transcript_view(
     // lands. User messages and error bubbles always break the run and stay
     // visible.
     let mut index = 0
-    while index < conv.messages.length() {
-      guard conv.messages[index].kind
-        is (Tool(..) | Reasoning | Assistant(false)) else {
+    while index < visible.length() {
+      guard visible[index].kind is (Tool(..) | Reasoning | Assistant(false)) else {
         items.push(
-          transcript_item_view(conv.messages[index], on_open, on_jump=target => {
+          transcript_item_view(visible[index], on_open, on_jump=target => {
             dispatch(
               JumpToLocation(
                 path=target.file,
@@ -1106,10 +1112,9 @@ fn transcript_view(
         continue
       }
       let run : Array[@transcript.TranscriptItem] = []
-      while index < conv.messages.length() &&
-            conv.messages[index].kind
-            is (Tool(..) | Reasoning | Assistant(false)) {
-        run.push(conv.messages[index])
+      while index < visible.length() &&
+            visible[index].kind is (Tool(..) | Reasoning | Assistant(false)) {
+        run.push(visible[index])
         index = index + 1
       }
       push_run(items, run, on_open)
@@ -2079,7 +2084,7 @@ fn launcher_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
   // A conversation's workspace exists only once it has run; a fresh chat with
   // no turn yet has nothing to open, so the launcher is disabled until then.
   let conv = model.active()
-  let ready = !conv.messages.is_empty() || conv.is_running()
+  let ready = !conv.visible_items().is_empty() || conv.is_running()
   let children : Array[@html.Html] = [
     @html.button(
       class=if model.launcher.open {

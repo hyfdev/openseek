@@ -274,7 +274,7 @@ test "opening a stored session adopts its workspace" {
   inspect(opening.loading_session, content="desktop-w")
   let (_, loaded) = update(
     dispatch,
-    SessionLoaded(session="desktop-w", items=[]),
+    SessionLoaded(session="desktop-w", items=[], watermark=0),
     opening,
   )
   assert_true(loaded.active().workspace is Some(Absolute("/proj")))

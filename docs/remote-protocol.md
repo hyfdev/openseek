@@ -94,9 +94,12 @@ any auth checks — it is a splicer for local work, never for deployment.
 
 ## Connection lifecycle: reconnect = resync
 
-There is **no resume machinery**: no sequence numbers, no cursor, no replay.
-A connection delivers events from the moment it exists; whatever a client
-missed while disconnected it recovers by re-reading state:
+There is **no resume machinery**: no connection cursor and no replay. (The
+one sequence that exists is per-session and durable, not per-connection:
+`session.event` carries the store's own event sequence — see *The durable
+transcript* below — and a reconnect recovers missed commits by re-reading,
+never by replay.) A connection delivers events from the moment it exists;
+whatever a client missed while disconnected it recovers by re-reading state:
 
 1. Connect the WebSocket. Notifications start flowing immediately.
 2. Resync: `session.list` + `agent.runs` (and reload whatever conversation
@@ -149,7 +152,7 @@ Notifications:
 
 | method | params |
 |---|---|
-| `agent.started` | `{run_id, task, session, model, max_steps, cwd?}` — `task` is the prompt text, the only live source of the prompt bubble for a client that did not send it |
+| `agent.started` | `{run_id, task, session, model, max_steps, cwd?}` — `task` is the prompt text, kept for old clients that synthesize the prompt bubble from it; current clients take the bubble from the prompt's own `session.event` commit |
 | `agent.event` | `{run_id?, session, event: {…}}` — the engine's event object verbatim (`assistant_delta`, `tool_result`, `agent_finished`, …); `run_id` is absent for events emitted before any run of the engine process's lifetime (a compaction on a freshly spawned engine), which route by `session` |
 | `agent.error` | `{message, run_id?, diagnostics?}` |
 | `agent.finished` | `{run_id, status, answer?}` |
@@ -159,16 +162,50 @@ Notifications:
 | method | params | result |
 |---|---|---|
 | `session.list` | `{}` | the session index |
-| `session.load` | `{session, workspace?}` | `{session: <transcript>}` |
+| `session.load` | `{session, workspace?}` | `{session: <the durable session JSON>, watermark}` — `watermark` is the highest event `sequence` the snapshot contains (0 for an empty record) |
 | `session.list_archived` | `{}` | the archived index |
 | `session.archive` | `{session}` | outcome |
 | `session.unarchive` | `{session}` | outcome |
 
-Notification:
+Notifications:
 
 | method | params |
 |---|---|
+| `session.event` | `{session, sequence, event: {sequence, ts, item}}` — one durably **committed** store event, `event` verbatim as `session.load` carries it in `events`; see *The durable transcript* below |
 | `session.changed` | `{change: "archived" \| "unarchived", session}` — broadcast to every client (the requester included) when a conversation moves between the live and archived stores; recipients re-read both lists and drop live state for an archived record |
+
+#### The durable transcript: snapshots + commits
+
+A conversation's durable transcript has exactly two sources: the
+`session.load` snapshot and the `session.event` commits that follow it. A
+commit exists **if and only if** its item is in the session's durable
+record, and `sequence` is the item's one-based position there — contiguous
+per session. Everything else on the wire (`agent.event` deltas and full
+messages, `agent.started`'s `task`, steer receipts) is display overlay and
+lifecycle signal: show it live, but never persist it into the transcript —
+its durable form arrives as a commit.
+
+Client algorithm, per session: keep a watermark `W`, starting at the
+snapshot's. For each `session.event`: `sequence ≤ W` → drop (re-broadcasts
+and load/commit races are harmless by construction); `sequence == W + 1` →
+apply and advance; `sequence > W + 1` → a gap (missed broadcasts — a slow
+client kicked, a host restart, an external CLI writer): re-read via
+`session.load`, buffering commits that arrive meanwhile, and reconcile them
+against the new snapshot's watermark.
+
+The host broadcasts commits while it manages a live writer for the session
+(an engine process, spawn to exit — the exit is preceded by a final sweep of
+whatever the engine persisted last). Between engines nothing writes on the
+host's behalf, so there is nothing to broadcast; anything an *external*
+writer (the CLI sharing the session) appends meanwhile surfaces as a gap on
+the next commit, which the reload answers. Compaction may drop summarized
+events from the record; sequences never renumber, so the summary's commit
+still applies contiguously.
+
+Old clients ignore `session.event` and keep building the transcript from
+`agent.event` as before; old hosts never send it (and their `session.load`
+reply has no `watermark`), which a new client reads as "no commits will
+come" and behaves exactly like the old one.
 
 ### settings.* — the host-owned engine endpoint settings
 

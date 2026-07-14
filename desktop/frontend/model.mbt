@@ -205,7 +205,40 @@ priv struct Conversation {
   // Shown as pending bubbles until then; leftovers are swept into dropped
   // notices when the run ends, so the text never vanishes silently.
   pending_steers : Array[String]
+  // The durable transcript: exactly what `session.load` snapshots and
+  // `session.event` commits said, nothing else. Copy-on-write.
   messages : Array[@transcript.TranscriptItem]
+  // The highest durable sequence `messages` reflects: commits at or below it
+  // are already applied, `watermark + 1` applies next, and anything later is
+  // a gap — this client missed a broadcast — answered by a reload.
+  watermark : Int
+  // Where the durable transcript stands relative to the store; see
+  // `TranscriptSync`.
+  sync : TranscriptSync
+  // Display-only items the durable record has not committed yet: the
+  // just-sent prompt, a step's settled text, tool cards, steer echoes, and
+  // client-local notices (a rejected start, a dropped steer). Rendered after
+  // `messages`; each durable commit retires its overlay twin (matched by
+  // kind FIFO — worst case a twin lingers until the next same-kind commit or
+  // reload, a purely cosmetic miss). Copy-on-write.
+  overlay : Array[@transcript.TranscriptItem]
+}
+
+///|
+/// Whether the conversation's durable transcript is up to date with the
+/// store, or a re-read is in flight. Commits that arrive mid-reload are
+/// buffered — the snapshot they follow may or may not contain them, and the
+/// watermark decides once it lands.
+priv enum TranscriptSync {
+  Synced
+  Reloading(buffered~ : Array[BufferedCommit])
+}
+
+///|
+priv struct BufferedCommit {
+  sequence : Int
+  kind : String
+  payload : Map[String, Json]
 }
 
 ///|
@@ -672,12 +705,37 @@ priv enum Msg {
   // the conversation that owned that run (the window itself is already
   // brought forward natively).
   NotificationClicked(run_id~ : String)
-  SessionLoaded(session~ : String, items~ : Array[@transcript.TranscriptItem])
+  SessionLoaded(
+    session~ : String,
+    items~ : Array[@transcript.TranscriptItem],
+    watermark~ : Int
+  )
   // Loading a stored session failed before its conversation ever existed
   // (bridge call errored, or the data was malformed): pops an error toast
   // rather than poisoning the conversation on screen. `session` says which
   // request failed, so a load abandoned by a newer selection is dropped.
   SessionLoadFailed(session~ : String, message~ : String)
+  // A background re-read of a conversation's durable record (a commit-gap
+  // resync, or a reload for a foreign run): same data as `SessionLoaded`,
+  // but it never activates the conversation or steals the screen.
+  SessionRefreshed(
+    session~ : String,
+    items~ : Array[@transcript.TranscriptItem],
+    watermark~ : Int
+  )
+  // A background re-read failed. The conversation drops back to `Synced`
+  // (with its buffered commits discarded) — the next commit's gap check
+  // retries the reload, so a transient read failure heals itself.
+  SessionRefreshFailed(session~ : String)
+  // The host's `session.event` broadcast: one durably committed store event.
+  // Together with `session.load` snapshots these are the transcript's only
+  // durable sources; the live `agent.event` stream is display overlay.
+  SessionCommitted(
+    session~ : String,
+    sequence~ : Int,
+    kind~ : String,
+    payload~ : Map[String, Json]
+  )
   // A host-side action with no conversation of its own (opening a file in
   // the system app, launching an app) failed: pops an error toast.
   HostActionFailed(String)
@@ -838,6 +896,9 @@ fn empty_conversation(
     streaming_reasoning: "",
     pending_steers: [],
     messages: [],
+    watermark: 0,
+    sync: Synced,
+    overlay: [],
   }
 }
 
@@ -1086,6 +1147,7 @@ fn Model::activate(self : Model, session_id : String) -> Model {
       conversations.push({ ..conv, unseen_finish: false })
     } else if conv.is_running() ||
       conv.messages.length() > 0 ||
+      conv.overlay.length() > 0 ||
       !conv.draft_empty() {
       conversations.push(conv)
     }
@@ -1118,7 +1180,7 @@ fn Conversation::draft_sendable(self : Conversation) -> Bool {
 /// or transcript items from one. A fresh "New chat" (even with a typed
 /// draft) has not, and stays out of the sidebar until its first send.
 fn Conversation::has_begun(self : Conversation) -> Bool {
-  self.is_running() || self.messages.length() > 0
+  self.is_running() || self.messages.length() > 0 || self.overlay.length() > 0
 }
 
 ///|
@@ -1134,14 +1196,130 @@ fn Conversation::clear_streams(self : Conversation) -> Conversation {
 }
 
 ///|
-fn Conversation::append_item(
+/// Append a display-only item after the durable transcript: everything the
+/// live stream reports lands here first and joins `messages` only when its
+/// durable commit arrives (which retires the overlay twin). Client-local
+/// notices with no durable counterpart also live here — they last until the
+/// next reload, exactly as long as they used to.
+fn Conversation::append_overlay(
   self : Conversation,
   kind : @transcript.ItemKind,
   content : String,
 ) -> Conversation {
+  let overlay = self.overlay.copy()
+  overlay.push({ kind, content })
+  { ..self, overlay, }
+}
+
+///|
+/// What the transcript shows: the durable items, then the not-yet-committed
+/// overlay.
+fn Conversation::visible_items(
+  self : Conversation,
+) -> Array[@transcript.TranscriptItem] {
+  if self.overlay.is_empty() {
+    self.messages
+  } else {
+    self.messages + self.overlay
+  }
+}
+
+///|
+/// Apply one durable commit's item to the transcript and retire the overlay
+/// items it settles: for each transcript item the commit renders as, the
+/// first overlay item of the same kind drops (FIFO — the store commits in
+/// the same order the live stream reported). Returns whether the transcript
+/// visibly grew.
+fn Conversation::apply_commit(
+  self : Conversation,
+  kind : String,
+  payload : Map[String, Json],
+) -> (Bool, Conversation) {
   let messages = self.messages.copy()
-  messages.push({ kind, content })
-  { ..self, messages, }
+  let before = messages.length()
+  @transcript.apply_session_item(messages, kind, payload)
+  let mut overlay = self.overlay
+  for index in before..<messages.length() {
+    overlay = drop_first_overlay(overlay, messages[index].kind)
+  }
+  (messages.length() > before, { ..self, messages, overlay })
+}
+
+///|
+/// Remove the first overlay item of `kind`'s class, if any — the durable
+/// commit that just landed is its settled form.
+fn drop_first_overlay(
+  overlay : Array[@transcript.TranscriptItem],
+  kind : @transcript.ItemKind,
+) -> Array[@transcript.TranscriptItem] {
+  for index, item in overlay {
+    if same_item_class(item.kind, kind) {
+      let next = overlay.copy()
+      let _ = next.remove(index)
+      return next
+    }
+  }
+  overlay
+}
+
+///|
+/// Kind classes for overlay retirement: constructor identity, payload
+/// ignored (a tool card's durable form may brief itself differently than the
+/// live event did).
+fn same_item_class(a : @transcript.ItemKind, b : @transcript.ItemKind) -> Bool {
+  match (a, b) {
+    (User, User)
+    | (Reasoning, Reasoning)
+    | (Summary, Summary)
+    | (Assistant(_), Assistant(_))
+    | (Tool(..), Tool(..)) => true
+    _ => false
+  }
+}
+
+///|
+/// Adopt a fresh `session.load` snapshot: it replaces the durable transcript
+/// wholesale, clears the overlay (the snapshot is the settled truth for
+/// everything committed so far — an overlay item it does not contain will
+/// come back through its own commit), and drains the commits buffered while
+/// the read was in flight. Returns the conversation and whether buffered
+/// commits from beyond the snapshot failed to connect — a remaining gap the
+/// caller answers with another read.
+fn Conversation::adopt_snapshot(
+  self : Conversation,
+  items : Array[@transcript.TranscriptItem],
+  watermark : Int,
+) -> (Conversation, Bool) {
+  let pending = match self.sync {
+    Reloading(buffered~) => buffered.copy()
+    Synced => []
+  }
+  // Sequence order, whatever the arrival order was.
+  pending.sort_by((a, b) => a.sequence - b.sequence)
+  let mut conv : Conversation = {
+    ..self,
+    messages: items,
+    watermark,
+    overlay: [],
+    sync: Synced,
+  }
+  let leftover : Array[BufferedCommit] = []
+  for commit in pending {
+    if commit.sequence <= conv.watermark {
+      continue
+    }
+    if commit.sequence == conv.watermark + 1 && leftover.is_empty() {
+      let (_, next) = conv.apply_commit(commit.kind, commit.payload)
+      conv = { ..next, watermark: commit.sequence }
+    } else {
+      leftover.push(commit)
+    }
+  }
+  if leftover.is_empty() {
+    (conv, false)
+  } else {
+    ({ ..conv, sync: Reloading(buffered=leftover) }, true)
+  }
 }
 
 ///|
@@ -1180,15 +1358,15 @@ fn Conversation::settle_pending_steer(
 fn Conversation::sweep_pending_steers(self : Conversation) -> Conversation {
   let mut conv = self
   for text in self.pending_steers {
-    conv = conv.append_item(Assistant(true), steer_dropped_notice(text))
+    conv = conv.append_overlay(Assistant(true), steer_dropped_notice(text))
   }
   { ..conv, pending_steers: [] }
 }
 
 ///|
 fn Conversation::last_assistant_content(self : Conversation) -> String? {
-  if self.messages.get(self.messages.length() - 1) is Some(item) &&
-    item.kind is Assistant(_) {
+  let items = self.visible_items()
+  if items.get(items.length() - 1) is Some(item) && item.kind is Assistant(_) {
     Some(item.content)
   } else {
     None

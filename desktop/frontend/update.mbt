@@ -10,6 +10,35 @@ fn should_append_answer(conv : Conversation, answer : String) -> Bool {
 }
 
 ///|
+/// Fold a background snapshot into its conversation without activating it:
+/// adopt the transcript + watermark, and re-read once more if commits
+/// buffered during the read left a gap. A snapshot for a conversation this
+/// client no longer tracks is dropped.
+fn apply_session_refresh(
+  dispatch : @cmd.Emit[Msg],
+  model : Model,
+  session : String,
+  items : Array[@transcript.TranscriptItem],
+  watermark : Int,
+) -> (@cmd.Cmd, Model) {
+  guard model.find_conversation(session) is Some(conv) else {
+    return (@cmd.none, model)
+  }
+  let (conv, gapped) = conv.adopt_snapshot(items, watermark)
+  let commands = [scroll_if_active(model, session)]
+  if gapped {
+    commands.push(
+      refresh_session(
+        dispatch,
+        session,
+        workspace=model.session_workspace(session),
+      ),
+    )
+  }
+  (@cmd.batch(commands), model.replace_conversation(conv))
+}
+
+///|
 /// Scroll the transcript only when `session_id` is the conversation on
 /// screen — a background conversation's stream must not yank the visible
 /// scroll position around — and only while the user is at the bottom:
@@ -342,7 +371,7 @@ fn apply_engine_event(
       if content.is_empty() {
         (false, next)
       } else {
-        (true, next.append_item(Reasoning, content))
+        (true, next.append_overlay(Reasoning, content))
       }
     }
     AssistantMessage(content) => {
@@ -351,7 +380,7 @@ fn apply_engine_event(
       if content.is_empty() {
         (false, conv)
       } else {
-        (true, conv.append_item(Assistant(false), content))
+        (true, conv.append_overlay(Assistant(false), content))
       }
     }
     RuntimeUpdate(content) => {
@@ -360,7 +389,7 @@ fn apply_engine_event(
       if !update.status.is_empty() || update.diagnostics.length() > 0 {
         (
           true,
-          next.append_item(
+          next.append_overlay(
             Tool(
               name=@transcript.runtime_update_title(update),
               is_error=false,
@@ -378,7 +407,7 @@ fn apply_engine_event(
     ToolResult(tool_name~, is_error~, content~, brief~) =>
       (
         true,
-        conv.append_item(
+        conv.append_overlay(
           Tool(
             name=if tool_name.trim().is_empty() { "tool" } else { tool_name },
             is_error~,
@@ -390,7 +419,7 @@ fn apply_engine_event(
     ToolCallDecodeError(tool_name~, reason~) =>
       (
         true,
-        conv.append_item(
+        conv.append_overlay(
           Tool(
             name=if tool_name.trim().is_empty() { "tool" } else { tool_name },
             is_error=true,
@@ -407,7 +436,7 @@ fn apply_engine_event(
       let conv = conv.clear_streams()
       let answer = answer.trim().to_owned()
       if should_append_answer(conv, answer) {
-        (true, conv.append_item(Assistant(false), answer))
+        (true, conv.append_overlay(Assistant(false), answer))
       } else {
         (false, conv)
       }
@@ -420,7 +449,7 @@ fn apply_engine_event(
       let conv = conv.clear_streams()
       let answer = answer.trim().to_owned()
       if should_append_answer(conv, answer) {
-        (true, conv.append_item(Assistant(false), answer))
+        (true, conv.append_overlay(Assistant(false), answer))
       } else {
         (false, conv)
       }
@@ -431,12 +460,14 @@ fn apply_engine_event(
       } else {
         "aborted: " + reason
       }
-      (true, conv.clear_streams().append_item(Assistant(true), content))
+      (true, conv.clear_streams().append_overlay(Assistant(true), content))
     }
     MaxStepsExhausted =>
       (
         true,
-        conv.clear_streams().append_item(Assistant(true), "max steps exhausted"),
+        conv
+        .clear_streams()
+        .append_overlay(Assistant(true), "max steps exhausted"),
       )
     AgentSetupFailed(reason) => {
       let content = if reason.trim().is_empty() {
@@ -444,12 +475,12 @@ fn apply_engine_event(
       } else {
         "setup failed: " + reason
       }
-      (true, conv.clear_streams().append_item(Assistant(true), content))
+      (true, conv.clear_streams().append_overlay(Assistant(true), content))
     }
     // The steer took effect at a step boundary: it is part of the
     // conversation now, so echo it as a user message.
     SteerApplied(content) =>
-      (true, conv.settle_pending_steer(content).append_item(User, content))
+      (true, conv.settle_pending_steer(content).append_overlay(User, content))
     // The steer raced the turn's end through the pipes and was rejected; the
     // text must not vanish silently.
     SteerDropped(content) =>
@@ -457,7 +488,7 @@ fn apply_engine_event(
         true,
         conv
         .settle_pending_steer(content)
-        .append_item(Assistant(true), steer_dropped_notice(content)),
+        .append_overlay(Assistant(true), steer_dropped_notice(content)),
       )
     // Automatic compaction runs inside this open turn. Show the durable
     // checkpoint with the same Summary card as manual compaction and replay,
@@ -467,7 +498,7 @@ fn apply_engine_event(
       if summary.is_empty() {
         (false, conv)
       } else {
-        (true, conv.append_item(Summary, summary))
+        (true, conv.append_overlay(Summary, summary))
       }
     }
     // Compaction runs while the engine is idle and the next prompt will carry
@@ -481,7 +512,7 @@ fn apply_engine_event(
       if summary.is_empty() {
         (false, conv)
       } else {
-        (true, conv.append_item(Summary, summary))
+        (true, conv.append_overlay(Summary, summary))
       }
     }
     CompactionFailed(reason) => {
@@ -492,7 +523,7 @@ fn apply_engine_event(
       }
       (
         true,
-        { ..conv, compaction: NotCompacting }.append_item(
+        { ..conv, compaction: NotCompacting }.append_overlay(
           Assistant(true),
           content,
         ),
@@ -613,19 +644,20 @@ fn update_msg(
       // exactly where this client was absent: the conversation on screen
       // re-reads now, every other one re-reads when opened (`OpenSession`
       // always reloads). An in-flight user load keeps right of way.
-      let reload = match model.find_conversation(model.active_session) {
-        Some(conv) if conv.has_begun() && model.loading_session.is_empty() =>
-          Some(model.active_session)
-        _ => None
-      }
-      if reload is Some(session_id) {
-        commands.push(
-          open_session(
-            dispatch,
-            session_id,
-            workspace=model.session_workspace(session_id),
-          ),
-        )
+      let model = match model.find_conversation(model.active_session) {
+        Some(conv) if conv.has_begun() && model.loading_session.is_empty() => {
+          commands.push(
+            refresh_session(
+              dispatch,
+              conv.session_id,
+              workspace=model.session_workspace(conv.session_id),
+            ),
+          )
+          // Buffer commits until the snapshot lands — its watermark decides
+          // which of them it already contains.
+          model.replace_conversation({ ..conv, sync: Reloading(buffered=[]) })
+        }
+        _ => model
       }
       (
         @cmd.batch(commands),
@@ -637,10 +669,6 @@ fn update_msg(
           // makes the post-dispatch panel sync re-issue `fs.watch` instead
           // of reading the stale record as "already placed".
           file_panel: { ..model.file_panel, watching: "" },
-          loading_session: match reload {
-            Some(session_id) => session_id
-            None => model.loading_session
-          },
           // An unusable endpoint routes straight to Settings — the composer
           // could do nothing anyway.
           screen: if model.api_ready() {
@@ -1205,7 +1233,7 @@ fn update_msg(
         // compaction settles.
         (@cmd.none, model)
       } else {
-        let next = conv.append_item(User, task)
+        let next = conv.append_overlay(User, task)
         let next = {
           ..next,
           task: "",
@@ -1246,7 +1274,10 @@ fn update_msg(
           (
             scroll_if_active(model, session),
             model.replace_conversation(
-              settled.append_item(Assistant(true), steer_dropped_notice(text)),
+              settled.append_overlay(
+                Assistant(true),
+                steer_dropped_notice(text),
+              ),
             ),
           )
         }
@@ -1481,8 +1512,16 @@ fn update_msg(
         // conversation — and the current view stays on screen while the
         // reply is in flight. A conversation that never began has nothing
         // stored to read.
+        let reread = conv.has_begun()
+        // Buffer commits while the re-read is in flight; the snapshot's
+        // watermark reconciles them when it lands.
+        let model = if reread {
+          model.replace_conversation({ ..conv, sync: Reloading(buffered=[]) })
+        } else {
+          model
+        }
         (
-          if conv.has_begun() {
+          if reread {
             @cmd.batch([
               scroll_transcript_after_render(),
               open_session(
@@ -1498,7 +1537,7 @@ fn update_msg(
             ..model.activate(session_id),
             screen: Chat,
             transcript_pinned: true,
-            loading_session: if conv.has_begun() {
+            loading_session: if reread {
               session_id
             } else {
               ""
@@ -1521,37 +1560,44 @@ fn update_msg(
           },
         )
       }
-    SessionLoaded(session=session_id, items~) =>
+    SessionLoaded(session=session_id, items~, watermark~) =>
       if model.loading_session != session_id {
-        (@cmd.none, model)
+        // Overtaken by a newer selection — but fresh durable data is never
+        // wasted: fold it in as a background refresh (no activation).
+        apply_session_refresh(dispatch, model, session_id, items, watermark)
       } else {
         // The store's transcript replaces the local copy wholesale — the
-        // store is the single source of truth for completed items, and
-        // nothing is ever synthesized on top of a loaded transcript, so
-        // duplicates are impossible by construction. Live client-side state
-        // (run phase, streaming buffers, pending steers, the composer
-        // draft) rides across untouched. The one hole: a prompt sent in the
-        // same instant the snapshot was taken may be missing from it — its
-        // own `started` event re-establishes the run, and the next reload
-        // brings the bubble.
-        let conv = match model.find_conversation(session_id) {
-          Some(conv) => { ..conv, messages: items }
+        // store is the single source of truth for committed items, and
+        // nothing else ever joins `messages`, so duplicates are impossible
+        // by construction. Live client-side state (run phase, streaming
+        // buffers, pending steers, the composer draft) rides across
+        // untouched; the overlay resets — anything the snapshot does not
+        // contain comes back through its own `session.event` commit.
+        let (conv, gapped) = (match model.find_conversation(session_id) {
+          Some(conv) => conv
           None =>
-            {
-              ..empty_conversation(
-                session_id,
-                workspace=model.session_workspace(session_id),
-              ),
-              messages: items,
-            }
+            empty_conversation(
+              session_id,
+              workspace=model.session_workspace(session_id),
+            )
+        }).adopt_snapshot(items, watermark)
+        // The host derives the resumed workspace from the session id, so
+        // the branch probe sends no cwd.
+        let commands = [
+          scroll_transcript_after_render(),
+          fetch_branch(dispatch, session_id, None),
+        ]
+        if gapped {
+          commands.push(
+            refresh_session(
+              dispatch,
+              session_id,
+              workspace=model.session_workspace(session_id),
+            ),
+          )
         }
         (
-          // The host derives the resumed workspace from the session id, so
-          // the branch probe sends no cwd.
-          @cmd.batch([
-            scroll_transcript_after_render(),
-            fetch_branch(dispatch, session_id, None),
-          ]),
+          @cmd.batch(commands),
           {
             ..model.replace_conversation(conv).activate(session_id),
             transcript_pinned: true,
@@ -1559,6 +1605,66 @@ fn update_msg(
             completion: None,
           },
         )
+      }
+    SessionRefreshed(session~, items~, watermark~) =>
+      apply_session_refresh(dispatch, model, session, items, watermark)
+    SessionRefreshFailed(session~) =>
+      // Drop back to Synced (discarding the buffer): the next commit's gap
+      // check re-issues the read, so a transient failure heals itself.
+      if model.find_conversation(session) is Some(conv) {
+        (@cmd.none, model.replace_conversation({ ..conv, sync: Synced }))
+      } else {
+        (@cmd.none, model)
+      }
+    SessionCommitted(session~, sequence~, kind~, payload~) =>
+      if model.find_conversation(session) is Some(conv) {
+        match conv.sync {
+          // A read is in flight: buffer — its snapshot's watermark decides
+          // whether this commit is already contained once it lands.
+          Reloading(buffered~) => {
+            let buffered = buffered.copy()
+            buffered.push({ sequence, kind, payload })
+            (
+              @cmd.none,
+              model.replace_conversation({ ..conv, sync: Reloading(buffered~) }),
+            )
+          }
+          Synced =>
+            if sequence <= conv.watermark {
+              // Old news: the snapshot (or an earlier commit) already
+              // carried it. Re-broadcasts are safe by construction.
+              (@cmd.none, model)
+            } else if sequence == conv.watermark + 1 {
+              let (grew, next) = conv.apply_commit(kind, payload)
+              (
+                if grew {
+                  scroll_if_active(model, session)
+                } else {
+                  @cmd.none
+                },
+                model.replace_conversation({ ..next, watermark: sequence }),
+              )
+            } else {
+              // A gap: this client missed a broadcast (kicked as a slow
+              // subscriber, a host restart, an external writer). The record
+              // is the source of truth — re-read it, buffering from here.
+              (
+                refresh_session(
+                  dispatch,
+                  session,
+                  workspace=model.session_workspace(session),
+                ),
+                model.replace_conversation({
+                  ..conv,
+                  sync: Reloading(buffered=[{ sequence, kind, payload }]),
+                }),
+              )
+            }
+        }
+      } else {
+        // A conversation this client never opened: nothing local to extend.
+        // Its transcript is read fresh when opened.
+        (@cmd.none, model)
       }
     TranscriptPinned(pinned) =>
       (@cmd.none, { ..model, transcript_pinned: pinned })
@@ -1629,19 +1735,29 @@ fn update_msg(
             true,
           )
       }
-      // The prompt bubble: the sender appended its own copy when it sent; a
-      // materialized (empty) conversation starts from the pushed `task`. An
-      // existing transcript is never appended to — the reload below brings
-      // the store's copy, so duplicates are impossible by construction.
-      let conv = match task {
-        Some(task) if foreign && conv.messages.is_empty() && !task.is_empty() =>
-          conv.append_item(User, task)
-        _ => conv
-      }
+      // The prompt bubble itself is not appended here — not even from the
+      // pushed `task`: the durable transcript's only sources are snapshots
+      // and `session.event` commits, and the prompt's own commit (or the
+      // refresh below) brings it. `task` still rides on the event for
+      // clients that render run identity elsewhere.
+      ignore(task)
+      // A foreign run means the store holds items this client never saw —
+      // the prompt at least. The conversation on screen re-reads it now (a
+      // background one catches up through commits, or when opened); commits
+      // buffer until the snapshot lands. An in-flight user load keeps right
+      // of way.
+      let refresh = foreign &&
+        session == model.active_session &&
+        model.loading_session.is_empty()
       let updated = model.replace_conversation({
         ..conv,
         run: Open(run_id~, stage=Opened),
         last_run_id: Some(run_id),
+        sync: if refresh {
+          Reloading(buffered=[])
+        } else {
+          conv.sync
+        },
         // A started run always reports its directory, but a malformed
         // event decodes as `None`; keeping the previous root beats
         // forgetting one we already knew.
@@ -1654,23 +1770,14 @@ fn update_msg(
       // The run's workspace directory now exists, so the branch chip can be
       // probed (and refreshed — a rerun may follow a checkout).
       let commands = [fetch_branch(dispatch, session, cwd)]
-      // A foreign run means the store holds items this client never saw —
-      // the prompt at least. The conversation on screen re-reads it now; a
-      // background one re-reads when opened (`OpenSession` always reloads).
-      // An in-flight user load keeps right of way.
-      let updated = if foreign &&
-        session == updated.active_session &&
-        updated.loading_session.is_empty() {
+      if refresh {
         commands.push(
-          open_session(
+          refresh_session(
             dispatch,
             session,
             workspace=updated.session_workspace(session),
           ),
         )
-        { ..updated, loading_session: session }
-      } else {
-        updated
       }
       // Sync the global model/step settings only when this start belongs to
       // the conversation on screen. A slow background start (the user switched
@@ -1761,7 +1868,7 @@ fn update_msg(
           ..conv
           .clear_streams()
           .sweep_pending_steers()
-          .append_item(Assistant(true), message),
+          .append_overlay(Assistant(true), message),
           run: NoRun(ended=Some(RunFailed)),
         }
         (
@@ -1807,7 +1914,7 @@ fn update_msg(
         // Mid-run the error is transient — the host closes the run with its
         // own finished event moments later, and that verdict wins; only an
         // idle conversation keeps the error as how things stand.
-        let next = conv.append_item(Assistant(true), content)
+        let next = conv.append_overlay(Assistant(true), content)
         (
           scroll_if_active(model, conv.session_id),
           model.replace_conversation(
@@ -1827,7 +1934,7 @@ fn update_msg(
         (
           scroll_if_active(model, conv.session_id),
           model.replace_conversation({
-            ..conv.append_item(Assistant(true), message),
+            ..conv.append_overlay(Assistant(true), message),
             compaction: NotCompacting,
           }),
         )
@@ -1858,7 +1965,7 @@ fn update_msg(
           (
             @cmd.batch([scroll_if_active(model, conv.session_id), refresh]),
             model.replace_conversation(
-              base.append_item(Assistant(false), answer),
+              base.append_overlay(Assistant(false), answer),
             ),
           )
         } else {
@@ -1966,11 +2073,11 @@ test "reasoning message commits a thinking item and clears its stream" {
     model,
   )
   inspect(next.active().streaming_reasoning, content="")
-  inspect(next.active().messages.length(), content="1")
-  guard next.active().messages[0].kind is Reasoning else {
+  inspect(next.active().overlay.length(), content="1")
+  guard next.active().overlay[0].kind is Reasoning else {
     fail("expected reasoning")
   }
-  inspect(next.active().messages[0].content, content="full thought")
+  inspect(next.active().overlay[0].content, content="full thought")
 }
 
 ///|
@@ -1988,8 +2095,8 @@ test "assistant message replaces the live stream with a committed item" {
   )
   inspect(next.active().streaming_response, content="")
   inspect(next.active().streaming_reasoning, content="")
-  inspect(next.active().messages.length(), content="1")
-  inspect(next.active().messages[0].content, content="answer")
+  inspect(next.active().overlay.length(), content="1")
+  inspect(next.active().overlay[0].content, content="answer")
 }
 
 ///|
@@ -2073,7 +2180,7 @@ test "an idle background notice routes by the last run id" {
     model,
   )
   inspect(next.active().watcher_status, content="failed")
-  guard next.active().messages.get(0)
+  guard next.active().overlay.get(0)
     is Some({ kind: Tool(name="moon_check failed", ..), .. }) else {
     fail("expected a runtime notice card")
   }
@@ -2226,7 +2333,7 @@ test "open session tracks the latest load and ignores stale replies" {
   ]
   let (_, after_a) = update(
     dispatch,
-    SessionLoaded(session="desktop-a", items=a_items),
+    SessionLoaded(session="desktop-a", items=a_items, watermark=0),
     loading_b,
   )
   inspect(after_a.active_session, content="desktop-test")
@@ -2236,7 +2343,7 @@ test "open session tracks the latest load and ignores stale replies" {
   ]
   let (_, after_b) = update(
     dispatch,
-    SessionLoaded(session="desktop-b", items=b_items),
+    SessionLoaded(session="desktop-b", items=b_items, watermark=0),
     after_a,
   )
   inspect(after_b.active_session, content="desktop-b")
@@ -2316,12 +2423,12 @@ test "session loaded swaps the active conversation onto the stored session" {
   ]
   let (_, once) = update(
     dispatch,
-    SessionLoaded(session="desktop-stored", items~),
+    SessionLoaded(session="desktop-stored", items~, watermark=0),
     model,
   )
   let (_, twice) = update(
     dispatch,
-    SessionLoaded(session="desktop-stored", items~),
+    SessionLoaded(session="desktop-stored", items~, watermark=0),
     model,
   )
   inspect(once.active_session, content="desktop-stored")
@@ -2345,7 +2452,7 @@ test "session loaded adopts the store transcript and keeps live run state" {
   // The active conversation runs; loading some other stored session is fine.
   let (_, other) = update(
     dispatch,
-    SessionLoaded(session="desktop-stored", items~),
+    SessionLoaded(session="desktop-stored", items~, watermark=0),
     model,
   )
   inspect(other.active_session, content="desktop-stored")
@@ -2362,7 +2469,7 @@ test "session loaded adopts the store transcript and keeps live run state" {
   })
   let (_, same) = update(
     dispatch,
-    SessionLoaded(session="desktop-test", items~),
+    SessionLoaded(session="desktop-test", items~, watermark=0),
     { ..streaming, loading_session: "desktop-test" },
   )
   inspect(same.active().messages.length(), content="1")
@@ -2395,8 +2502,10 @@ test "started routes by session and records the host's workspace" {
     fail("expected the run id to be recorded")
   }
   // A run this client did not send: the store gained its prompt, so the
-  // on-screen conversation re-reads it.
-  inspect(next.loading_session, content="desktop-test")
+  // on-screen conversation re-reads it in the background, buffering commits
+  // until the snapshot lands. The user-load marker stays free.
+  assert_true(next.active().sync is Reloading(..))
+  inspect(next.loading_session, content="")
 }
 
 ///|
@@ -2423,10 +2532,11 @@ test "started for an unknown session materializes its conversation" {
   guard ghost.run is Open(run_id="r7", ..) else {
     fail("expected the run id to be recorded")
   }
-  // The pushed prompt becomes the bubble — a materialized conversation has
-  // no other live source for it.
-  inspect(ghost.messages.length(), content="1")
-  inspect(ghost.messages[0].content, content="fix the flaky test")
+  // No bubble is synthesized from the pushed task — the durable transcript's
+  // only sources are snapshots and commits, and the prompt's own commit (or
+  // the read when this conversation is opened) brings it.
+  inspect(ghost.messages.length(), content="0")
+  inspect(ghost.overlay.length(), content="0")
   // Focus stays where the user is.
   inspect(next.active_session, content="desktop-test")
   inspect(next.active().is_running(), content="false")
@@ -2505,7 +2615,7 @@ test "a background run finishes without disturbing the conversation on screen" {
   }
   inspect(bg.is_running(), content="false")
   assert_true(bg.run is NoRun(ended=Some(RunFinished(_))))
-  inspect(bg.messages[1].content, content="done")
+  inspect(bg.overlay[0].content, content="done")
   // The conversation on screen is still running its own turn.
   inspect(next.active().is_running(), content="true")
   assert_true(next.display_status() is Running)
@@ -2572,11 +2682,11 @@ test "steer_applied commits the pending steer as a user message" {
     model,
   )
   inspect(next.active().pending_steers.length(), content="0")
-  inspect(next.active().messages.length(), content="1")
-  guard next.active().messages[0].kind is User else {
+  inspect(next.active().overlay.length(), content="1")
+  guard next.active().overlay[0].kind is User else {
     fail("expected a user item")
   }
-  inspect(next.active().messages[0].content, content="go left")
+  inspect(next.active().overlay[0].content, content="go left")
 }
 
 ///|
@@ -2592,11 +2702,11 @@ test "steer_dropped settles the pending steer with a visible notice" {
     model,
   )
   inspect(next.active().pending_steers.length(), content="0")
-  inspect(next.active().messages.length(), content="1")
-  guard next.active().messages[0].kind is Assistant(true) else {
+  inspect(next.active().overlay.length(), content="1")
+  guard next.active().overlay[0].kind is Assistant(true) else {
     fail("expected an error bubble")
   }
-  assert_true(next.active().messages[0].content.contains("go left"))
+  assert_true(next.active().overlay[0].content.contains("go left"))
 }
 
 ///|
@@ -2613,7 +2723,7 @@ test "an identical-text settle removes exactly one pending entry" {
   )
   inspect(next.active().pending_steers.length(), content="1")
   inspect(next.active().pending_steers[0], content="again")
-  inspect(next.active().messages.length(), content="1")
+  inspect(next.active().overlay.length(), content="1")
 }
 
 ///|
@@ -2629,11 +2739,11 @@ test "an undelivered steer is reported instead of vanishing" {
     model,
   )
   inspect(next.active().pending_steers.length(), content="0")
-  inspect(next.active().messages.length(), content="1")
-  guard next.active().messages[0].kind is Assistant(true) else {
+  inspect(next.active().overlay.length(), content="1")
+  guard next.active().overlay[0].kind is Assistant(true) else {
     fail("expected an error bubble")
   }
-  assert_true(next.active().messages[0].content.contains("lost"))
+  assert_true(next.active().overlay[0].content.contains("lost"))
 }
 
 ///|
@@ -2650,10 +2760,10 @@ test "a run that ends with steers in flight sweeps them into notices" {
   )
   inspect(next.active().pending_steers.length(), content="0")
   inspect(next.active().is_running(), content="false")
-  guard next.active().messages[0].kind is Assistant(true) else {
+  guard next.active().overlay[0].kind is Assistant(true) else {
     fail("expected an error bubble")
   }
-  assert_true(next.active().messages[0].content.contains("orphaned"))
+  assert_true(next.active().overlay[0].content.contains("orphaned"))
 }
 
 ///|
@@ -2674,8 +2784,8 @@ test "late undelivered steer is dropped after run-end sweep" {
     finished,
   )
   inspect(next.active().pending_steers.length(), content="0")
-  inspect(next.active().messages.length(), content="1")
-  assert_true(next.active().messages[0].content.contains("lost"))
+  inspect(next.active().overlay.length(), content="1")
+  assert_true(next.active().overlay[0].content.contains("lost"))
 }
 
 ///|
@@ -3107,7 +3217,7 @@ test "explicit user actions re-pin the transcript" {
   // So does loading a stored session or rotating to a fresh one.
   let (_, loaded) = update(
     dispatch,
-    SessionLoaded(session="desktop-old", items=[]),
+    SessionLoaded(session="desktop-old", items=[], watermark=0),
     { ..test_model(), transcript_pinned: false, loading_session: "desktop-old" },
   )
   inspect(loaded.transcript_pinned, content="true")
@@ -3562,11 +3672,11 @@ test "update is pure: automatic checkpoint appends a summary" {
     Engine(Some("r7"), AutoCompactionFinished("checkpoint recap"), session=None),
     model,
   )
-  inspect(model.active().messages.length(), content="0")
-  inspect(once.active().messages.length(), content="1")
-  inspect(twice.active().messages.length(), content="1")
-  guard once.active().messages.last() is Some(once_item) &&
-    twice.active().messages.last() is Some(twice_item) else {
+  inspect(model.active().overlay.length(), content="0")
+  inspect(once.active().overlay.length(), content="1")
+  inspect(twice.active().overlay.length(), content="1")
+  guard once.active().overlay.last() is Some(once_item) &&
+    twice.active().overlay.last() is Some(twice_item) else {
     fail("expected checkpoint summaries")
   }
   assert_true(once_item.kind is Summary && twice_item.kind is Summary)
@@ -3602,11 +3712,11 @@ test "update is pure: context yield appends continuation guidance" {
     Engine(Some("r7"), ContextYield(answer), session=None),
     model,
   )
-  inspect(model.active().messages.length(), content="0")
-  inspect(once.active().messages.length(), content="1")
-  inspect(twice.active().messages.length(), content="1")
-  guard once.active().messages.last() is Some(once_item) &&
-    twice.active().messages.last() is Some(twice_item) else {
+  inspect(model.active().overlay.length(), content="0")
+  inspect(once.active().overlay.length(), content="1")
+  inspect(twice.active().overlay.length(), content="1")
+  guard once.active().overlay.last() is Some(once_item) &&
+    twice.active().overlay.last() is Some(twice_item) else {
     fail("expected context-yield guidance")
   }
   assert_true(
@@ -3647,9 +3757,9 @@ test "context yield settles after its automatic checkpoint" {
     Finished(run_id="r7", status="context_yield", answer=Some(answer)),
     yielded,
   )
-  inspect(settled.active().messages.length(), content="2")
-  guard settled.active().messages.get(0) is Some(summary) &&
-    settled.active().messages.get(1) is Some(guidance) else {
+  inspect(settled.active().overlay.length(), content="2")
+  guard settled.active().overlay.get(0) is Some(summary) &&
+    settled.active().overlay.get(1) is Some(guidance) else {
     fail("expected checkpoint and guidance")
   }
   assert_true(summary.kind is Summary)
@@ -3686,7 +3796,7 @@ test "compaction_finished appends a standalone summary item" {
     ),
     model,
   )
-  guard next.active().messages.last() is Some(item) && item.kind is Summary else {
+  guard next.active().overlay.last() is Some(item) && item.kind is Summary else {
     fail("expected a summary item")
   }
   inspect(item.content, content="earlier turns compacted")
@@ -3719,7 +3829,7 @@ test "compaction events route by session when no run id matches" {
     ),
     started,
   )
-  guard next.active().messages.last() is Some(item) && item.kind is Summary else {
+  guard next.active().overlay.last() is Some(item) && item.kind is Summary else {
     fail("expected a summary item")
   }
   assert_true(next.active().compaction is NotCompacting)
@@ -3742,7 +3852,7 @@ test "compaction_failed settles a still-queued compaction" {
     model,
   )
   assert_true(next.active().compaction is NotCompacting)
-  inspect(next.active().messages.length(), content="1")
+  inspect(next.active().overlay.length(), content="1")
 }
 
 ///|
@@ -3761,7 +3871,7 @@ test "CompactRejected clears the queued notice and reports the error" {
     model,
   )
   assert_true(next.active().compaction is NotCompacting)
-  inspect(next.active().messages.length(), content="1")
+  inspect(next.active().overlay.length(), content="1")
 }
 
 ///|
@@ -3952,4 +4062,259 @@ test "check_update replies decode by kind" {
   assert_true(decode_update_check("{\"kind\":\"available\"}") is None)
   assert_true(decode_update_check("{\"kind\":\"surprise\"}") is None)
   assert_true(decode_update_check("garbage") is None)
+}
+
+///|
+test "send shows the prompt as overlay until its commit lands" {
+  let dispatch = test_dispatch()
+  let model = test_model().replace_conversation({
+    ..test_conversation(),
+    task: "build the thing",
+  })
+  let (_, sent) = update(dispatch, Send, model)
+  // No optimistic durable write: the prompt is display overlay only.
+  inspect(sent.active().messages.length(), content="0")
+  inspect(sent.active().overlay.length(), content="1")
+  guard sent.active().overlay[0].kind is User else {
+    fail("expected a user overlay")
+  }
+  inspect(sent.active().watermark, content="0")
+  // The durable commit lands the real item and retires the overlay twin.
+  let (_, committed) = update(
+    dispatch,
+    SessionCommitted(session="desktop-test", sequence=1, kind="user", payload={
+      "content": Json::string("build the thing"),
+    }),
+    sent,
+  )
+  inspect(committed.active().messages.length(), content="1")
+  guard committed.active().messages[0].kind is User else {
+    fail("expected a user item")
+  }
+  inspect(committed.active().overlay.length(), content="0")
+  inspect(committed.active().watermark, content="1")
+}
+
+///|
+test "a replayed commit at or below the watermark is dropped" {
+  let dispatch = test_dispatch()
+  let model = test_model().replace_conversation({
+    ..test_conversation(),
+    messages: [{ kind: User, content: "already there" }],
+    watermark: 2,
+  })
+  let (_, next) = update(
+    dispatch,
+    SessionCommitted(session="desktop-test", sequence=2, kind="user", payload={
+      "content": Json::string("already there"),
+    }),
+    model,
+  )
+  inspect(next.active().messages.length(), content="1")
+  inspect(next.active().watermark, content="2")
+}
+
+///|
+test "a commit past the frontier buffers and flips into a reload" {
+  let dispatch = test_dispatch()
+  let model = test_model().replace_conversation({
+    ..test_conversation(),
+    watermark: 1,
+  })
+  let (_, next) = update(
+    dispatch,
+    SessionCommitted(session="desktop-test", sequence=5, kind="user", payload={
+      "content": Json::string("from the future"),
+    }),
+    model,
+  )
+  // The gap means missed broadcasts; nothing is applied out of order.
+  inspect(next.active().messages.length(), content="0")
+  inspect(next.active().watermark, content="1")
+  guard next.active().sync is Reloading(buffered~) else {
+    fail("expected a reload in flight")
+  }
+  inspect(buffered.length(), content="1")
+  inspect(buffered[0].sequence, content="5")
+}
+
+///|
+test "commits buffer while a reload is in flight" {
+  let dispatch = test_dispatch()
+  let model = test_model().replace_conversation({
+    ..test_conversation(),
+    sync: Reloading(buffered=[]),
+  })
+  let (_, next) = update(
+    dispatch,
+    SessionCommitted(session="desktop-test", sequence=3, kind="user", payload={
+      "content": Json::string("mid-reload"),
+    }),
+    model,
+  )
+  inspect(next.active().messages.length(), content="0")
+  guard next.active().sync is Reloading(buffered~) else {
+    fail("expected the reload to stay in flight")
+  }
+  inspect(buffered.length(), content="1")
+}
+
+///|
+test "a snapshot drains buffered commits in sequence order" {
+  let dispatch = test_dispatch()
+  let model = test_model().replace_conversation({
+    ..test_conversation()
+    // Out of arrival order on purpose; the drain sorts by sequence.
+    ,
+    sync: Reloading(buffered=[
+      {
+        sequence: 4,
+        kind: "user",
+        payload: { "content": Json::string("four") },
+      },
+      {
+        sequence: 3,
+        kind: "user",
+        payload: { "content": Json::string("three") },
+      },
+    ]),
+  })
+  let (_, next) = update(
+    dispatch,
+    SessionRefreshed(
+      session="desktop-test",
+      items=[
+        { kind: User, content: "one" },
+        { kind: Assistant(false), content: "two" },
+      ],
+      watermark=2,
+    ),
+    model,
+  )
+  inspect(next.active().messages.length(), content="4")
+  inspect(next.active().messages[2].content, content="three")
+  inspect(next.active().messages[3].content, content="four")
+  inspect(next.active().watermark, content="4")
+  assert_true(next.active().sync is Synced)
+}
+
+///|
+test "a snapshot already containing the buffered commits drops them" {
+  let dispatch = test_dispatch()
+  let model = test_model().replace_conversation({
+    ..test_conversation(),
+    sync: Reloading(buffered=[
+      { sequence: 2, kind: "user", payload: { "content": Json::string("dup") } },
+    ]),
+  })
+  let (_, next) = update(
+    dispatch,
+    SessionRefreshed(
+      session="desktop-test",
+      items=[{ kind: User, content: "one" }, { kind: User, content: "dup" }],
+      watermark=2,
+    ),
+    model,
+  )
+  inspect(next.active().messages.length(), content="2")
+  inspect(next.active().watermark, content="2")
+  assert_true(next.active().sync is Synced)
+}
+
+///|
+test "a snapshot with a still-gapped buffer keeps reloading" {
+  let dispatch = test_dispatch()
+  let model = test_model().replace_conversation({
+    ..test_conversation(),
+    sync: Reloading(buffered=[
+      { sequence: 9, kind: "user", payload: { "content": Json::string("far") } },
+    ]),
+  })
+  let (_, next) = update(
+    dispatch,
+    SessionRefreshed(
+      session="desktop-test",
+      items=[{ kind: User, content: "one" }],
+      watermark=2,
+    ),
+    model,
+  )
+  inspect(next.active().watermark, content="2")
+  guard next.active().sync is Reloading(buffered~) else {
+    fail("expected another reload for the remaining gap")
+  }
+  inspect(buffered.length(), content="1")
+  inspect(buffered[0].sequence, content="9")
+}
+
+///|
+test "a failed refresh drops back to synced and the next commit heals it" {
+  let dispatch = test_dispatch()
+  let model = test_model().replace_conversation({
+    ..test_conversation(),
+    messages: [{ kind: User, content: "kept" }],
+    watermark: 1,
+    sync: Reloading(buffered=[
+      { sequence: 3, kind: "user", payload: { "content": Json::string("x") } },
+    ]),
+  })
+  let (_, failed) = update(
+    dispatch,
+    SessionRefreshFailed(session="desktop-test"),
+    model,
+  )
+  assert_true(failed.active().sync is Synced)
+  inspect(failed.active().messages.length(), content="1")
+  // The next contiguous commit applies normally.
+  let (_, healed) = update(
+    dispatch,
+    SessionCommitted(session="desktop-test", sequence=2, kind="user", payload={
+      "content": Json::string("next"),
+    }),
+    failed,
+  )
+  inspect(healed.active().messages.length(), content="2")
+  inspect(healed.active().watermark, content="2")
+}
+
+///|
+test "an assistant commit retires its reasoning and answer overlays" {
+  let dispatch = test_dispatch()
+  let (_, thought) = update(
+    dispatch,
+    Engine(Some("r7"), ReasoningMessage("think"), session=None),
+    running_model(),
+  )
+  let (_, answered) = update(
+    dispatch,
+    Engine(Some("r7"), AssistantMessage("answer"), session=None),
+    thought,
+  )
+  inspect(answered.active().overlay.length(), content="2")
+  let (_, committed) = update(
+    dispatch,
+    SessionCommitted(session="desktop-test", sequence=1, kind="assistant", payload={
+      "content": Json::string("answer"),
+      "reasoning_content": Json::string("think"),
+    }),
+    answered,
+  )
+  // One durable item projects as reasoning + answer; both overlays retire.
+  inspect(committed.active().messages.length(), content="2")
+  inspect(committed.active().overlay.length(), content="0")
+  inspect(committed.active().watermark, content="1")
+}
+
+///|
+test "a commit for an unknown session changes nothing" {
+  let dispatch = test_dispatch()
+  let (_, next) = update(
+    dispatch,
+    SessionCommitted(session="desktop-elsewhere", sequence=1, kind="user", payload={
+      "content": Json::string("hi"),
+    }),
+    test_model(),
+  )
+  inspect(next.conversations.length(), content="1")
+  inspect(next.active().messages.length(), content="0")
 }

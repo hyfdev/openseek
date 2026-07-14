@@ -28,6 +28,7 @@ fn bridge_msg(method_ : String, payload : Map[String, Json]) -> Msg? {
     "agent.event" => engine_msg(payload)
     "agent.error" => error_msg(payload)
     "agent.finished" => finished_msg(payload)
+    "session.event" => session_event_msg(payload)
     "session.changed" => Some(SessionsChanged)
     "settings.changed" =>
       decode_host_settings(payload).map(settings => HostSettingsLoaded(settings))
@@ -131,7 +132,8 @@ fn wire_proton_events(
     method_ in (
       [
         "agent.connected", "agent.started", "agent.event", "agent.error", "agent.finished",
-        "session.changed", "settings.changed", "lsp.diagnostics", "fs.changed",
+        "session.event", "session.changed", "settings.changed", "lsp.diagnostics",
+        "fs.changed",
       ] : Array[String]) {
     on("openseek." + method_, payload => bridge_msg(method_, payload))
   }
@@ -295,6 +297,24 @@ fn started_msg(payload : Map[String, Json]) -> Msg? {
       task=@jsonx.json_text(payload, "task"),
     ),
   )
+}
+
+///|
+/// One `session.event` commit: the store event rides in `event` verbatim
+/// (`{"sequence", "ts", "item"}`), and the item's `{kind, payload}` is what
+/// the transcript projector consumes. A payload missing any of it is
+/// malformed and dropped — the watermark gap it leaves behind is answered by
+/// a reload, so nothing is lost silently.
+fn session_event_msg(payload : Map[String, Json]) -> Msg? {
+  guard @jsonx.json_text(payload, "session") is Some(session) &&
+    @jsonx.json_int(payload, "sequence") is Some(sequence) &&
+    payload.get("event") is Some(Object(event)) &&
+    event.get("item") is Some(Object(item)) &&
+    @jsonx.json_text(item, "kind") is Some(kind) &&
+    item.get("payload") is Some(Object(item_payload)) else {
+    return None
+  }
+  Some(SessionCommitted(session~, sequence~, kind~, payload=item_payload))
 }
 
 ///|
@@ -514,6 +534,61 @@ fn open_session(
   session_id : String,
   workspace~ : String,
 ) -> @cmd.Cmd {
+  load_session_cmd(
+    session_id,
+    workspace~,
+    on_loaded=view => {
+      dispatch(
+        SessionLoaded(
+          session=session_id,
+          items=view.items,
+          watermark=view.watermark,
+        ),
+      )
+    },
+    on_failed=detail => {
+      dispatch(
+        SessionLoadFailed(
+          session=session_id,
+          message="failed to load session \{session_id}: " + detail,
+        ),
+      )
+    },
+  )
+}
+
+///|
+/// Re-read a conversation's durable record in the background — a commit-gap
+/// resync, or catching up on a foreign run — without activating it or
+/// stealing the screen.
+fn refresh_session(
+  dispatch : @cmd.Emit[Msg],
+  session_id : String,
+  workspace~ : String,
+) -> @cmd.Cmd {
+  load_session_cmd(
+    session_id,
+    workspace~,
+    on_loaded=view => {
+      dispatch(
+        SessionRefreshed(
+          session=session_id,
+          items=view.items,
+          watermark=view.watermark,
+        ),
+      )
+    },
+    on_failed=_ => dispatch(SessionRefreshFailed(session=session_id)),
+  )
+}
+
+///|
+fn load_session_cmd(
+  session_id : String,
+  workspace~ : String,
+  on_loaded~ : (@transcript.SessionLoadView) -> @cmd.Cmd,
+  on_failed~ : (String) -> @cmd.Cmd,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let payload = @js.Object::new()
@@ -521,33 +596,14 @@ fn open_session(
       @interop.set_trimmed(payload, "workspace", workspace)
       let reply = @interop.bridge_request("session.load", payload.to_value()) catch {
         error => {
-          scheduler.add(
-            dispatch(
-              SessionLoadFailed(
-                session=session_id,
-                message="failed to load session \{session_id}: " +
-                  @interop.bridge_error_text(error),
-              ),
-            ),
-          )
+          scheduler.add(on_failed(@interop.bridge_error_text(error)))
           return
         }
       }
       match
-        @transcript.transcript_from_session_json(
-          @interop.reply_json_text(reply),
-        ) {
-        Some(items) =>
-          scheduler.add(dispatch(SessionLoaded(session=session_id, items~)))
-        None =>
-          scheduler.add(
-            dispatch(
-              SessionLoadFailed(
-                session=session_id,
-                message="failed to load session \{session_id}: malformed data",
-              ),
-            ),
-          )
+        @transcript.decode_session_load_reply(@interop.reply_json_text(reply)) {
+        Some(view) => scheduler.add(on_loaded(view))
+        None => scheduler.add(on_failed("malformed data"))
       }
     })
   })

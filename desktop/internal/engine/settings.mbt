@@ -286,11 +286,19 @@ async fn write_settings_file(runtime_dir : @path.Path, text : String) -> Unit {
 }
 
 ///|
-/// The endpoint a run resolves from the settings: `(api_key, api_url)`,
-/// with `None` for the engine's built-in default (the official DeepSeek
+/// The endpoint a run talks to, resolved from the settings. `api_url` is
+/// `None` for the engine's built-in default (the official DeepSeek
 /// endpoint). The client no longer sends credentials — this is the one
 /// place they enter a run's config.
-async fn resolved_endpoint(settings : EngineSettings) -> (String, String?) {
+priv struct ResolvedEndpoint {
+  api_key : String
+  api_url : String?
+}
+
+///|
+fn resolved_endpoint(
+  settings : EngineSettings,
+) -> ResolvedEndpoint raise EngineError {
   match settings.provider {
     Openseek => {
       let url = OpenseekProxyUrl
@@ -300,7 +308,7 @@ async fn resolved_endpoint(settings : EngineSettings) -> (String, String?) {
         None,
         client_token?=openseek_client_token(),
       )
-      (key, Some(url))
+      { api_key: key, api_url: Some(url) }
     }
     Deepseek => {
       let key = configured_api_key(
@@ -309,7 +317,7 @@ async fn resolved_endpoint(settings : EngineSettings) -> (String, String?) {
         @env.get("DEEPSEEK"),
         client_token?=openseek_client_token(),
       )
-      (key, None)
+      { api_key: key, api_url: None }
     }
     Custom => {
       guard settings.custom_api_url is Some(url) else {
@@ -321,7 +329,7 @@ async fn resolved_endpoint(settings : EngineSettings) -> (String, String?) {
         None,
         client_token?=openseek_client_token(),
       )
-      (key, Some(url))
+      { api_key: key, api_url: Some(url) }
     }
   }
 }

@@ -86,6 +86,7 @@ pub(all) enum EngineEvent {
   StreamEvent(EventPayload)
   Error(ErrorPayload)
   Finished(FinishedPayload)
+  SessionCommit(SessionCommitPayload)
 }
 
 type EngineManager
@@ -111,6 +112,8 @@ pub(all) struct LoadSessionRequest {
 }
 
 type PumpReply derive(ToJson)
+
+type SessionCommitPayload derive(ToJson)
 
 type SessionGroup derive(ToJson)
 

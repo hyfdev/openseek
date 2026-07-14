@@ -97,6 +97,12 @@ pub async fn archive_session(
       }
     }
   }
+  // Drain the session's follower before touching the record: the ack means
+  // no `sessions show` is in flight and none will start, so a late scan can
+  // never read (and broadcast from) the directory mid-move. New followers
+  // cannot appear either — the slot claim above blocks every op that could
+  // spawn one until this op finishes.
+  stop_follower(manager, session)
   guard session_store_root(session) is Some(root) else {
     raise EngineError(
       "cannot determine a session root; set OPENSEEK_SESSION_ROOT",

@@ -140,7 +140,7 @@ async fn serve_config(
 ) -> RunConfig {
   let engine = manager.engine
   let settings = load_engine_settings(manager.runtime_dir)
-  let (api_key, api_url) = resolved_endpoint(settings)
+  let endpoint = resolved_endpoint(settings)
   let host = engine_host(settings_wsl_request(settings), engine)
   // A workspace run happens in the project directory itself, with the
   // session's durable record in the in-project store. Only registered
@@ -156,8 +156,8 @@ async fn serve_config(
   }
   {
     task,
-    api_key,
-    api_url,
+    api_key: endpoint.api_key,
+    api_url: endpoint.api_url,
     model: match model {
       Some(model) => model
       // The engine takes its model from OPENSEEK_MODEL (DEEPSEEK_MODEL is

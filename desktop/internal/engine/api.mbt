@@ -127,6 +127,10 @@ struct WorkspacesReply {
 ///|
 struct LoadSessionReply {
   session : Json
+  // The highest event sequence contained in `session` — the client's
+  // starting watermark: `session.event` commits at or below it are already
+  // in the snapshot, and the first fresh commit is watermark + 1.
+  watermark : Int
 } derive(ToJson)
 
 ///|
@@ -177,12 +181,28 @@ struct ErrorPayload {
 } derive(ToJson)
 
 ///|
+/// One durably committed session event, broadcast as `session.event`. The
+/// canonical transcript channel: a commit exists if and only if its item is
+/// in the session's store file, and `sequence` is the item's one-based
+/// position there — contiguous per session, so a client can apply commits
+/// with a plain watermark (drop ≤ W, apply W+1, anything later is a gap and
+/// means reload). `event` is the store's event JSON verbatim
+/// (`{"sequence", "ts", "item"}`), exactly what a `session.load` snapshot
+/// carries in its `events` array.
+struct SessionCommitPayload {
+  session : String
+  sequence : Int
+  event : Json
+} derive(ToJson)
+
+///|
 pub(all) enum EngineEvent {
   Connected(ConnectedPayload)
   Started(StartedPayload)
   StreamEvent(EventPayload)
   Error(ErrorPayload)
   Finished(FinishedPayload)
+  SessionCommit(SessionCommitPayload)
 }
 
 ///|

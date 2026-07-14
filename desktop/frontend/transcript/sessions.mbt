@@ -42,15 +42,35 @@ pub fn decode_sessions_reply(text : String) -> Array[SessionListItem]? {
 }
 
 ///|
+/// A decoded `session.load` reply: the transcript the snapshot renders as,
+/// and the highest event sequence it contains — the client's starting
+/// watermark, deciding which later `session.event` commits are already in
+/// the snapshot. `watermark` is 0 for an empty record, and for a host old
+/// enough not to send the field — such a host never broadcasts commits, so
+/// every position agrees with it.
+pub struct SessionLoadView {
+  items : Array[TranscriptItem]
+  watermark : Int
+}
+
+///|
 /// Parse a `load_session` reply (the durable session JSON) into transcript
-/// items, reconstructing what the live transcript showed while the
-/// conversation was running: reasoning before the answer, tool cards,
-/// runtime updates, and error bubbles for turns that did not finish.
-pub fn transcript_from_session_json(text : String) -> Array[TranscriptItem]? {
+/// items plus its watermark, reconstructing what the live transcript showed
+/// while the conversation was running: reasoning before the answer, tool
+/// cards, runtime updates, and error bubbles for turns that did not finish.
+/// `None` only for structurally unusable JSON — the caller reports that as a
+/// failed load, never as an empty conversation.
+pub fn decode_session_load_reply(text : String) -> SessionLoadView? {
   let json = @json.parse(text) catch { _ => return None }
   guard json is Object(reply) else { return None }
   guard reply.get("session") is Some(Object(session)) else { return None }
-  guard session.get("events") is Some(Array(events)) else { return Some([]) }
+  let watermark = match reply.get("watermark") {
+    Some(Number(watermark, ..)) => watermark.to_int()
+    _ => 0
+  }
+  guard session.get("events") is Some(Array(events)) else {
+    return Some({ items: [], watermark })
+  }
   let items : Array[TranscriptItem] = []
   for event in events {
     guard event is Object(event_fields) else { continue }
@@ -59,7 +79,28 @@ pub fn transcript_from_session_json(text : String) -> Array[TranscriptItem]? {
     guard item.get("payload") is Some(Object(payload)) else { continue }
     append_session_item(items, kind, payload)
   }
-  Some(items)
+  Some({ items, watermark })
+}
+
+///|
+/// The items half of `decode_session_load_reply`, kept for callers (and
+/// tests) that predate watermarks.
+pub fn transcript_from_session_json(text : String) -> Array[TranscriptItem]? {
+  decode_session_load_reply(text).map(view => view.items)
+}
+
+///|
+/// Project one durable session item — a `session.event` commit's
+/// `{kind, payload}` — onto the transcript, appending the 0..N items it
+/// renders as. The same projector `transcript_from_session_json` replays a
+/// whole snapshot through, so a transcript built incrementally from commits
+/// and one rebuilt from the next snapshot agree by construction.
+pub fn apply_session_item(
+  items : Array[TranscriptItem],
+  kind : String,
+  payload : Map[String, Json],
+) -> Unit {
+  append_session_item(items, kind, payload)
 }
 
 ///|

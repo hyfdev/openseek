@@ -127,6 +127,11 @@ fn Hub::sink(
         }
         self.publish("agent.finished", payload.to_json())
       }
+      // The canonical transcript channel: one durably committed store event.
+      // Clients that understand it build their durable transcript from these
+      // plus `session.load` snapshots; the `agent.event` stream above stays
+      // a display overlay (docs/remote-protocol.md).
+      SessionCommit(payload) => self.publish("session.event", payload.to_json())
     }
   })
 }

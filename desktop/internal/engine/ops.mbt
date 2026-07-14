@@ -39,6 +39,13 @@ pub async fn start_run(
   defer {
     slot.pending = None
     manager.prune_slot(key)
+    // A start that failed without leaving a live engine behind (spawn
+    // failure, a dead write) has no writer for the follower to watch; ask
+    // it to retire. Fire-and-forget — nothing writes anymore, so the final
+    // scan finishing a moment later costs nothing.
+    if slot.engine is None {
+      request_stop_follower(manager, key)
+    }
   }
   ensure_run_cwd(config)
   let need_spawn = if slot.engine is Some(live) {
@@ -208,6 +215,11 @@ pub async fn compact_run(
   defer {
     slot.pending = None
     manager.prune_slot(payload.session)
+    // Mirror of start_run's cleanup: a compact whose spawn failed leaves no
+    // writer, so its follower retires.
+    if slot.engine is None {
+      request_stop_follower(manager, payload.session)
+    }
   }
   let live = if slot.engine is Some(live) {
     live
@@ -385,6 +397,14 @@ pub async fn load_session(
   guard !session.is_empty() else {
     raise EngineError("session id must not be empty")
   }
+  // A followed session (a live engine is writing to it) is read through its
+  // follower actor: the snapshot then comes out of the same serial loop
+  // that broadcasts `session.event` commits, so the two can never disagree
+  // about what has been committed. The reply's watermark tells the client
+  // which commits its snapshot already contains.
+  if follower_snapshot(manager, session) is Some(json) {
+    return { session: json, watermark: session_max_sequence(json) }
+  }
   // The client's workspace hint says which store to read; without one (or
   // with an unregistered path) the session's record is located by probing
   // the registered workspaces, then the global root.
@@ -412,7 +432,27 @@ pub async fn load_session(
   let json = @json.parse(output) catch {
     _ => raise EngineError("engine returned a malformed session")
   }
-  { session: json }
+  { session: json, watermark: session_max_sequence(json) }
+}
+
+///|
+/// Read a followed session's snapshot through its actor; `None` when the
+/// session has no live follower (idle sessions read the store directly).
+async fn follower_snapshot(manager : EngineManager, session : String) -> Json? {
+  guard manager.followers.get(session) is Some(follower) && !follower.stopping else {
+    return None
+  }
+  let reply : @async.Queue[FollowerLoadReply] = Queue(kind=Unbounded)
+  follower.inbox.put(Load(reply)) catch {
+    error if @async.is_being_cancelled() => raise error
+    // The actor retired between the lookup and the send; read directly.
+    _ => return None
+  }
+  match reply.get() {
+    LoadOk(json) => Some(json)
+    LoadStopped => None
+    LoadFailed(detail) => raise EngineError("session load failed: " + detail)
+  }
 }
 
 ///|

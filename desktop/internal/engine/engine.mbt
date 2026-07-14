@@ -237,6 +237,13 @@ struct EngineManager {
   runtime_dir : @path.Path?
   commands : @async.Queue[PumpCommand]
   mut pump : PumpState
+  // One session follower per conversation with a live desktop-managed
+  // writer, keyed by session id — the canonical `session.event` broadcaster
+  // (see follower.mbt). Entries are installed by the spawn path and remove
+  // themselves when their actor retires; stopping the pump clears the map
+  // wholesale (the group's cancellation kills the actors without their
+  // self-removal running).
+  followers : Map[String, SessionFollower]
 }
 
 ///|
@@ -287,7 +294,13 @@ pub fn new_engine_manager(
   engine : String,
   runtime_dir? : @path.Path,
 ) -> EngineManager {
-  { engine, runtime_dir, commands: Queue(kind=Unbounded), pump: Stopped }
+  {
+    engine,
+    runtime_dir,
+    commands: Queue(kind=Unbounded),
+    pump: Stopped,
+    followers: Map([]),
+  }
 }
 
 ///|
@@ -415,6 +428,10 @@ pub async fn run_engine_pump(
   let sessions : Map[String, SessionSlot] = Map([])
   fn reset() -> Unit {
     manager.pump = Stopped
+    // The group's cancellation kills the follower actors before their
+    // self-removal can run; drop the map here so a restarted pump starts
+    // from a clean slate instead of finding retired entries.
+    manager.followers.clear()
   }
 
   manager.pump = Serving(sessions~)
@@ -673,6 +690,10 @@ async fn[G] start_serve_engine(
     steer_runs: SteerRunTracker::new(),
   }
   slot.engine = Some(engine)
+  // The follower must be watching — baseline scan included — before this
+  // spawn is acknowledged: the requesting op writes the first command (and
+  // with it the engine's first durable append) only after the ack.
+  ensure_follower(sink~, group~, manager~, config~)
   let messages : @async.Queue[StreamMessage] = Queue(kind=Unbounded)
   let stderr_task = group.spawn(no_wait=true) <| () => {
     stderr_reader.read_all().text() catch {
@@ -703,6 +724,10 @@ async fn serve_engine_consumer(
   for ;; {
     match messages.get() {
       StreamEvent(raw) => {
+        // Every stdout event is a hint that the engine may just have
+        // appended to the durable record — the follower's low-latency
+        // wakeup (its poll only backstops this).
+        manager.kick_follower(engine.session_key)
         let decoded = @event.decode_event(raw)
         let run_id = engine.steer_runs.run_id_for_event(
           decoded,
@@ -784,7 +809,16 @@ async fn serve_engine_consumer(
           slot.engine is Some(current) &&
           physical_equal(current, engine) {
           slot.engine = None
+          let pending = slot.pending
           manager.prune_slot(engine.session_key)
+          // The session's only writer is gone: run the follower's final
+          // scan (broadcasting whatever the dying engine persisted last)
+          // and retire it. A pending op is about to install a successor —
+          // its own failure path stops the follower if the install never
+          // happens — so the follower stays for it.
+          if pending is None {
+            stop_follower(manager, engine.session_key)
+          }
         }
         match engine.phase {
           // EOF with a run still open means the engine died mid-turn: close
