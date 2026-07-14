@@ -19,18 +19,52 @@ priv struct WslRequest {
 }
 
 ///|
+const SubmissionIdMaxBytes = 128
+
+///|
+/// Keep client correlation bounded before it enters live-run state or an
+/// outbound notification. Valid ids remain opaque — whitespace around a
+/// non-blank id is significant and therefore echoed unchanged.
+fn normalize_submission_id(submission_id : String?) -> String? {
+  guard submission_id is Some(submission_id) && !submission_id.trim().is_empty() else {
+    return None
+  }
+  let mut byte_length = 0
+  for char in submission_id {
+    let codepoint = char.to_int()
+    let width = if codepoint <= 127 {
+      1
+    } else if codepoint <= 2047 {
+      2
+    } else if codepoint <= 65535 {
+      3
+    } else {
+      4
+    }
+    byte_length = byte_length + width
+    if byte_length > SubmissionIdMaxBytes {
+      return None
+    }
+  }
+  Some(submission_id)
+}
+
+///|
 /// The endpoint (provider, credentials) and the WSL preference are the
 /// host-owned settings' business — a start names only the work and where it
 /// runs.
 pub(all) struct StartRequest {
   task : String
+  // Optional client-minted lifecycle identity echoed with `agent.started`.
+  // The host ignores blank ids and ids longer than 128 UTF-8 bytes; accepted
+  // values are opaque and echoed unchanged.
+  submission_id : String?
   model : String?
   max_steps : Int?
   session : String?
-  session_root : String?
   // A registered workspace directory to run in: the engine works in the
   // project itself and the session's durable record lands in its in-project
-  // store. Overrides the derived scratch cwd and `session_root`.
+  // store. Overrides the derived scratch cwd and store lookup.
   workspace : String?
 }
 
@@ -43,6 +77,9 @@ pub(all) struct CancelRequest {
 pub(all) struct SteerRequest {
   text : String
   run_id : String?
+  // Optional client-minted lifecycle identity echoed on the matching steer
+  // receipt. The same 128-byte, non-blank boundary as StartRequest applies.
+  submission_id : String?
 }
 
 ///|
@@ -56,7 +93,6 @@ pub(all) struct CompactRequest {
   // spawns one on the durable session with exactly these settings.
   model : String?
   max_steps : Int?
-  session_root : String?
   workspace : String?
 }
 
@@ -142,6 +178,7 @@ struct ConnectedPayload {
 struct StartedPayload {
   run_id : String
   task : String
+  submission_id : String?
   engine : String
   model : String
   max_steps : Int
@@ -170,6 +207,10 @@ pub struct FinishedPayload {
   status : String
   answer : String?
   exit_code : Int?
+  // Present only after the host's follower completed its final durable scan.
+  // An abnormal process exit may have no Terminal item; this sequence is the
+  // exact chronology boundary clients can safely attach local notices to.
+  durable_sequence : Int?
 } derive(ToJson)
 
 ///|
@@ -196,6 +237,17 @@ struct SessionCommitPayload {
 } derive(ToJson)
 
 ///|
+/// A lifecycle finish emitted before a stubborn child could be reaped is
+/// later strengthened by this non-lifecycle boundary notification. Keeping it
+/// distinct avoids a second Finished (and duplicate system/client terminal
+/// side effects) for the same run.
+struct DurableBoundaryPayload {
+  run_id : String
+  session : String
+  sequence : Int
+} derive(ToJson)
+
+///|
 pub(all) enum EngineEvent {
   Connected(ConnectedPayload)
   Started(StartedPayload)
@@ -203,6 +255,7 @@ pub(all) enum EngineEvent {
   Error(ErrorPayload)
   Finished(FinishedPayload)
   SessionCommit(SessionCommitPayload)
+  DurableBoundary(DurableBoundaryPayload)
 }
 
 ///|
@@ -253,6 +306,26 @@ async fn emit_finished(
   status : RunStatus,
   answer? : String,
   exit_code? : Int,
+  durable_sequence? : Int,
 ) -> Unit {
-  emit(sink, Finished({ run_id, status: status.wire(), answer, exit_code }))
+  emit(
+    sink,
+    Finished({
+      run_id,
+      status: status.wire(),
+      answer,
+      exit_code,
+      durable_sequence,
+    }),
+  )
+}
+
+///|
+async fn emit_durable_boundary(
+  sink : EventSink,
+  run_id : String,
+  session : String,
+  sequence : Int,
+) -> Unit {
+  emit(sink, DurableBoundary({ run_id, session, sequence }))
 }

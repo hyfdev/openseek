@@ -84,8 +84,8 @@ fn model_select(dispatch : @cmd.Emit[Msg], selected : String) -> @html.Html {
 
 ///|
 fn conversation_title(conv : Conversation) -> String {
-  // Visible items, so a conversation titles itself the moment its prompt is
-  // sent (the overlay bubble) rather than only once the store commits it.
+  // Titles follow the committed user transcript. Client-local failure notices
+  // are visible too but never qualify as a title.
   for item in conv.visible_items() {
     if item.kind is User {
       // A prompt sent with chips titles by what was typed (or, chips alone,
@@ -1070,10 +1070,9 @@ fn transcript_view(
   on_open : (String) -> @cmd.Cmd,
 ) -> @html.Html {
   let items : Array[@html.Html] = []
-  // The durable transcript plus the not-yet-committed overlay (the just-sent
-  // prompt, a step's settled text): one list, rendered through one folding
-  // pass, so an item neither moves nor restyles when its commit lands and it
-  // migrates from overlay to durable.
+  // The durable transcript plus client-local notices, rendered through one
+  // folding pass. Live semantic events never synthesize durable-looking
+  // items here; their store commits populate the transcript.
   let visible = conv.visible_items()
   if visible.is_empty() {
     items.push(
@@ -1162,7 +1161,7 @@ fn transcript_view(
 /// (`steer_applied` commits it as a real user message).
 fn pending_steers_panel(conv : Conversation) -> @html.Html {
   let rows : Array[@html.Html] = []
-  for text in conv.pending_steers {
+  for text in conv.pending_steers() {
     let shown = user_display_text(text)
     rows.push(
       @html.div(class="pending-steer-row", title=shown, [
@@ -1331,8 +1330,11 @@ fn mention_tray(dispatch : @cmd.Emit[Msg], conv : Conversation) -> @html.Html {
 ///|
 fn composer_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
   let conv = model.active()
+  let transcript_ready = conv.sync is Synced &&
+    !conv.has_unresolved_run_tail_notice()
   let has_input = model.bridge is Connected &&
     model.api_ready() &&
+    transcript_ready &&
     conv.draft_sendable()
   // A compacting conversation cannot accept a prompt either: the serve
   // engine would queue it behind the compaction, where Stop cannot reach it.
@@ -1356,12 +1358,14 @@ fn composer_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
     @html.div(class="composer-status", status),
   ]
   if conv.is_running() {
-    // One morphing button while this conversation's turn runs: a sendable
-    // draft (typed text) turns it into a steer submit, anything else —
-    // empty, or chips still waiting for their instruction — leaves it as the
-    // interrupt. A turn being cancelled cannot be steered, so the button
-    // waits with the user's draft in the composer.
-    if !conv.draft_sendable() {
+    // One morphing button while this conversation's turn runs. It becomes a
+    // steer submit only when the durable boundary is ready too; a draft must
+    // never hide Stop behind a disabled Send during reload/reconciliation.
+    let can_steer = has_input &&
+      conv.run_durable_floor is Some(_) &&
+      conv.run is Open(stage~, ..) &&
+      !(stage is Cancelling)
+    if !can_steer {
       controls.push(
         @html.button(
           id="stop",
@@ -1373,13 +1377,12 @@ fn composer_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
         ),
       )
     } else {
-      let can_steer = has_input && !(conv.run is Open(stage=Cancelling, ..))
       controls.push(
         @html.button(
           id="send",
           class="icon-button send-button",
           title="Steer the running task",
-          disabled=!can_steer,
+          disabled=false,
           on_click=dispatch(Send),
           icon(icon_arrow_up),
         ),
@@ -1398,7 +1401,7 @@ fn composer_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
     )
   }
   let children : Array[@html.Html] = []
-  if conv.pending_steers.length() > 0 {
+  if !conv.pending_steers().is_empty() {
     children.push(pending_steers_panel(conv))
   }
   // The requested phase reads as compacting already: the distinction (the

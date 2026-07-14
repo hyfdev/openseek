@@ -94,8 +94,7 @@ async fn run_config(
     manager,
     model?=payload.model,
     max_steps?=payload.max_steps,
-    session?=payload.session,
-    session_root?=payload.session_root,
+    session?=payload.session.map(session => session.trim().to_owned()),
     workspace?=payload.workspace,
   )
 }
@@ -110,7 +109,8 @@ async fn compact_config(
   manager : EngineManager,
   payload : CompactRequest,
 ) -> RunConfig {
-  guard !payload.session.is_empty() else {
+  let session = payload.session.trim().to_owned()
+  guard !session.is_empty() else {
     raise EngineError("session id must not be empty")
   }
   serve_config(
@@ -118,8 +118,7 @@ async fn compact_config(
     manager,
     model?=payload.model,
     max_steps?=payload.max_steps,
-    session=payload.session,
-    session_root?=payload.session_root,
+    session~,
     workspace?=payload.workspace,
   )
 }
@@ -135,11 +134,10 @@ async fn serve_config(
   model? : String,
   max_steps? : Int,
   session? : String,
-  session_root? : String,
   workspace? : String,
 ) -> RunConfig {
   let engine = manager.engine
-  let settings = load_engine_settings(manager.runtime_dir)
+  let (settings, _) = manager.settings_snapshot()
   let endpoint = resolved_endpoint(settings)
   let host = engine_host(settings_wsl_request(settings), engine)
   // A workspace run happens in the project directory itself, with the
@@ -176,8 +174,11 @@ async fn serve_config(
     session,
     session_root: if workspace is Some(dir) {
       Some(workspace_session_root(dir))
-    } else if session is Some(_) {
-      resolved_session_root(payload_root?=session_root.map(root => Path(root)))
+    } else if session is Some(session) {
+      // A hint-less client resuming an existing workspace conversation must
+      // keep using that workspace's store. Only genuinely new sessions fall
+      // back to the global root; otherwise one id forks into two histories.
+      session_store_root(session)
     } else {
       None
     },
@@ -377,11 +378,71 @@ async test "run config ignores OPENSEEK_API_URL in favor of the settings" {
   let manager = new_engine_manager("openseek")
   let config = run_config(manager, {
     task: "hello",
+    submission_id: None,
     model: None,
     max_steps: None,
     session: None,
-    session_root: None,
     workspace: None,
   })
   assert_true(config.api_url is Some(OpenseekProxyUrl))
+}
+
+///|
+async test "host chooses durable placement from workspace state" {
+  archive_env_test_lock.acquire()
+  defer archive_env_test_lock.release()
+  let previous = @sys.get_env_var("OPENSEEK_SESSION_ROOT")
+  let dir = @fs.tmpdir(prefix="openseek-config-workspace-")
+  let global_root = dir + "/global"
+  let workspace = dir + "/workspace"
+  @sys.set_env_var("OPENSEEK_SESSION_ROOT", global_root)
+  defer (if previous is Some(value) {
+    @sys.set_env_var("OPENSEEK_SESSION_ROOT", value)
+  } else {
+    @sys.unset_env_var("OPENSEEK_SESSION_ROOT")
+  })
+  @fsx.ensure_dir(Path(global_root))
+  @fsx.ensure_dir(Path(workspace + "/.openseek/sessions/s-workspace"))
+  @fs.write_file(
+    global_root + "/workspaces.json",
+    ({ "workspaces": [workspace] } : Json).stringify(),
+    create_mode=CreateOrTruncate,
+  )
+  let manager = new_engine_manager("openseek")
+  let config = run_config(manager, {
+    task: "resume",
+    submission_id: None,
+    model: None,
+    max_steps: None,
+    session: Some("s-workspace"),
+    workspace: None,
+  })
+  assert_eq(
+    config.session_root.map(root => root.to_string()),
+    Some(workspace + "/.openseek"),
+  )
+  assert_eq(config.cwd.map(cwd => cwd.to_string()), Some(workspace))
+  let fresh = run_config(manager, {
+    task: "fresh",
+    submission_id: None,
+    model: None,
+    max_steps: None,
+    session: Some("s-global"),
+    workspace: None,
+  })
+  assert_eq(fresh.session_root.map(root => root.to_string()), Some(global_root))
+  let attached = run_config(manager, {
+    task: "attached",
+    submission_id: None,
+    model: None,
+    max_steps: None,
+    session: Some("s-attached"),
+    workspace: Some(workspace),
+  })
+  assert_eq(
+    attached.session_root.map(root => root.to_string()),
+    Some(workspace + "/.openseek"),
+  )
+  assert_eq(attached.cwd.map(cwd => cwd.to_string()), Some(workspace))
+  @fs.rmdir(dir, recursive=true)
 }

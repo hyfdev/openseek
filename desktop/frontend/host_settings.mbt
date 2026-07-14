@@ -22,6 +22,7 @@ fn decode_host_settings(payload : Map[String, Json]) -> HostSettings? {
     _ => (false, "", "")
   }
   Some({
+    revision: @jsonx.json_int(payload, "revision").unwrap_or(0),
     provider,
     custom_api_url: @jsonx.json_text(payload, "custom_api_url").unwrap_or(""),
     has_deepseek_key: payload.get("has_deepseek_key") is Some(True),
@@ -45,7 +46,10 @@ fn reply_host_settings(reply : @js.Value) -> HostSettings? {
 /// Seed (or refresh) the mirror from the host. A failed or malformed reply
 /// leaves the current mirror in place — the broadcast channel will correct
 /// it on the next change.
-fn fetch_host_settings(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+fn fetch_host_settings(
+  dispatch : @cmd.Emit[Msg],
+  connection_generation : Int,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
@@ -55,7 +59,14 @@ fn fetch_host_settings(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
         _ => return
       }
       if reply_host_settings(reply) is Some(settings) {
-        scheduler.add(dispatch(HostSettingsLoaded(settings)))
+        scheduler.add(
+          dispatch(
+            HostSettingsLoaded(
+              settings,
+              connection_generation=Some(connection_generation),
+            ),
+          ),
+        )
       }
     })
   })
@@ -66,22 +77,48 @@ fn fetch_host_settings(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
 /// state (`HostSettingsApplied` reconciles the mirror once no more writes
 /// are in flight); a failure surfaces as a toast and leaves the host store
 /// unchanged.
-fn push_host_settings(dispatch : @cmd.Emit[Msg], patch : @js.Value) -> @cmd.Cmd {
+fn push_host_settings(
+  dispatch : @cmd.Emit[Msg],
+  patch : @js.Value,
+  connection_generation : Int,
+  cleans_legacy? : Bool = false,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request("settings.set", patch) catch {
         error => {
           scheduler.add(
-            dispatch(HostSettingsSaveFailed(@interop.bridge_error_text(error))),
+            dispatch(
+              HostSettingsSaveFailed(
+                @interop.bridge_error_text(error),
+                connection_generation~,
+                cleans_legacy~,
+              ),
+            ),
           )
           return
         }
       }
       match reply_host_settings(reply) {
-        Some(settings) => scheduler.add(dispatch(HostSettingsApplied(settings)))
+        Some(settings) =>
+          scheduler.add(
+            dispatch(
+              HostSettingsApplied(
+                settings,
+                connection_generation~,
+                cleans_legacy~,
+              ),
+            ),
+          )
         None =>
           scheduler.add(
-            dispatch(HostSettingsSaveFailed("malformed settings reply")),
+            dispatch(
+              HostSettingsSaveFailed(
+                "malformed settings reply",
+                connection_generation~,
+                cleans_legacy~,
+              ),
+            ),
           )
       }
     })

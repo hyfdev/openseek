@@ -36,6 +36,9 @@ Frames are JSON text, shaped as **JSON-RPC 2.0**:
 // client → host: request
 {"jsonrpc": "2.0", "id": 1, "method": "agent.start", "params": {…}}
 
+// client → host: optional connection capability (no reply expected)
+{"jsonrpc": "2.0", "method": "client.capabilities", "params": {"durable_session_events": true}}
+
 // host → client: response (exactly one per request, either form)
 {"jsonrpc": "2.0", "id": 1, "result": {…}}
 {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "…"}}
@@ -47,6 +50,24 @@ Frames are JSON text, shaped as **JSON-RPC 2.0**:
 Request `id`s are client-assigned and client-scoped (a monotonic counter is
 fine). Responses may arrive out of order relative to other requests — the
 `id` is the correlation. Batch requests are not supported.
+
+`client.capabilities` is an optional, connection-scoped notification. A
+browser that sets `durable_session_events` to `true` asks the host to trim
+high-volume transcript objects whose canonical form is delivered by
+`session.event`. This trimming applies only to named durable sessions;
+session-less runs retain the complete legacy stream because they have no
+`session.event` source. For a durable run, the pushed `agent.started` remains
+with `task: ""`;
+`reasoning_message` and `assistant_message` remain as stream-settlement signals
+with `content: ""`; `tool_result`, `auto_compaction_finished`, `agent_finished`,
+and `context_yield` are omitted. The separate `agent.finished` lifecycle
+notification remains, including its optional `answer`;
+`compaction_finished` remains with an empty `summary` so it still closes the
+lifecycle state. Deltas, usage, step progress, tool-decode errors, runtime
+status, steer receipts, and all other run/compaction lifecycle and error events
+are unchanged. Missing, false, malformed, and unknown capabilities retain the
+legacy stream. Old hosts ignore the notification, and the desktop's in-process
+bridge does not negotiate it.
 
 ## Authentication
 
@@ -94,38 +115,69 @@ any auth checks — it is a splicer for local work, never for deployment.
 
 ## Connection lifecycle: reconnect = resync
 
-There is **no resume machinery**: no connection cursor and no replay. (The
-one sequence that exists is per-session and durable, not per-connection:
+There is no stream-resume machinery: no connection cursor and no replay of
+transient notifications. (The one sequence that exists is per-session and
+durable, not per-connection:
 `session.event` carries the store's own event sequence — see *The durable
 transcript* below — and a reconnect recovers missed commits by re-reading,
-never by replay.) A connection delivers events from the moment it exists;
-whatever a client missed while disconnected it recovers by re-reading state:
+never by replay.) The sole lifecycle exception is `agent.runs`'s targeted,
+process-lifetime settlement state for owners the reconnecting client names;
+it is a state query, not an event log. A connection delivers events from the
+moment it exists; whatever a client missed while disconnected it recovers by
+re-reading state:
 
-1. Connect the WebSocket. Notifications start flowing immediately.
+1. Connect the WebSocket. A capable client immediately sends
+   `client.capabilities`; notifications start flowing immediately, and the
+   capability applies once the host receives it.
 2. Resync: `session.list` + `agent.runs` (and reload whatever conversation
-   is open via `session.load`). The `agent.runs` reply is the **complete**
-   in-flight set, in both directions: it introduces runs the client has
+   is open via `session.load`). The client gives `agent.runs` the exact owners
+   from its request-time frontier: `{session, run_id}` after Started, or
+   `{session, submission_id}` while a start is in flight or delivery became
+   unconfirmed before its run id arrived. The reply contains the **complete**
+   in-flight set plus matching completed settlements retained by this host
+   process. The in-flight set introduces runs the client has
    never seen, and any run the client still shows that the reply lacks
    ended while it was away (its terminal notification will never be
-   replayed) and must be closed client-side.
+   replayed) and must be closed client-side. That negative-set decision is
+   limited to the exact per-session lifecycle state the client captured before
+   issuing this `agent.runs` request (idle/last run, starting `submission_id`,
+   or open run id). Any local steer reconciliation caused by that negative row
+   is likewise limited to the exact submission ids present at the request's
+   frontier; a steer submitted while the reply is in flight keeps its own
+   receipt path. Positive rows use the same frontier: a row is replayed only if
+   that session still has its captured state. A new `agent.started`,
+   `agent.finished`, or Send while the request is in flight therefore wins over
+   both stale presence and stale absence in the older reply. A settlement is
+   accepted under the same owner gate; an abnormal settlement is returned only
+   once its exact durable frontier is known (including sequence zero). One
+   atomic reply may contain a predecessor settlement and that session's active
+   successor, and clients apply both. The whole reply is also tagged with the
+   connection generation, so no row from a pre-reconnect request crosses a
+   later readiness boundary.
 3. Race note: notifications may arrive before the resync replies. This is
    harmless by construction — streaming deltas are ephemeral display state,
-   and every completed step is re-delivered as a full message
-   (`agent.event` with `assistant_message` / `tool_result`), which replaces
-   any partial delta buffer. A client that joins mid-step shows a truncated
-   stream for at most one step before the full text overwrites it.
+   and every completed step is delivered durably by `session.event` (legacy
+   clients also receive the full `agent.event` message). A client buffers
+   commits while loading and reconciles them against the snapshot watermark.
 
 What this costs, deliberately: transient events that occurred while
 disconnected (`usage` ticks, steer receipts, background notices) are gone —
 none of them carry state a resync cannot rebuild or safely ignore. A run
-that *finished* while the client was away is visible through `session.load`.
+that *finished* while the client was away is visible through `session.load`;
+its targeted `agent.runs` settlement supplies lifecycle outcome and the exact
+zero-durable case where no record exists to load. Settlements live only for the
+host process lifetime. After a host process restart there is no durable
+submission-id index, so a pre-restart unconfirmed input remains conservatively
+unresolved rather than being guessed.
 
 Slow clients are disconnected, not throttled and not silently dropped
 frame-by-frame: when a connection's outbound queue overflows, the host
 closes it, and the client reconnects into the resync path above.
 
-The in-process bridge is exempt from all of this: it cannot disconnect, so
-the desktop window never resyncs and never races.
+The in-process bridge does not use WebSocket reconnect or capability
+negotiation. It can still be recreated across a host restart: each
+`BridgeReady` transition makes the desktop rebuild host-derived state, so that
+readiness resync follows the same idempotent, race-tolerant rules.
 
 ## Method catalog
 
@@ -136,33 +188,51 @@ absence as `""`, `0`, or another in-band sentinel.
 ### agent.* — runs
 
 Run ids are opaque strings minted by the host, one per accepted prompt.
-They are random, never reused, and never collide across host restarts — a
-client may hold a pre-restart run id without any risk of it addressing a
-new run. Clients compare them for equality only.
+They use 128 bits of OS randomness and are not intentionally reused across
+host restarts, so a client may safely retain a pre-restart run id. Clients
+compare them for equality only.
+
+`submission_id` is a separate, optional opaque string minted by the client.
+It must contain non-whitespace content and be at most 128 UTF-8 bytes; the host
+treats a blank or overlong value as absent rather than retaining or echoing it.
+On `agent.start` the host echoes it unchanged in the corresponding
+`agent.started`; on `agent.steer` it is echoed in that submission's eventual
+`steer_applied` or `steer_dropped` event. This identifies the exact live
+submission that owns the returned run or receipt, even when two steers have
+identical text. The `agent.started` echo establishes run ownership but not
+durability—it is emitted before the host writes the prompt. An `agent.start`
+result of `accepted` proves the complete stdin command was written, not that
+the User item reached the store. Clients therefore retain a recovery copy
+until a normal Terminal-backed finish proves the User append, or an abnormal
+exact durable frontier reconciles it (sequence zero restores it for
+resubmission). This is lifecycle correlation only; durable transcript items
+still come from `session.event`. Old clients omit it, and old hosts omit the
+echoes.
 
 | method | params | result |
 |---|---|---|
-| `agent.start` | `{task, model?, max_steps?, session?, session_root?, workspace?}` — no credentials and no WSL preference: the host resolves the endpoint from its settings store (`settings.*`) | `{run_id, status, …}` — accepted once the run is public; pre-`started` failures are the error response |
+| `agent.start` | `{task, submission_id?, model?, max_steps?, session?, workspace?}` — no credentials, WSL preference, or store path: the host resolves settings and durable placement; `workspace` is honored only when registered | `{run_id, status, …}` — `accepted` after the complete prompt command is written; a post-`started` write failure returns `failed`, while pre-`started` failures use the error response |
 | `agent.cancel` | `{run_id?}` (absent = the latest run) | cancel outcome |
-| `agent.steer` | `{text, run_id?}` | steer outcome |
-| `agent.compact` | `{session, model?, max_steps?, session_root?, workspace?}` — `agent.start` minus `task`: a conversation resumed after a restart has no live process, and compacting spawns one with these settings | compaction outcome |
-| `agent.runs` | `{}` | `{runs: […]}` — every in-flight run's `agent.started` params, replayed through the same decoder; the resync replacement for v1's sticky `started` replay |
+| `agent.steer` | `{text, run_id?, submission_id?}` | steer outcome |
+| `agent.compact` | `{session, model?, max_steps?, workspace?}` — `agent.start` minus `task`: a conversation resumed after a restart has no live process, and compacting spawns one with these settings | compaction outcome |
+| `agent.runs` | `{known?: [{session, run_id?, submission_id?}]}` — each selector must carry a run or submission id; `{}` remains valid | `{runs: […], settled: […]}` — every in-flight run's `agent.started` params plus selector-matched `{run_id, session, submission_id?, status, exit_code?, durable_sequence?}` lifecycle settlements. Normal Terminal-backed statuses are immediately replayable; abnormal statuses appear only with an exact durable sequence. Active and settled state are captured atomically |
 
 Notifications:
 
 | method | params |
 |---|---|
-| `agent.started` | `{run_id, task, session, model, max_steps, cwd?}` — `task` is the prompt text, kept for old clients that synthesize the prompt bubble from it; current clients take the bubble from the prompt's own `session.event` commit |
-| `agent.event` | `{run_id?, session, event: {…}}` — the engine's event object verbatim (`assistant_delta`, `tool_result`, `agent_finished`, …); `run_id` is absent for events emitted before any run of the engine process's lifetime (a compaction on a freshly spawned engine), which route by `session` |
-| `agent.error` | `{message, run_id?, diagnostics?}` |
-| `agent.finished` | `{run_id, status, answer?}` |
+| `agent.started` | `{run_id, task, submission_id?, session, engine, model, max_steps, cwd?, session_root?}` — `cwd` and `session_root` are host-derived placement facts, never client-selected paths. `task` is kept for old clients that synthesize the prompt bubble from it; current clients take the bubble from the prompt's own `session.event` commit |
+| `agent.event` | `{run_id?, session, event: {…}}` — the engine's event object (`assistant_delta`, `tool_result`, `agent_finished`, …); for a correlated steer receipt the host adds its optional `submission_id`. `run_id` is absent for events emitted before any run of the engine process's lifetime (a compaction on a freshly spawned engine), which route by `session` |
+| `agent.error` | `{message, run_id?, exit_code?, diagnostics?}` |
+| `agent.finished` | `{run_id, status, answer?, exit_code?, durable_sequence?}` — `durable_sequence` is present when an abnormal process exit's follower final scan completed before lifecycle publication; it is the exact stored boundary even when the dead turn appended no Terminal |
+| `agent.durable` | `{run_id, session, sequence}` — strengthens an already-emitted failure/abort result after the host retires that serve process and its follower final scan succeeds. In particular, `agent_setup_failed`, `turn_failed`, and `agent_aborted` do not by themselves prove their best-effort Terminal append succeeded. This is a boundary update, not a second finish |
 
 ### session.*
 
 | method | params | result |
 |---|---|---|
 | `session.list` | `{}` | the session index |
-| `session.load` | `{session, workspace?}` | `{session: <the durable session JSON>, watermark}` — `watermark` is the highest event `sequence` the snapshot contains (0 for an empty record) |
+| `session.load` | `{session, workspace?}` — a non-blank workspace must still be registered; omitted/blank locates the session across registered stores, then the global store | `{session: <the durable session JSON>, watermark?}` — current hosts include `watermark`, the highest event `sequence` the snapshot contains (0 for an empty record); older hosts omit it, and clients derive the same value from the stored events' own sequences |
 | `session.list_archived` | `{}` | the archived index |
 | `session.archive` | `{session}` | outcome |
 | `session.unarchive` | `{session}` | outcome |
@@ -172,7 +242,7 @@ Notifications:
 | method | params |
 |---|---|
 | `session.event` | `{session, sequence, event: {sequence, ts, item}}` — one durably **committed** store event, `event` verbatim as `session.load` carries it in `events`; see *The durable transcript* below |
-| `session.changed` | `{change: "archived" \| "unarchived", session}` — broadcast to every client (the requester included) when a conversation moves between the live and archived stores; recipients re-read both lists and drop live state for an archived record |
+| `session.changed` | `{change: "archived" \| "unarchived", session}` — broadcast to every client (the requester included) when a conversation moves between the live and archived stores; recipients apply this per-session fact immediately, keep it authoritative over already-in-flight unversioned list replies, and re-read both lists. A new connection starts a fresh list round. |
 
 #### The durable transcript: snapshots + commits
 
@@ -180,10 +250,12 @@ A conversation's durable transcript has exactly two sources: the
 `session.load` snapshot and the `session.event` commits that follow it. A
 commit exists **if and only if** its item is in the session's durable
 record, and `sequence` is the item's one-based position there — contiguous
-per session. Everything else on the wire (`agent.event` deltas and full
-messages, `agent.started`'s `task`, steer receipts) is display overlay and
-lifecycle signal: show it live, but never persist it into the transcript —
-its durable form arrives as a commit.
+per session. Everything else on the wire is transient stream or lifecycle
+state: commit-aware clients may show deltas live, but full semantic messages,
+`agent.started`'s `task`, and steer receipts never append transcript items —
+their durable form arrives as a commit. A negotiated
+`durable_session_events` connection receives the lightweight forms described
+above instead of duplicate full semantic payloads.
 
 Client algorithm, per session: keep a watermark `W`, starting at the
 snapshot's. For each `session.event`: `sequence ≤ W` → drop (re-broadcasts
@@ -198,14 +270,39 @@ The host broadcasts commits while it manages a live writer for the session
 whatever the engine persisted last). Between engines nothing writes on the
 host's behalf, so there is nothing to broadcast; anything an *external*
 writer (the CLI sharing the session) appends meanwhile surfaces as a gap on
-the next commit, which the reload answers. Compaction may drop summarized
-events from the record; sequences never renumber, so the summary's commit
-still applies contiguously.
+the next commit, which the reload answers. Compaction appends its durable
+summary to the log; existing sequences never renumber, so the summary's
+commit still applies contiguously.
+
+The final sweep also closes the lifecycle proof for an abnormal exit. If the
+sweep itself fails, the host keeps that run's pending durable boundary with
+the retryable follower generation; a later lifecycle drain publishes the
+same `agent.durable` boundary before retiring it. The targeted `agent.runs`
+settlement then lets a reconnecting owner distinguish “some commits exist”
+from the exact-zero case, where its recovery copy of the input is restored
+for resubmission.
 
 Old clients ignore `session.event` and keep building the transcript from
-`agent.event` as before; old hosts never send it (and their `session.load`
-reply has no `watermark`), which a new client reads as "no commits will
-come" and behaves exactly like the old one.
+`agent.event` as before. Old hosts never send `session.event`, ignore the
+capability notification, and omit the top-level `session.load.watermark`.
+A new client derives the watermark from the snapshot events' own `sequence`
+fields and performs one generation-tagged background `session.load` when a
+named run reaches `agent.finished`. That post-terminal snapshot is the
+compatibility/final-consistency path for the full semantic items the new
+client deliberately does not append from `agent.event`. If an older snapshot
+is already in flight, the client keeps reads single-flight and schedules one
+fresh generation after it settles; commits received from a new host remain
+buffered and are filtered against the resulting watermark as usual.
+Only completion, context-yield, and max-step statuses prove that the semantic
+log followed a successful Terminal append. Failure and abort statuses remain
+unanchored until an exact durable boundary arrives, either live through
+`agent.durable` or in the matching `agent.runs` settlement, so a later run's
+anonymous Terminal cannot be mistaken for theirs.
+
+Likewise, an old host's `agent.started` has no `submission_id`. The exact
+`agent.start` response still carries the request's run id, so a client may use
+that response to settle its local submission after the id-less Started push
+has opened the same run.
 
 ### settings.* — the host-owned engine endpoint settings
 
@@ -225,6 +322,7 @@ The status shape, also the params of every `settings.changed` notification:
 
 ```jsonc
 {
+  "revision": 7,                    // host-process monotonic revision
   "provider": "openseek" | "deepseek" | "custom",
   "custom_api_url": "https://…",   // absent when unset
   "has_deepseek_key": false,       // presence only — the key text never leaves the host
@@ -232,6 +330,11 @@ The status shape, also the params of every `settings.changed` notification:
   "wsl": {"enabled": false, "distro": "…", "engine": "…"}  // distro/engine absent when unset
 }
 ```
+
+Successful writes are serialized and increment `revision` before the status
+is returned and broadcast. Clients ignore a lower revision within one host
+connection generation. `BridgeReady` starts a new generation and resets that
+comparison because the host process may have restarted its counter.
 
 Notification:
 
@@ -245,7 +348,25 @@ Notification:
 |---|---|---|
 | `workspace.list` | `{}` | `{workspaces: […]}` |
 | `workspace.add` | `{path}` | the updated list |
-| `workspace.remove` | `{path}` | the updated list |
+| `workspace.remove` | `{path}` | the updated list — refused while any conversation operation is still being prepared, or while a run/compaction in that workspace is active; idle engines and their final follower scan are drained before the registry entry is committed |
+
+Notifications:
+
+| method | params |
+|---|---|
+| `workspace.changed` | `{workspaces: […]}` — the canonical post-commit registry list, broadcast to every client while the host still holds its registry serialization lock; recipients invalidate older `workspace.list` replies before adopting it |
+
+Removing a workspace only hides its registry entry; it does not delete the
+directory or sessions. Clients keep the workspace attached to already-open
+conversation state, so a stale attempt names that now-unregistered path and
+is rejected instead of silently relocating the session into the global store.
+
+That workspace hint is part of a client's resume state. A protocol client
+that persists a workspace session across a host restart must persist and send
+its `workspace` too: once the workspace is no longer registered, an omitted
+hint leaves a missing id indistinguishable from a brand-new scratch session.
+The current wire has no persistent detached-session tombstone; the bundled
+client retains the hint and therefore gets the intended rejection.
 
 ### git.*
 
@@ -415,12 +536,14 @@ v1 (an HTTP + SSE gateway embedded in the desktop) is described by
   commands, SSE for events, and a bespoke HTTP-over-WebSocket frame
   protocol (`req`/`resp`/`chunk`/`end`/`abort`) inside the tunnel. v2 is
   one JSON-RPC WebSocket, and the tunnel forwards it blind.
-- **No seq / replay ring / sticky starts.** v1 resumed event streams by
+- **No connection seq / replay ring / sticky starts.** v1 resumed event streams by
   cursor (`?since=`) against a 4096-frame ring, with in-flight runs'
   `started` frames pinned. v2 reconnects by resyncing state: the serve
   engine appends every completed item to the session store as it runs, so
-  `session.load` + `agent.runs` rebuild everything durable, and
-  full-message events overwrite partial deltas within one step.
+  `session.load` rebuilds the durable transcript, while `agent.runs` returns
+  current starts plus selector-targeted process-lifetime settlements needed
+  to close exact reconnect ownership (including a zero-commit abnormal exit).
+  Full-message events overwrite partial deltas within one step.
 - **Route/op names unified** under dotted namespaces (`agent.*`,
   `session.*`, `workspace.*`, `git.*`, `fs.*`, `lsp.*`, `skills.*`,
   `update.*`, `app.*`, `host.*`), shared verbatim by the bridge and the

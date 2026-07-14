@@ -82,7 +82,21 @@ pub fn ws_connect(
     open_: false,
   }
   active_session.val = Some(session)
-  socket.set_with_string("onopen", (_event : @js.Value) => session.open_ = true)
+  socket.set_with_string("onopen", (_event : @js.Value) => {
+    // Negotiate before exposing the socket to request senders. Old hosts
+    // ignore client notifications; new hosts can omit full semantic
+    // transcript events whose durable form arrives through `session.event`.
+    let capabilities = @js.Object::new()
+    capabilities["durable_session_events"] = true
+    let frame = @js.Object::new()
+    frame["jsonrpc"] = "2.0"
+    frame["method"] = "client.capabilities"
+    frame["params"] = capabilities.to_value()
+    let _ : @js.Value = socket.apply_with_string("send", [
+      @js.Value::cast_from(json_text(frame.to_value())),
+    ])
+    session.open_ = true
+  })
   socket.set_with_string("onmessage", (event : @js.Value) => {
     handle_message(session, event, on_notification)
   })
@@ -118,13 +132,34 @@ async fn ws_request(op : String, payload : @js.Value) -> @js.Value {
     ([] : Array[@js.Value]),
   )
   session.pending[id] = deferred
-  let _ : @js.Value = session.socket.apply_with_string("send", [
-    @js.Value::cast_from(text),
-  ])
+  @js.Error_::wrap(
+    () => session.socket.apply_with_string("send", [@js.Value::cast_from(text)]),
+    map_ok=_ => (),
+  ) catch {
+    error => {
+      // `send` can throw synchronously after insertion but before a promise
+      // waiter exists. Remove only our still-current resolver: an exotic
+      // synchronous response may already have settled/replaced this id.
+      remove_pending_if_same(session, id, deferred)
+      raise error
+    }
+  }
   let promise : @js.Promise = @js.Value::cast(
     (deferred.get_with_string("promise") : @js.Value),
   )
   promise.wait()
+}
+
+///|
+fn remove_pending_if_same(
+  session : RpcSession,
+  id : Int,
+  deferred : @js.Value,
+) -> Unit {
+  if session.pending.get(id) is Some(current) &&
+    physical_equal(current, deferred) {
+    session.pending.remove(id)
+  }
 }
 
 ///|
@@ -167,7 +202,10 @@ fn handle_message(
         { "message": String(message), .. } => message
         _ => "request failed"
       }
-      settle(deferred, "reject", js_error(message))
+      // Mark a peer JSON-RPC error separately from a socket loss. Both reject
+      // the same JS promise, but submission recovery must restore a draft only
+      // when the host definitively answered this exact request.
+      settle(deferred, "reject", js_error(message, rpc_rejection=true))
     }
     None => {
       let result = match js_prop(envelope, "result") {
@@ -186,7 +224,7 @@ fn handle_message(
 /// message wherever the op's error lands.
 fn reject_all(session : RpcSession, message : String) -> Unit {
   for _, deferred in session.pending {
-    settle(deferred, "reject", js_error(message))
+    settle(deferred, "reject", js_error(message, rpc_rejection=false))
   }
   session.pending.clear()
 }
@@ -197,9 +235,13 @@ fn settle(deferred : @js.Value, way : String, value : @js.Value) -> Unit {
 }
 
 ///|
-fn js_error(message : String) -> @js.Value {
+fn js_error(message : String, rpc_rejection~ : Bool) -> @js.Value {
   let ctor : @js.Value = @js.globalThis.get_with_string("Error")
-  ctor.new([message])
+  let error : @js.Value = ctor.new([message])
+  if rpc_rejection {
+    error.set_with_string("__openseek_rpc_rejection", true)
+  }
+  error
 }
 
 ///|
@@ -212,4 +254,32 @@ fn json_text(value : @js.Value) -> String {
     Some(text) => text
     None => "{}"
   }
+}
+
+///|
+test "synchronous send cleanup removes only its own pending resolver" {
+  let socket = @js.Object::new().to_value()
+  let original = @js.Object::new().to_value()
+  let replacement = @js.Object::new().to_value()
+  let session : RpcSession = {
+    socket,
+    pending: { 7: original },
+    next_id: 8,
+    open_: true,
+  }
+  remove_pending_if_same(session, 7, replacement)
+  assert_true(session.pending.get(7) is Some(_))
+  remove_pending_if_same(session, 7, original)
+  assert_true(session.pending.get(7) is None)
+}
+
+///|
+test "only marked browser RPC errors are definitive refusals" {
+  let ctor : @js.Value = @js.globalThis.get_with_string("Error")
+  let transport : @js.Value = ctor.new(["connection lost"])
+  let rejected : @js.Value = ctor.new(["host refused"])
+  rejected.set_with_string("__openseek_rpc_rejection", true)
+  assert_false(browser_rpc_error_is_definite(transport))
+  assert_true(browser_rpc_error_is_definite(rejected))
+  assert_false(bridge_error_is_definite(BridgeError("bridge unavailable")))
 }

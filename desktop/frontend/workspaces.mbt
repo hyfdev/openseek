@@ -1,12 +1,15 @@
 // The sidebar's workspace flow: `pick_workspace` opens the system folder
 // chooser, `list_workspaces` reads the attached project directories back,
-// and `add_workspace`/`remove_workspace` change the registry. The registry
-// ops reply with the updated list, so one decoder serves them all — and
-// since attaching or detaching a workspace changes which session groups
-// exist, the action commands refresh the session list too.
+// and `add_workspace`/`remove_workspace` change the registry. Each durable
+// mutation broadcasts its canonical updated list to every client while the
+// host still holds the registry's serialization lock.
 
 ///|
-fn fetch_workspaces(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+fn fetch_workspaces(
+  dispatch : @cmd.Emit[Msg],
+  connection_generation : Int,
+  request_generation : Int,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       // A host without the op just reads as "no workspaces attached".
@@ -22,7 +25,15 @@ fn fetch_workspaces(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
         is Some(workspaces) else {
         return
       }
-      scheduler.add(dispatch(WorkspacesLoaded(workspaces)))
+      scheduler.add(
+        dispatch(
+          WorkspacesLoaded(
+            workspaces,
+            connection_generation~,
+            request_generation~,
+          ),
+        ),
+      )
     })
   })
 }
@@ -136,7 +147,7 @@ async fn workspace_action_into(
 ) -> Unit noraise {
   let payload = @js.Object::new()
   payload["path"] = path
-  let reply = @interop.bridge_request(op, payload.to_value()) catch {
+  let _ = @interop.bridge_request(op, payload.to_value()) catch {
     error => {
       scheduler.add(
         dispatch(WorkspaceFailed(@interop.bridge_error_text(error))),
@@ -144,13 +155,9 @@ async fn workspace_action_into(
       return
     }
   }
-  match decode_workspaces(@interop.reply_json_text(reply)) {
-    Some(workspaces) => scheduler.add(dispatch(WorkspacesLoaded(workspaces)))
-    None => scheduler.add(dispatch(WorkspaceFailed("malformed workspace list")))
-  }
-  // The registry changed, so the sidebar has a session group to gain or
-  // drop; refresh the list that carries them.
-  refresh_sessions_into(scheduler, dispatch)
+  // Success is published to every client as canonical `workspace.changed`
+  // from the registry commit seam. The RPC response itself carries no newer
+  // ordering information and must not start a second, fallible list read.
 }
 
 ///|
@@ -159,6 +166,13 @@ async fn workspace_action_into(
 fn decode_workspaces(text : String) -> Array[String]? {
   let json = @json.parse(text) catch { _ => return None }
   guard json is Object(reply) else { return None }
+  workspaces_from_fields(reply)
+}
+
+///|
+/// Decode the common `{workspaces:[...]}` shape used by list replies and the
+/// host's post-commit broadcast.
+fn workspaces_from_fields(reply : Map[String, Json]) -> Array[String]? {
   guard reply.get("workspaces") is Some(Array(items)) else { return None }
   let paths : Array[String] = []
   for item in items {
@@ -229,7 +243,7 @@ test "a scratch rotation leaves the conversation in the default store" {
 }
 
 ///|
-test "workspaces loaded resets placements the registry no longer has" {
+test "workspaces loaded retains a detached conversation's durable placement" {
   let dispatch = test_dispatch()
   let model = {
     ..test_model().replace_conversation({
@@ -238,9 +252,14 @@ test "workspaces loaded resets placements the registry no longer has" {
     }),
     active_workspace: "/gone",
   }
-  let (_, next) = update(dispatch, WorkspacesLoaded(["/kept"]), model)
+  let (_, next) = update(
+    dispatch,
+    WorkspacesLoaded(["/kept"], connection_generation=0, request_generation=0),
+    model,
+  )
   inspect(next.workspaces.length(), content="1")
-  assert_true(next.active().workspace is None)
+  inspect(next.sessions_request_generation, content="1")
+  assert_true(next.active().workspace is Some(Absolute("/gone")))
   inspect(next.active_workspace, content="")
   // A still-registered placement survives the same reply.
   let attached = {
@@ -250,9 +269,84 @@ test "workspaces loaded resets placements the registry no longer has" {
     }),
     active_workspace: "/kept",
   }
-  let (_, kept) = update(dispatch, WorkspacesLoaded(["/kept"]), attached)
+  let (_, kept) = update(
+    dispatch,
+    WorkspacesLoaded(["/kept"], connection_generation=0, request_generation=0),
+    attached,
+  )
+  inspect(kept.sessions_request_generation, content="1")
   assert_true(kept.active().workspace is Some(Absolute("/kept")))
   inspect(kept.active_workspace, content="/kept")
+}
+
+///|
+test "an older workspace reply cannot replace a newer same-connection reply" {
+  let dispatch = test_dispatch()
+  let model = { ..test_model(), workspaces_request_generation: 2 }
+  let (_, newest) = update(
+    dispatch,
+    WorkspacesLoaded(
+      ["/current"],
+      connection_generation=0,
+      request_generation=2,
+    ),
+    model,
+  )
+  inspect(newest.workspaces.length(), content="1")
+  inspect(newest.workspaces[0], content="/current")
+  inspect(newest.sessions_request_generation, content="1")
+  let (_, stale) = update(
+    dispatch,
+    WorkspacesLoaded(["/old"], connection_generation=0, request_generation=1),
+    newest,
+  )
+  inspect(stale.workspaces.length(), content="1")
+  inspect(stale.workspaces[0], content="/current")
+  inspect(stale.sessions_request_generation, content="1")
+}
+
+///|
+test "a workspace commit broadcast supersedes list replies and refreshes sessions" {
+  let dispatch = test_dispatch()
+  let model = {
+    ..test_model(),
+    workspaces: ["/current"],
+    workspaces_request_generation: 2,
+  }
+  let (_, changed) = update(dispatch, WorkspacesChanged(["/new"]), model)
+  inspect(changed.workspaces_request_generation, content="3")
+  inspect(changed.workspaces.length(), content="1")
+  inspect(changed.workspaces[0], content="/new")
+  inspect(changed.sessions_request_generation, content="1")
+  let (_, stale) = update(
+    dispatch,
+    WorkspacesLoaded(
+      ["/current"],
+      connection_generation=0,
+      request_generation=2,
+    ),
+    changed,
+  )
+  inspect(stale.workspaces[0], content="/new")
+}
+
+///|
+test "workspace commit decoder carries the canonical registry list" {
+  guard bridge_msg("workspace.changed", {
+      "workspaces": Json::array([Json::string("/one"), Json::string("/two")]),
+    })
+    is Some(WorkspacesChanged(paths)) else {
+    fail("expected a workspace change")
+  }
+  inspect(paths.length(), content="2")
+  inspect(paths[1], content="/two")
+}
+
+///|
+test "proton subscribes to canonical durable and workspace notifications" {
+  let methods = proton_event_methods()
+  assert_true(methods.contains("agent.durable"))
+  assert_true(methods.contains("workspace.changed"))
 }
 
 ///|
@@ -274,7 +368,13 @@ test "opening a stored session adopts its workspace" {
   inspect(opening.loading_session, content="desktop-w")
   let (_, loaded) = update(
     dispatch,
-    SessionLoaded(session="desktop-w", items=[], watermark=0),
+    SessionLoaded(
+      session="desktop-w",
+      items=[],
+      watermark=0,
+      event_boundaries=[],
+      generation=1,
+    ),
     opening,
   )
   assert_true(loaded.active().workspace is Some(Absolute("/proj")))
@@ -346,6 +446,7 @@ test "confirming registers the browsed directory and closes the picker" {
   )
   let (_, confirmed) = update(dispatch, WorkspacePickerConfirm, loaded)
   assert_true(confirmed.workspace_picker is None)
+  inspect(confirmed.workspaces_request_generation, content="0")
   // Confirming before anything was browsed has nothing to register and
   // keeps the picker open.
   let (_, early) = update(dispatch, WorkspacePickerConfirm, opened)

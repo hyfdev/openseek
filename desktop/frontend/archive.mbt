@@ -7,7 +7,11 @@
 // the two action commands refresh the live list too.
 
 ///|
-fn fetch_archived(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+fn fetch_archived(
+  dispatch : @cmd.Emit[Msg],
+  connection_generation : Int,
+  request_generation : Int,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       // A host without the op (or without a session store) just reads as an
@@ -23,6 +27,9 @@ fn fetch_archived(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
           ArchivedLoaded(
             @transcript.decode_sessions_reply(@interop.reply_json_text(reply)).unwrap_or([],
             ),
+            connection_generation~,
+            request_generation~,
+            fresh_session=generated_session_id(),
           ),
         ),
       )
@@ -31,13 +38,31 @@ fn fetch_archived(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
 }
 
 ///|
-fn archive_session(dispatch : @cmd.Emit[Msg], session : String) -> @cmd.Cmd {
-  archive_action(dispatch, "session.archive", session)
+fn archive_session(
+  dispatch : @cmd.Emit[Msg],
+  session : String,
+  connection_generation : Int,
+  sessions_request_generation : Int,
+  archived_request_generation : Int,
+) -> @cmd.Cmd {
+  archive_action(
+    dispatch, "session.archive", session, connection_generation, sessions_request_generation,
+    archived_request_generation,
+  )
 }
 
 ///|
-fn unarchive_session(dispatch : @cmd.Emit[Msg], session : String) -> @cmd.Cmd {
-  archive_action(dispatch, "session.unarchive", session)
+fn unarchive_session(
+  dispatch : @cmd.Emit[Msg],
+  session : String,
+  connection_generation : Int,
+  sessions_request_generation : Int,
+  archived_request_generation : Int,
+) -> @cmd.Cmd {
+  archive_action(
+    dispatch, "session.unarchive", session, connection_generation, sessions_request_generation,
+    archived_request_generation,
+  )
 }
 
 ///|
@@ -45,6 +70,9 @@ fn archive_action(
   dispatch : @cmd.Emit[Msg],
   op : String,
   session : String,
+  connection_generation : Int,
+  sessions_request_generation : Int,
+  archived_request_generation : Int,
 ) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
@@ -63,6 +91,9 @@ fn archive_action(
           ArchivedLoaded(
             @transcript.decode_sessions_reply(@interop.reply_json_text(reply)).unwrap_or([],
             ),
+            connection_generation~,
+            request_generation=archived_request_generation,
+            fresh_session=generated_session_id(),
           ),
         ),
       )
@@ -81,7 +112,16 @@ fn archive_action(
       }
       match
         @transcript.decode_sessions_reply(@interop.reply_json_text(sessions)) {
-        Some(items) => scheduler.add(dispatch(SessionsLoaded(items)))
+        Some(items) =>
+          scheduler.add(
+            dispatch(
+              SessionsLoaded(
+                items,
+                connection_generation~,
+                request_generation=sessions_request_generation,
+              ),
+            ),
+          )
         None =>
           scheduler.add(dispatch(SessionsFailed("malformed session list")))
       }

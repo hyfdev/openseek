@@ -10,6 +10,8 @@ import {
 // Values
 pub fn add_capture_listener(@js.Value, String, (@dom.Event) -> Unit) -> Unit
 
+pub fn bridge_error_is_definite(Error) -> Bool
+
 pub fn bridge_error_text(Error) -> String
 
 pub async fn bridge_request(String, @js.Value) -> @js.Value

@@ -129,46 +129,69 @@ pub async fn dispatch(
       let payload : CompactPayload = decode(params)
       @engine.compact_run(state.manager, payload.to_request()).to_json()
     }
-    "agent.runs" => state.hub.runs()
+    "agent.runs" => {
+      let payload : RunsPayload = decode(params)
+      state.hub.runs(known?=payload.known)
+    }
     "session.list" => @engine.list_sessions(state.manager).to_json()
     "session.load" => {
       let payload : LoadSessionPayload = decode(params)
       @engine.load_session(state.manager, payload.to_request()).to_json()
     }
     "session.list_archived" =>
-      @engine.archived_sessions(state.manager).to_json()
+      @engine.archived_sessions(state.manager, session => {
+        publish_session_changed(state, "archived", session)
+      }).to_json()
     "session.archive" => {
       let payload : SessionPayload = decode(params)
-      let reply = @engine.archive_session(state.manager, payload.session).to_json()
-      // Every other client still lists (or has open) the conversation that
-      // just moved; without a broadcast only the requester learns, and a
-      // stale client could prompt into the archived record.
-      publish_session_changed(state, "archived", payload.session)
-      reply
+      let session = payload.canonical_session()
+      // The callback runs inside the rename's cancellation shield. Every
+      // other client learns the canonical id before any cancellable list
+      // reply, so a cancelled requester cannot suppress invalidation.
+      @engine.archive_session(state.manager, session, () => {
+        publish_session_changed(state, "archived", session)
+      }).to_json()
     }
     "session.unarchive" => {
       let payload : SessionPayload = decode(params)
-      let reply = @engine.unarchive_session(state.manager, payload.session).to_json()
-      publish_session_changed(state, "unarchived", payload.session)
-      reply
+      let session = payload.canonical_session()
+      @engine.unarchive_session(state.manager, session, () => {
+        publish_session_changed(state, "unarchived", session)
+      }).to_json()
     }
     "settings.get" => @engine.settings_status(state.manager)
     "settings.set" => {
       let payload : SettingsSetPayload = decode(params)
-      let status = @engine.update_settings(state.manager, payload.to_patch())
-      // Every client renders these settings (the Settings page, the
-      // composer's ready gate); the ones that did not ask must learn too.
-      state.hub.publish("settings.changed", status)
-      status
+      // The store commit and its broadcast are one finite cancellation-
+      // shielded linearization point. `update_settings` invokes the callback
+      // while its manager-owned lock is still held, preserving revision order
+      // across concurrent clients even if the requester disconnects.
+      @async.protect_from_cancel(() => {
+        @engine.update_settings(state.manager, payload.to_patch(), on_committed=fn(
+          status,
+        ) {
+          // Every client renders these settings (the Settings page, the
+          // composer's ready gate); clients that did not ask must learn too.
+          state.hub.publish("settings.changed", status)
+        })
+      })
     }
     "workspace.list" => @engine.list_workspaces().to_json()
     "workspace.add" => {
       let payload : WorkspacePayload = decode(params)
-      @engine.attach_workspace(payload.path).to_json()
+      @engine.attach_workspace(payload.path, workspaces => {
+        state.hub.publish("workspace.changed", {
+          "workspaces": workspaces.to_json(),
+        })
+      }).to_json()
     }
     "workspace.remove" => {
       let payload : WorkspacePayload = decode(params)
-      @engine.detach_workspace(payload.path).to_json()
+      @engine.detach_workspace(state.manager, payload.path, workspaces => {
+        state.hub.publish("workspace.changed", {
+          "workspaces": workspaces.to_json(),
+        })
+      }).to_json()
     }
     "host.meta" =>
       // `wsl` is the host's own capability: the engine runs here, so the

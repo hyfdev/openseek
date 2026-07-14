@@ -5,6 +5,9 @@ const DefaultModel : String = "deepseek-v4-pro"
 const DefaultMaxSteps : String = "1000"
 
 ///|
+const TranscriptRefreshFailedNotice : String = "Transcript refresh failed repeatedly. New commits are buffered; reopen the conversation or wait for the next update to retry."
+
+///|
 /// Legacy localStorage keys from when the page stored the engine endpoint
 /// settings itself. Those now live on the host (`settings.get`/`set`); the
 /// keys remain only so the desktop window can migrate stored values up once
@@ -112,8 +115,11 @@ priv enum RunPhase {
   // Between runs; `ended` remembers how the last one closed (`None` before
   // the first run of this app-lifetime).
   NoRun(ended~ : RunEnd?)
-  // Send accepted: the start op is in flight and no run id exists yet.
-  Starting
+  // Send accepted: this exact submission's start op is in flight and no run
+  // id exists yet. Keeping the id in the phase prevents an older reconnect
+  // snapshot from adjudicating a newer start merely because both ids remain
+  // in the reconciliation ledger.
+  Starting(submission_id~ : String)
   // The host's `started` event opened run `run_id`.
   Open(run_id~ : String, stage~ : TurnStage)
 }
@@ -140,6 +146,66 @@ priv enum RunEnd {
   RunFailed
   RunErrored
   RunFinished(RunOutcome)
+}
+
+///|
+/// One run identity returned by an `agent.runs` snapshot. The whole snapshot
+/// crosses into `update` as one generation-tagged message, so a reply from an
+/// older connection cannot replay any of these starts into a newer model.
+priv struct RecoveredRun {
+  run_id : String
+  session : String
+  model : String
+  max_steps : Int
+  cwd : @pathx.Absolute?
+  task : String?
+  submission_id : String?
+}
+
+///|
+/// One completed lifecycle returned by `agent.runs` for an exact owner the
+/// reconnecting page named. These rows are process-lifetime host evidence,
+/// not a history feed: selector matching below prevents an old completion
+/// from settling a newer run that reused the same conversation UI.
+priv struct RecoveredSettlement {
+  run_id : String
+  session : String
+  submission_id : String?
+  status : String
+  durable_sequence : Int?
+}
+
+///|
+/// The exact per-session lifecycle state at the instant an `agent.runs`
+/// request starts. An unversioned positive row is safe to replay only while
+/// the session still has this state; a live Started or Finished received
+/// meanwhile takes precedence over the older snapshot. `steer_ids` freezes
+/// the local inputs that existed at that same cut, so a slower negative reply
+/// cannot adjudicate a steer submitted after the request began.
+priv enum RunSnapshotState {
+  SnapshotIdle(last_run_id~ : String?)
+  SnapshotStarting(submission_id~ : String)
+  SnapshotOpen(run_id~ : String)
+}
+
+///|
+priv struct RunSnapshotFrontier {
+  session : String
+  state : RunSnapshotState
+  // Initial prompts whose start transport failed before a run id came back.
+  // Their submission id is still an exact owner and must survive the
+  // lifecycle's transition to SnapshotIdle for reconnect settlement lookup.
+  initial_ids : Array[String]
+  steer_ids : Array[String]
+}
+
+///|
+/// How a recovered settlement matched the request-time owner. Submission
+/// matches must first bind the host's run id into the local input ledger;
+/// run matches already have that identity.
+priv enum SettlementFrontierMatch {
+  SettlementByRun
+  SettlementBySubmission(String)
 }
 
 ///|
@@ -173,6 +239,19 @@ priv struct Conversation {
   // engine events arrive stamped with this id once the run phase is already
   // back to `NoRun`; routing them needs the retained id.
   last_run_id : String?
+  // Highest durable terminal sequence already known for this conversation.
+  // A locally steerable run freezes its own floor at start; a later terminal
+  // can therefore be recognized even if its commit beats `Finished` to UI.
+  last_terminal_sequence : Int
+  // Exclusive lower bound for the current run's terminal. `None` means the
+  // run began while transcript history was unresolved; steering stays gated
+  // rather than attaching a local notice to an unprovable boundary.
+  run_durable_floor : Int?
+  // The first snapshot generation issued after a foreign Started. An older
+  // in-flight snapshot may drain commits but cannot establish the new run's
+  // floor; only this causal read (or a later one) may release commit-based
+  // floor discovery.
+  run_floor_generation : Int?
   // Where this conversation's compaction stands; see `CompactionPhase`.
   compaction : CompactionPhase
   // A run finished while this conversation was off screen and the user has
@@ -195,16 +274,17 @@ priv struct Conversation {
   branch : String?
   watcher_status : String
   // Live text of the in-flight assistant turn, accumulated from
-  // `assistant_delta` / `reasoning_delta` events and cleared once the engine
-  // commits the full message (or the step/run ends). Empty means not streaming.
+  // `assistant_delta` / `reasoning_delta` events and cleared by ordered full
+  // semantic, step, run-lifecycle, or reconnect boundaries. Follower commits
+  // are not run/step tagged and therefore never clear a potentially newer
+  // stream. Empty means not streaming.
   streaming_response : String
   streaming_reasoning : String
-  // Steering input sent to the running turn but not yet settled by the
-  // engine: it echoes each steer back as `steer_applied` (folded into the
-  // turn at a step boundary) or `steer_dropped` (raced the turn's end).
-  // Shown as pending bubbles until then; leftovers are swept into dropped
-  // notices when the run ends, so the text never vanishes silently.
-  pending_steers : Array[String]
+  // Local submissions awaiting exact id-bearing host receipts. Initial prompt
+  // and steer entries share the ledger; steer state is also the sole source
+  // for pending UI and provisional failures. Canonical User text never claims
+  // ownership, so identical submissions from multiple clients cannot collide.
+  input_ledger : Array[PendingInput]
   // The durable transcript: exactly what `session.load` snapshots and
   // `session.event` commits said, nothing else. Copy-on-write.
   messages : Array[@transcript.TranscriptItem]
@@ -215,23 +295,105 @@ priv struct Conversation {
   // Where the durable transcript stands relative to the store; see
   // `TranscriptSync`.
   sync : TranscriptSync
-  // Display-only items the durable record has not committed yet: the
-  // just-sent prompt, a step's settled text, tool cards, steer echoes, and
-  // client-local notices (a rejected start, a dropped steer). Rendered after
-  // `messages`; each durable commit retires its overlay twin (matched by
-  // kind FIFO — worst case a twin lingers until the next same-kind commit or
-  // reload, a purely cosmetic miss). Copy-on-write.
-  overlay : Array[@transcript.TranscriptItem]
+  // Client-local transcript notices with no durable counterpart (a rejected
+  // start, a dropped steer, a repeatedly failed transcript refresh). Each is
+  // anchored to a durable chronology boundary, so later turns render after it
+  // rather than pushing an old notice to the transcript tail. A run-end steer
+  // failure follows the current tail only until the durable terminal boundary
+  // arrives; some delivery failures are provisional and a later exact-id
+  // receipt can retract them. Copy-on-write.
+  overlay : Array[LocalNotice]
+}
+
+///|
+/// How a local notice may be reconciled by a later canonical User. Start RPC
+/// and steer delivery failures are indeterminate: the host may have accepted
+/// the submission before its response path failed. Only the exact id-bearing
+/// receipt may retract one; transcript text is deliberately not ownership.
+priv enum NoticeReconciliation {
+  Retained
+  Submission(String)
+  RunDiagnostic(String)
+}
+
+///|
+/// Where a client-local notice sits in the durable chronology. `TerminalTail`
+/// waits for a run whose semantic finish guarantees a durable Terminal.
+/// Once another run starts, only a causal full snapshot may locate that old
+/// terminal: its commit may already have passed before the notice existed, so
+/// a later live terminal could belong to the successor. `SnapshotCut` waits
+/// for a full read started after the uncertain lifecycle transition, then
+/// fixes the notice at that read's display boundary without claiming any item
+/// inside it. Bare `UncertainTail` has neither a terminal nor a scheduled cut
+/// and therefore never claims an anonymous durable event. `DurableTail` names
+/// an exact final sequence learned from the host's EOF scan.
+priv enum NoticeAnchor {
+  AfterMessages(Int)
+  TerminalTail(Int?)
+  PriorTerminalTail(floor~ : Int, snapshot_generation~ : Int)
+  SnapshotCut(snapshot_generation~ : Int)
+  UncertainTail
+  DurableTail(Int)
+}
+
+///|
+priv enum InputKind {
+  InitialPrompt
+  SteerInput
+}
+
+///|
+priv enum InputState {
+  Awaiting
+  Unconfirmed
+}
+
+///|
+/// One locally submitted input awaiting an id-bearing host receipt. The
+/// globally unique `submission_id` is the only ownership proof: canonical
+/// transcript text and legacy receipts without an id never settle this entry.
+/// The original draft shape is retained so a definitive refusal can restore
+/// it to the composer without exposing the serialized mention envelope.
+priv struct PendingInput {
+  submission_id : String
+  kind : InputKind
+  // The run this input belongs to once Started or the start response supplies
+  // it. Initial prompts begin as `None`; retaining their draft until a normal
+  // durable finish (not merely an stdin-write response) prevents pre-append
+  // engine failures from losing the user's text.
+  run_id : String?
+  content : String
+  draft : String
+  mentions : Array[Mention]
+  state : InputState
+}
+
+///|
+/// One non-durable transcript notice at a durable chronology boundary.
+priv struct LocalNotice {
+  kind : @transcript.ItemKind
+  content : String
+  anchor : NoticeAnchor
+  reconciliation : NoticeReconciliation
 }
 
 ///|
 /// Whether the conversation's durable transcript is up to date with the
-/// store, or a re-read is in flight. Commits that arrive mid-reload are
-/// buffered — the snapshot they follow may or may not contain them, and the
-/// watermark decides once it lands.
+/// store, a generation-tagged re-read is in flight, or a bounded retry round
+/// has stopped. Commits stay buffered across every failure. A later commit,
+/// reconnect, or explicit open starts a fresh generation from `ReloadFailed`.
 priv enum TranscriptSync {
   Synced
-  Reloading(buffered~ : Array[BufferedCommit])
+  Reloading(
+    generation~ : Int,
+    attempt~ : Int,
+    buffered~ : Array[BufferedCommit],
+    // A durable boundary arrived after this request started. Keep the read
+    // single-flight, then run one more generation so an older in-flight
+    // snapshot cannot become the final view of that boundary.
+    reload_after_current~ : Bool
+  )
+  ReloadFailed(generation~ : Int, buffered~ : Array[BufferedCommit])
 }
 
 ///|
@@ -348,6 +510,16 @@ priv enum BridgeState {
 }
 
 ///|
+/// The latest identity-bearing archive fact this connection observed for one
+/// session. Whole-list replies do not carry a revision and can predate that
+/// notification, so they are reconciled through this override until the next
+/// connection boundary starts a fresh authoritative list round.
+priv struct ArchiveOverride {
+  session : String
+  archived : Bool
+}
+
+///|
 priv struct Model {
   // Whether the host bridge is up; see `BridgeState`.
   bridge : BridgeState
@@ -366,10 +538,15 @@ priv struct Model {
   api_provider : ApiProvider
   custom_api_url : String
   // Host-settings writes still in flight. While any are, incoming
-  // `settings.changed` broadcasts and `settings.get` replies are stale by
-  // construction (they may predate the pending write) and are dropped; the
-  // last write's own reply reconciles the mirror.
+  // `settings.changed` broadcasts and `settings.get` replies may predate an
+  // optimistic edit, so the newest revision is deferred until the last write
+  // settles instead of clobbering the form mid-edit.
   settings_saves : Int
+  // Host-local monotonic revision attached to every settings status. It
+  // orders concurrent clients' broadcasts and RPC replies; -1 means this
+  // bridge generation has not accepted an authoritative status yet.
+  host_settings_revision : Int
+  deferred_host_settings : HostSettings?
   // A legacy localStorage migration's push is in flight; its success is
   // what deletes the migrated secrets from localStorage.
   legacy_cleanup_pending : Bool
@@ -378,8 +555,8 @@ priv struct Model {
   // the page may run on any device while the engine runs on the host) gates
   // both the settings section and what `start` sends. `wsl_distro` empty
   // means the user's default distro; `wsl_engine` empty means `openseek` on
-  // the distro's PATH. The three settings persist to localStorage as they
-  // change.
+  // the distro's PATH. The host settings store persists all three and shares
+  // them with every attached client.
   host_wsl : Bool
   // Whether this page is the desktop window (the proton webview) rather than
   // a browser reached through a relay. Probed once at startup. Gates the
@@ -413,6 +590,26 @@ priv struct Model {
   // Durable session currently being fetched from the host, if any. Sidebar
   // selections can race; only the latest request may activate a stored session.
   loading_session : String
+  // Last token allocated to a transcript snapshot request in this app run.
+  // This lives above individual conversations so pruning, archive removal,
+  // and reopening cannot reuse a token that an older host reply still carries.
+  transcript_request_generation : Int
+  // Incremented at every BridgeReady. Session-list replies carry the value
+  // captured when their request was issued, so a reply from a dead connection
+  // cannot overwrite the lists rebuilt after reconnect.
+  connection_generation : Int
+  // Page-lifetime request tokens for the independently fetched sidebar
+  // collections. Connection generation rejects dead sockets; these reject an
+  // older reply from the same connection after a newer request was issued.
+  sessions_request_generation : Int
+  archived_request_generation : Int
+  workspaces_request_generation : Int
+  // A page-lifetime namespace plus monotonic counter allocate globally unique
+  // submission ids without making `update` read randomness. Different windows
+  // get independent timestamp/random namespaces; replaying the same model is
+  // deterministic.
+  submission_namespace : String
+  submission_sequence : Int
   // Every conversation with live client state this app run: the active one,
   // those still running in the background, and those visited and kept for an
   // instant switch back. Copy-on-write, like the transcript arrays.
@@ -426,6 +623,10 @@ priv struct Model {
   // "Archived" group with an unarchive control. Reported by the host in the
   // same entry shape as the live list.
   archived : Array[@transcript.SessionListItem]
+  // Per-session archive facts newer than an unversioned whole-list reply.
+  // Cleared only at BridgeReady, immediately before fresh live and archived
+  // lists are requested for the new connection.
+  archive_overrides : Array[ArchiveOverride]
   // Project directories attached as workspaces: the host registry's absolute
   // paths in registration order. The sidebar shows one section per entry.
   workspaces : Array[String]
@@ -544,6 +745,7 @@ priv enum LauncherApps {
 /// broadcast), decoded: the host's engine endpoint settings, with key
 /// material reduced to presence.
 priv struct HostSettings {
+  revision : Int
   provider : String
   custom_api_url : String
   has_deepseek_key : Bool
@@ -573,11 +775,19 @@ priv enum Msg {
   // The host's settings, from a `settings.get` reply or a peer client's
   // edit broadcast as `settings.changed`. Applied only while no local write
   // is in flight — see `Model::settings_saves`.
-  HostSettingsLoaded(HostSettings)
+  HostSettingsLoaded(HostSettings, connection_generation~ : Int?)
   // A `settings.set` this client sent came back with the post-write state.
-  HostSettingsApplied(HostSettings)
+  HostSettingsApplied(
+    HostSettings,
+    connection_generation~ : Int,
+    cleans_legacy~ : Bool
+  )
   // A `settings.set` this client sent failed; the message pops as a toast.
-  HostSettingsSaveFailed(String)
+  HostSettingsSaveFailed(
+    String,
+    connection_generation~ : Int,
+    cleans_legacy~ : Bool
+  )
   // The legacy localStorage engine settings, read at bridge time. The
   // desktop window migrates them up to the host once; a browser page only
   // purges them (a stale secret in shared storage is the leak this design
@@ -687,19 +897,35 @@ priv enum Msg {
   // installed list instead).
   SkillActionDone(key~ : String, error~ : String)
   Send
-  // The host reported a steer that never reached the engine (turn already
-  // closed, engine dead, or the bridge call itself failed): carries the
-  // session and original text so the right conversation's pending
-  // acknowledgment can settle.
-  SteerUndelivered(session~ : String, text~ : String)
+  // The steer RPC failed before its outcome was known. The host may already
+  // have accepted it, so its notice/ledger entry stays provisional.
+  SteerUndelivered(
+    session~ : String,
+    submission_id~ : String,
+    text~ : String,
+    run_id~ : String
+  )
+  // The host definitively returned `steered:false`; no canonical User can
+  // follow, so both pending UI and its ledger entry retire immediately.
+  SteerRejected(
+    session~ : String,
+    submission_id~ : String,
+    text~ : String,
+    run_id~ : String
+  )
   Stop
   NewChat
   SessionRotated(String)
-  SessionsLoaded(Array[@transcript.SessionListItem])
+  SessionsLoaded(
+    Array[@transcript.SessionListItem],
+    connection_generation~ : Int,
+    request_generation~ : Int
+  )
   SessionsFailed(String)
-  // The host's `session.changed` broadcast: another client archived or
-  // unarchived a conversation, so both sidebar lists must be re-read.
-  SessionsChanged
+  // The host's identity-bearing `session.changed` broadcast. Archive changes
+  // invalidate that exact live target immediately; both sidebar lists are
+  // then re-read for their durable contents.
+  SessionsChanged(change~ : String, session~ : String, fresh_session~ : String?)
   OpenSession(String)
   // The user clicked the system notification a finished run posted: jump to
   // the conversation that owned that run (the window itself is already
@@ -708,28 +934,29 @@ priv enum Msg {
   SessionLoaded(
     session~ : String,
     items~ : Array[@transcript.TranscriptItem],
-    watermark~ : Int
+    watermark~ : Int,
+    event_boundaries~ : Array[(Int, Bool, Int)],
+    generation~ : Int
   )
-  // Loading a stored session failed before its conversation ever existed
-  // (bridge call errored, or the data was malformed): pops an error toast
-  // rather than poisoning the conversation on screen. `session` says which
-  // request failed, so a load abandoned by a newer selection is dropped.
-  SessionLoadFailed(session~ : String, message~ : String)
+  // A foreground stored-session read failed. Generation guards stale replies;
+  // bounded retries keep the selection pending before final failure is shown.
+  SessionLoadFailed(session~ : String, message~ : String, generation~ : Int)
   // A background re-read of a conversation's durable record (a commit-gap
   // resync, or a reload for a foreign run): same data as `SessionLoaded`,
   // but it never activates the conversation or steals the screen.
   SessionRefreshed(
     session~ : String,
     items~ : Array[@transcript.TranscriptItem],
-    watermark~ : Int
+    watermark~ : Int,
+    event_boundaries~ : Array[(Int, Bool, Int)],
+    generation~ : Int
   )
-  // A background re-read failed. The conversation drops back to `Synced`
-  // (with its buffered commits discarded) — the next commit's gap check
-  // retries the reload, so a transient read failure heals itself.
-  SessionRefreshFailed(session~ : String)
+  // A background re-read failed. The generation identifies the exact read,
+  // so an old failure cannot stop a newer one.
+  SessionRefreshFailed(session~ : String, generation~ : Int)
   // The host's `session.event` broadcast: one durably committed store event.
   // Together with `session.load` snapshots these are the transcript's only
-  // durable sources; the live `agent.event` stream is display overlay.
+  // durable sources; the live `agent.event` stream is lifecycle/stream state.
   SessionCommitted(
     session~ : String,
     sequence~ : Int,
@@ -739,9 +966,17 @@ priv enum Msg {
   // A host-side action with no conversation of its own (opening a file in
   // the system app, launching an app) failed: pops an error toast.
   HostActionFailed(String)
-  // The registered workspaces — the reply to `list_workspaces` and to a
-  // successful add/remove alike.
-  WorkspacesLoaded(Array[String])
+  // The registered workspaces — the reply to `workspace.list`. Both
+  // generations are required: reconnect rejects a dead socket, while request
+  // generation rejects an older reply from the current connection.
+  WorkspacesLoaded(
+    Array[String],
+    connection_generation~ : Int,
+    request_generation~ : Int
+  )
+  // The host's canonical post-commit registry broadcast. Every client adopts
+  // the same list in durable write order and invalidates older list replies.
+  WorkspacesChanged(Array[String])
   // Open the in-app folder picker (browsing starts at the host's home
   // directory). The picker renders host-side listings, so it works the
   // same against the embedded gateway and a remote one.
@@ -778,7 +1013,12 @@ priv enum Msg {
   UnarchiveSession(String)
   // The archived conversations — the reply to `archived_sessions` and to a
   // successful `archive_session`/`unarchive_session` alike.
-  ArchivedLoaded(Array[@transcript.SessionListItem])
+  ArchivedLoaded(
+    Array[@transcript.SessionListItem],
+    connection_generation~ : Int,
+    request_generation~ : Int,
+    fresh_session~ : String
+  )
   ArchiveFailed(String)
   // The transcript's at-bottom state changed (the user scrolled away from,
   // or back to, the tail). Reported by the DOM scroll watcher.
@@ -814,13 +1054,25 @@ priv enum Msg {
     model~ : String,
     max_steps~ : Int,
     cwd~ : @pathx.Absolute?,
-    task~ : String?
+    task~ : String?,
+    submission_id~ : String?
+  )
+  // One complete `agent.runs` reply. Replayed starts and the negative-set
+  // frontier must be accepted or rejected together at one connection
+  // generation; dispatching its rows separately would let a stale reply
+  // resurrect a run after a later BridgeReady already resynced it away.
+  RunsLoaded(
+    runs~ : Array[RecoveredRun],
+    settled~ : Array[RecoveredSettlement],
+    live~ : Array[String],
+    frontier~ : Array[RunSnapshotFrontier],
+    connection_generation~ : Int
   )
   // The complete in-flight run set, from an `agent.runs` resync. Any
   // conversation still showing an open run this set lacks ended while the
   // client was away — its terminal event is gone for good (reconnect =
   // resync; transients are not replayed), so this is what closes it.
-  RunsSettled(live~ : Array[String])
+  RunsSettled(live~ : Array[String], frontier~ : Array[RunSnapshotFrontier])
   // A stream event from an engine. The run id is `None` for events emitted
   // before any run of the engine process's lifetime. `session` is the
   // conversation the host stamped on it (`None` when the payload carries no
@@ -834,20 +1086,52 @@ priv enum Msg {
   // comment becomes a chip on the composer draft, which only the app model
   // knows about.
   FileEditor(@fileeditor.Msg)
-  // The start request for that conversation never produced a run (the bridge
-  // call failed or the host refused it).
-  Failed(session~ : String, message~ : String)
+  // The exact local start request returned its run result. `accepted` is the
+  // prompt's ownership receipt and can recover a Started notification lost on
+  // the same connection; any other status leaves delivery unconfirmed.
+  StartResponded(
+    session~ : String,
+    submission_id~ : String,
+    run_id~ : String,
+    status~ : String,
+    exit_code~ : Int
+  )
+  // The response path failed before host acceptance was knowable. Keep an
+  // exact-id unconfirmed entry; canonical transcript text cannot settle it.
+  StartUndelivered(
+    session~ : String,
+    submission_id~ : String,
+    message~ : String
+  )
+  // The host definitively refused this exact request. Restore its draft and
+  // retire the ledger entry immediately.
+  StartRejected(session~ : String, submission_id~ : String, message~ : String)
   // A host error without a run (`run_id` is `None` — a pre-run failure)
   // belongs to whatever conversation the user is looking at; `diagnostics`
-  // is stderr worth appending, when the host captured any.
-  Error(run_id~ : String?, message~ : String, diagnostics~ : String?)
+  // is stderr worth appending, when the host captured any. With a run,
+  // `exit_code` distinguishes a local process-exit diagnostic from semantic
+  // agent failures that already have a durable terminal commit.
+  Error(
+    run_id~ : String?,
+    message~ : String,
+    diagnostics~ : String?,
+    exit_code~ : Int?
+  )
   // The `compact` bridge request itself was rejected (no engine, host error):
   // nothing will report compaction events, so the conversation's queued /
   // in-flight compaction notice must be cleared here, not by the stream.
   CompactRejected(session~ : String, message~ : String)
   // `answer` accompanies normal success and context yield (where it is
   // continuation guidance); other terminal statuses carry none.
-  Finished(run_id~ : String, status~ : String, answer~ : String?)
+  Finished(
+    run_id~ : String,
+    status~ : String,
+    answer~ : String?,
+    durable_sequence~ : Int?
+  )
+  // A failed command's process reached EOF after lifecycle was already
+  // settled. This is only the exact durable boundary, never a second finish.
+  DurableBoundary(run_id~ : String, session~ : String, sequence~ : Int)
 }
 
 ///|
@@ -886,6 +1170,9 @@ fn empty_conversation(
     mentions: [],
     run: NoRun(ended=None),
     last_run_id: None,
+    last_terminal_sequence: 0,
+    run_durable_floor: None,
+    run_floor_generation: None,
     compaction: NotCompacting,
     unseen_finish: false,
     usage_tokens: 0,
@@ -894,7 +1181,7 @@ fn empty_conversation(
     watcher_status: "",
     streaming_response: "",
     streaming_reasoning: "",
-    pending_steers: [],
+    input_ledger: [],
     messages: [],
     watermark: 0,
     sync: Synced,
@@ -914,6 +1201,8 @@ fn initial_model() -> Model {
     api_provider: Openseek,
     custom_api_url: "",
     settings_saves: 0,
+    host_settings_revision: -1,
+    deferred_host_settings: None,
     legacy_cleanup_pending: false,
     host_wsl: false,
     is_desktop: @interop.using_proton_bridge(),
@@ -926,9 +1215,17 @@ fn initial_model() -> Model {
     workspaces_collapsed: false,
     active_session: "",
     loading_session: "",
+    transcript_request_generation: 0,
+    connection_generation: 0,
+    sessions_request_generation: 0,
+    archived_request_generation: 0,
+    workspaces_request_generation: 0,
+    submission_namespace: generated_session_id() + "-submission",
+    submission_sequence: 0,
     conversations: [],
     sessions: [],
     archived: [],
+    archive_overrides: [],
     workspaces: [],
     active_workspace: "",
     workspace_picker: None,
@@ -973,6 +1270,8 @@ fn Model::skill_installed(self : Model, source : String) -> Bool {
 fn Model::apply_host_settings(self : Model, settings : HostSettings) -> Model {
   let next = {
     ..self,
+    host_settings_revision: settings.revision,
+    deferred_host_settings: None,
     api_provider: ApiProvider::parse(settings.provider),
     custom_api_url: settings.custom_api_url,
     deepseek_key_saved: settings.has_deepseek_key,
@@ -982,6 +1281,33 @@ fn Model::apply_host_settings(self : Model, settings : HostSettings) -> Model {
     wsl_engine: settings.wsl_engine,
   }
   { ..next, screen: if next.api_ready() { next.screen } else { Settings } }
+}
+
+///|
+/// Retain the highest host revision observed while one or more optimistic
+/// writes are outstanding. The body is applied only when the last write
+/// settles, preventing both stale rollback and mid-edit UI clobbering.
+fn Model::defer_host_settings(self : Model, settings : HostSettings) -> Model {
+  if settings.revision < self.host_settings_revision {
+    return self
+  }
+  let deferred = match self.deferred_host_settings {
+    Some(current) if current.revision > settings.revision => current
+    _ => settings
+  }
+  { ..self, deferred_host_settings: Some(deferred) }
+}
+
+///|
+/// Apply the newest deferred status once optimistic writes no longer protect
+/// the form. A lower revision is discarded; equal is deliberately accepted
+/// so a failed optimistic edit can be restored by an authoritative `get`.
+fn Model::flush_host_settings(self : Model) -> Model {
+  match self.deferred_host_settings {
+    Some(settings) if settings.revision >= self.host_settings_revision =>
+      self.apply_host_settings(settings)
+    _ => { ..self, deferred_host_settings: None }
+  }
 }
 
 ///|
@@ -1025,7 +1351,7 @@ fn Model::display_status(self : Model) -> Status {
         NoRun(ended=Some(RunFailed)) => Failed
         NoRun(ended=Some(RunErrored)) => Errored
         NoRun(ended=Some(RunFinished(outcome))) => Finished(outcome)
-        Starting => Starting
+        Starting(..) => Starting
         Open(stage=Opened, ..) => Running
         Open(stage=AtStep(step), ..) => Step(step)
         Open(stage=Cancelling, ..) => Cancelling
@@ -1038,6 +1364,118 @@ fn Model::find_conversation(self : Model, session_id : String) -> Conversation? 
   for conv in self.conversations {
     if conv.session_id == session_id {
       return Some(conv)
+    }
+  }
+  None
+}
+
+///|
+/// Capture the exact lifecycle identity of every session currently known to
+/// this page. Absence is meaningful too: a snapshot may introduce an unknown
+/// session only if no live notification materialized it before the reply.
+fn Model::run_snapshot_frontier(self : Model) -> Array[RunSnapshotFrontier] {
+  self.conversations.map(conv => {
+    let state = match conv.run {
+      NoRun(..) => SnapshotIdle(last_run_id=conv.last_run_id)
+      Starting(submission_id~) => SnapshotStarting(submission_id~)
+      Open(run_id~, ..) => SnapshotOpen(run_id~)
+    }
+    let initial_ids : Array[String] = []
+    for input in conv.input_ledger {
+      if input.kind is InitialPrompt && input.run_id is None {
+        initial_ids.push(input.submission_id)
+      }
+    }
+    let steer_ids : Array[String] = []
+    let steer_owner = match state {
+      SnapshotOpen(run_id~) => Some(run_id)
+      SnapshotIdle(last_run_id=Some(run_id)) => Some(run_id)
+      _ => None
+    }
+    if steer_owner is Some(run_id) {
+      for input in conv.input_ledger {
+        if input.kind is SteerInput &&
+          input.run_id is Some(owner) &&
+          owner == run_id {
+          steer_ids.push(input.submission_id)
+        }
+      }
+    }
+    { session: conv.session_id, state, initial_ids, steer_ids }
+  })
+}
+
+///|
+/// Whether `session` still has exactly the lifecycle state captured when a
+/// runs snapshot began. This is the acceptance gate for each positive row.
+/// If the session was absent from the frontier, it must still be absent now.
+fn Model::matches_run_snapshot_frontier(
+  self : Model,
+  frontier : Array[RunSnapshotFrontier],
+  session : String,
+) -> Bool {
+  for captured in frontier {
+    if captured.session == session {
+      guard self.find_conversation(session) is Some(conv) else { return false }
+      return match captured.state {
+        SnapshotIdle(last_run_id~) =>
+          conv.run is NoRun(..) && conv.last_run_id == last_run_id
+        SnapshotStarting(submission_id~) =>
+          conv.run is Starting(submission_id=current) &&
+          current == submission_id
+        SnapshotOpen(run_id~) =>
+          conv.run is Open(run_id=current, ..) && current == run_id
+      }
+    }
+  }
+  self.find_conversation(session) is None
+}
+
+///|
+/// Match a replayed completion to the exact lifecycle owner captured when
+/// `agent.runs` began. Starting has no run id yet, so it uses the client's
+/// submission id; Open/Idle use the host run id. The session is required in
+/// every case, and current state must still equal the captured cut.
+fn Model::matched_settlement_frontier(
+  self : Model,
+  frontier : Array[RunSnapshotFrontier],
+  settlement : RecoveredSettlement,
+) -> SettlementFrontierMatch? {
+  guard self.find_conversation(settlement.session) is Some(conv) else {
+    return None
+  }
+  for captured in frontier {
+    if captured.session == settlement.session {
+      return match captured.state {
+        SnapshotStarting(submission_id~) if conv.run
+          is Starting(submission_id=current) &&
+          current == submission_id &&
+          settlement.submission_id is Some(recovered) &&
+          recovered == submission_id =>
+          Some(SettlementBySubmission(submission_id))
+        SnapshotOpen(run_id~) if conv.run is Open(run_id=current, ..) &&
+          current == run_id &&
+          settlement.run_id == run_id => Some(SettlementByRun)
+        SnapshotIdle(last_run_id=Some(run_id)) if conv.run is NoRun(..) &&
+          conv.last_run_id is Some(current) &&
+          current == run_id &&
+          settlement.run_id == run_id => Some(SettlementByRun)
+        _ =>
+          if conv.run is NoRun(..) &&
+            settlement.submission_id is Some(submission_id) &&
+            captured.initial_ids.contains(submission_id) &&
+            conv.input_ledger
+            .iter()
+            .any(input => {
+              input.kind is InitialPrompt &&
+              input.submission_id == submission_id &&
+              input.run_id is None
+            }) {
+            Some(SettlementBySubmission(submission_id))
+          } else {
+            None
+          }
+      }
     }
   }
   None
@@ -1057,6 +1495,48 @@ fn Model::session_workspace(self : Model, session_id : String) -> String {
     Some(conv) => workspace_token(conv.workspace)
     None => ""
   }
+}
+
+///|
+/// The newest archive disposition this connection observed for `session`, if
+/// any. `true` means archived and `false` means live.
+fn Model::archive_override(self : Model, session : String) -> Bool? {
+  for fact in self.archive_overrides {
+    if fact.session == session {
+      return Some(fact.archived)
+    }
+  }
+  None
+}
+
+///|
+/// Record one archive notification as the sole current override for its
+/// session. This copy-on-write replacement is what lets every later list or
+/// commit handler consult the same monotonic fact.
+fn Model::with_archive_override(
+  self : Model,
+  session : String,
+  archived : Bool,
+) -> Model {
+  let overrides = self.archive_overrides.filter(item => item.session != session)
+  overrides.push({ session, archived })
+  { ..self, archive_overrides: overrides }
+}
+
+///|
+/// Whether re-reading this conversation can address a durable record. Local
+/// overlays and a failed pre-persistence start do not prove one exists; using
+/// them as a reload gate would turn every reconnect/reselect into three noisy
+/// `session.load` failures for an unsaved chat.
+fn Model::can_reload_transcript(self : Model, conv : Conversation) -> Bool {
+  if conv.watermark > 0 ||
+    !conv.messages.is_empty() ||
+    conv.sync is ReloadFailed(..) ||
+    conv.has_recovering_initial() ||
+    conv.overlay.iter().any(notice => notice.anchor is SnapshotCut(..)) {
+    return true
+  }
+  self.sessions.iter().any(item => item.id == conv.session_id)
 }
 
 ///|
@@ -1133,10 +1613,33 @@ fn Model::conversation_by_last_run(
 }
 
 ///|
+/// The conversation holding an exact id-bearing steer receipt. A receipt may
+/// trail its run's Finished event and even the next run's Started event, so
+/// current/last run ownership alone is not enough to route it.
+fn Model::conversation_by_pending_steer(
+  self : Model,
+  submission_id : String,
+  run_id : String,
+) -> Conversation? {
+  for conv in self.conversations {
+    for input in conv.input_ledger {
+      if input.kind is SteerInput &&
+        input.submission_id == submission_id &&
+        input.run_id is Some(owner) &&
+        owner == run_id {
+        return Some(conv)
+      }
+    }
+  }
+  None
+}
+
+///|
 /// Make `session_id` the on-screen conversation, creating its entry when it
-/// has none, and drop conversations with nothing worth keeping — not
-/// running, no transcript, no draft. Abandoned "New chat" husks die here
-/// instead of accumulating invisible entries.
+/// has none, and drop conversations with nothing worth keeping. Exact input
+/// ownership is retained even after lifecycle recovery closes a run: a late
+/// id-bearing receipt or rejection may still retract a warning or restore its
+/// draft. Abandoned "New chat" husks die here instead of accumulating.
 fn Model::activate(self : Model, session_id : String) -> Model {
   let conversations : Array[Conversation] = []
   let mut found = false
@@ -1145,10 +1648,7 @@ fn Model::activate(self : Model, session_id : String) -> Model {
       found = true
       // Opening the conversation is what "seen" means.
       conversations.push({ ..conv, unseen_finish: false })
-    } else if conv.is_running() ||
-      conv.messages.length() > 0 ||
-      conv.overlay.length() > 0 ||
-      !conv.draft_empty() {
+    } else if conv.has_begun() || !conv.draft_empty() {
       conversations.push(conv)
     }
   }
@@ -1176,11 +1676,15 @@ fn Conversation::draft_sendable(self : Conversation) -> Bool {
 }
 
 ///|
-/// Whether the conversation has actually gotten under way — a run in flight,
-/// or transcript items from one. A fresh "New chat" (even with a typed
-/// draft) has not, and stays out of the sidebar until its first send.
+/// Whether the conversation has actually gotten under way — a run, durable
+/// transcript, local notice, or exact submission ownership. A fresh "New
+/// chat" (even with a typed draft) has not, and stays out of the sidebar until
+/// its first send.
 fn Conversation::has_begun(self : Conversation) -> Bool {
-  self.is_running() || self.messages.length() > 0 || self.overlay.length() > 0
+  self.is_running() ||
+  self.messages.length() > 0 ||
+  self.overlay.length() > 0 ||
+  !self.input_ledger.is_empty()
 }
 
 ///|
@@ -1196,111 +1700,1260 @@ fn Conversation::clear_streams(self : Conversation) -> Conversation {
 }
 
 ///|
-/// Append a display-only item after the durable transcript: everything the
-/// live stream reports lands here first and joins `messages` only when its
-/// durable commit arrives (which retires the overlay twin). Client-local
-/// notices with no durable counterpart also live here — they last until the
-/// next reload, exactly as long as they used to.
-fn Conversation::append_overlay(
+/// Append one client-local notice at the current durable chronology boundary.
+fn Conversation::append_notice(
   self : Conversation,
   kind : @transcript.ItemKind,
   content : String,
+  reconciliation : NoticeReconciliation,
 ) -> Conversation {
   let overlay = self.overlay.copy()
-  overlay.push({ kind, content })
+  overlay.push({
+    kind,
+    content,
+    anchor: AfterMessages(self.messages.length()),
+    reconciliation,
+  })
   { ..self, overlay, }
 }
 
 ///|
-/// What the transcript shows: the durable items, then the not-yet-committed
-/// overlay.
+/// Choose the only safe chronology proof for a run-finish notice. A
+/// terminal-backed finish waits for the post-Finished snapshot generation;
+/// every other status remains anonymous until the host supplies an exact
+/// durable boundary.
+fn Conversation::run_tail_notice_anchor(
+  self : Conversation,
+  terminal_expected? : Bool = true,
+  terminal_snapshot_generation? : Int,
+) -> NoticeAnchor {
+  if terminal_expected {
+    match (self.run_durable_floor, terminal_snapshot_generation) {
+      (Some(floor), Some(snapshot_generation)) =>
+        PriorTerminalTail(floor~, snapshot_generation~)
+      (None, Some(snapshot_generation)) => SnapshotCut(snapshot_generation~)
+      _ => TerminalTail(self.run_durable_floor)
+    }
+  } else {
+    match terminal_snapshot_generation {
+      Some(snapshot_generation) => SnapshotCut(snapshot_generation~)
+      None => UncertainTail
+    }
+  }
+}
+
+///|
+/// Append a provisional submission notice that follows this run's durable
+/// tail until its terminal boundary commits.
+fn Conversation::append_run_tail_notice(
+  self : Conversation,
+  kind : @transcript.ItemKind,
+  content : String,
+  reconciliation : NoticeReconciliation,
+  terminal_expected? : Bool = true,
+  terminal_snapshot_generation? : Int,
+) -> Conversation {
+  let overlay = self.overlay.copy()
+  let anchor = self.run_tail_notice_anchor(
+    terminal_expected~,
+    terminal_snapshot_generation?,
+  )
+  overlay.push({ kind, content, anchor, reconciliation })
+  { ..self, overlay, }
+}
+
+///|
+/// Append a retained local notice. Live semantic events with durable twins
+/// never pass through here on their way to a commit.
+fn Conversation::append_local_notice(
+  self : Conversation,
+  kind : @transcript.ItemKind,
+  content : String,
+) -> Conversation {
+  self.append_notice(kind, content, Retained)
+}
+
+///|
+/// A host process diagnostic is local-only, but its display position belongs
+/// after that process's durable EOF frontier. Keep the run id as reconciliation
+/// identity so Finished/agent.durable can place it even while transcript
+/// commits are buffered behind a snapshot.
+fn Conversation::append_run_diagnostic(
+  self : Conversation,
+  run_id : String,
+  content : String,
+) -> Conversation {
+  self.append_run_tail_notice(
+    Assistant(true),
+    content,
+    RunDiagnostic(run_id),
+    terminal_expected=false,
+  )
+}
+
+///|
+fn Model::allocate_submission_id(self : Model) -> (Model, String) {
+  let sequence = self.submission_sequence + 1
+  (
+    { ..self, submission_sequence: sequence },
+    self.submission_namespace + "-" + sequence.to_string(),
+  )
+}
+
+///|
+fn Conversation::enqueue_input(
+  self : Conversation,
+  kind : InputKind,
+  submission_id : String,
+  run_id : String?,
+  content : String,
+  draft : String,
+  mentions : Array[Mention],
+) -> Conversation {
+  let input_ledger = self.input_ledger.copy()
+  input_ledger.push({
+    submission_id,
+    kind,
+    run_id,
+    content,
+    draft,
+    mentions: mentions.copy(),
+    state: Awaiting,
+  })
+  { ..self, input_ledger, }
+}
+
+///|
+/// Pending steer UI is a projection of the ownership ledger, never a second
+/// text queue. An unconfirmed steer leaves this panel and instead gets a
+/// truthful transcript notice until an id-bearing receipt settles it.
+fn Conversation::pending_steers(self : Conversation) -> Array[String] {
+  let pending : Array[String] = []
+  for input in self.input_ledger {
+    if input.kind is SteerInput && input.state is Awaiting {
+      pending.push(input.content)
+    }
+  }
+  pending
+}
+
+///|
+fn Conversation::has_recovering_initial(self : Conversation) -> Bool {
+  self.input_ledger
+  .iter()
+  .any(input => input.kind is InitialPrompt && input.state is Unconfirmed)
+}
+
+///|
+fn Conversation::has_initial_submission(
+  self : Conversation,
+  submission_id : String,
+) -> Bool {
+  self.input_ledger
+  .iter()
+  .any(input => {
+    input.kind is InitialPrompt && input.submission_id == submission_id
+  })
+}
+
+///|
+fn Conversation::has_notice_for_input(self : Conversation, id : String) -> Bool {
+  self.overlay
+  .iter()
+  .any(notice => notice.reconciliation is Submission(existing) && existing == id)
+}
+
+///|
+/// Move one exact submission notice to the abnormal process exit's durable
+/// frontier. An already-applied frontier has a known display boundary now;
+/// an in-flight one stays sequence-addressed until its buffer/snapshot lands.
+fn Conversation::anchor_submission_notice_at_durable_frontier(
+  self : Conversation,
+  submission_id : String,
+  frontier : Int,
+) -> Conversation {
+  let anchor = if frontier == self.watermark {
+    AfterMessages(self.messages.length())
+  } else {
+    DurableTail(frontier)
+  }
+  let overlay = self.overlay.map(notice => {
+    match notice.reconciliation {
+      Submission(id) if id == submission_id => { ..notice, anchor, }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// Move one exact submission warning to a causal snapshot observation cut.
+/// This is used when no terminal/EOF sequence is available; it never claims
+/// that an anonymous item in the snapshot belongs to the submission.
+fn Conversation::anchor_submission_notice_at_snapshot_cut(
+  self : Conversation,
+  submission_id : String,
+  snapshot_generation : Int,
+) -> Conversation {
+  let overlay = self.overlay.map(notice => {
+    match (notice.anchor, notice.reconciliation) {
+      (AfterMessages(_), Submission(id)) | (UncertainTail, Submission(id)) if id ==
+        submission_id => { ..notice, anchor: SnapshotCut(snapshot_generation~) }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// A failed command may emit lifecycle Finished before its process can be
+/// reaped. When EOF later supplies the final sequence, move the already-
+/// unconfirmed steer notices for that exact run onto the proven boundary.
+fn Conversation::anchor_unconfirmed_steers_at_durable_frontier(
+  self : Conversation,
+  run_id : String,
+  frontier : Int,
+) -> Conversation {
+  let mut next = self
+  for input in self.input_ledger {
+    if input.kind is SteerInput &&
+      input.state is Unconfirmed &&
+      input.run_id is Some(owner) &&
+      owner == run_id {
+      next = next.anchor_submission_notice_at_durable_frontier(
+        input.submission_id,
+        frontier,
+      )
+    }
+  }
+  next
+}
+
+///|
+/// Whether an exact input owned by `run_id` is waiting on a causal snapshot
+/// cut. Runs resync uses this cross-reference instead of treating every local
+/// notice as belonging to the lifecycle row it just settled.
+fn Conversation::has_submission_at_snapshot_cut_for_run(
+  self : Conversation,
+  run_id : String,
+) -> Bool {
+  for input in self.input_ledger {
+    if input.run_id is Some(owner) && owner == run_id {
+      for notice in self.overlay {
+        if notice.anchor is SnapshotCut(..) &&
+          notice.reconciliation is Submission(id) &&
+          id == input.submission_id {
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
+///|
+/// Place a retained process diagnostic at the exact EOF frontier supplied by
+/// Finished/agent.durable. Unlike submission notices, it has no ledger entry
+/// and is never retracted.
+fn Conversation::anchor_run_diagnostics_at_durable_frontier(
+  self : Conversation,
+  run_id : String,
+  frontier : Int,
+) -> Conversation {
+  let anchor = if frontier == self.watermark {
+    AfterMessages(self.messages.length())
+  } else {
+    DurableTail(frontier)
+  }
+  let overlay = self.overlay.map(notice => {
+    match notice.reconciliation {
+      RunDiagnostic(owner) if owner == run_id => { ..notice, anchor, }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// When the exact EOF sequence trails Finished, arm a process diagnostic for
+/// the same causal snapshot rule as other run-tail notices. Duplicate
+/// lifecycle messages cannot rewrite an already exact/frozen placement.
+fn Conversation::anchor_run_diagnostics_at_finish(
+  self : Conversation,
+  run_id : String,
+  terminal_expected : Bool,
+  terminal_snapshot_generation? : Int,
+) -> Conversation {
+  let anchor = self.run_tail_notice_anchor(
+    terminal_expected~,
+    terminal_snapshot_generation?,
+  )
+  let overlay = self.overlay.map(notice => {
+    let replace = notice.anchor is UncertainTail ||
+      (terminal_expected && notice.anchor is SnapshotCut(..))
+    if replace &&
+      notice.reconciliation is RunDiagnostic(owner) &&
+      owner == run_id {
+      { ..notice, anchor, }
+    } else {
+      notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// `agent.runs` may close a run and mark its steers Unconfirmed before that
+/// run's exact Finished notification arrives. Reclassify those existing
+/// uncertain notices by exact owner id so the later lifecycle truth can
+/// upgrade a normal finish to its post-Finished snapshot proof without
+/// touching another run's ledger entries. An abnormal duplicate cannot
+/// downgrade an already-armed snapshot cut; every other anchor is already
+/// stronger or in flight and remains idempotent across duplicate Finished.
+fn Conversation::anchor_unconfirmed_steers_at_run_finish(
+  self : Conversation,
+  run_id : String,
+  terminal_expected : Bool,
+  terminal_snapshot_generation? : Int,
+) -> Conversation {
+  let owned : Array[String] = []
+  for input in self.input_ledger {
+    if input.kind is SteerInput &&
+      input.state is Unconfirmed &&
+      input.run_id is Some(owner) &&
+      owner == run_id {
+      owned.push(input.submission_id)
+    }
+  }
+  if owned.is_empty() {
+    return self
+  }
+  let anchor = self.run_tail_notice_anchor(
+    terminal_expected~,
+    terminal_snapshot_generation?,
+  )
+  let overlay = self.overlay.map(notice => {
+    let replace = notice.anchor is UncertainTail ||
+      (terminal_expected && notice.anchor is SnapshotCut(..))
+    if replace {
+      match notice.reconciliation {
+        Submission(id) if owned.contains(id) => { ..notice, anchor, }
+        _ => notice
+      }
+    } else {
+      notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// Arm only the exact steers captured by one lifecycle frontier. The future
+/// snapshot is an observation fence, not evidence that any anonymous User or
+/// Terminal belongs to this run; exact receipts may still retract the notice.
+fn Conversation::arm_unconfirmed_steers_at_snapshot_cut(
+  self : Conversation,
+  submission_ids : Array[String],
+  owner_run_id : String,
+  snapshot_generation : Int,
+) -> Conversation {
+  let owned : Array[String] = []
+  for input in self.input_ledger {
+    if input.kind is SteerInput &&
+      input.state is Unconfirmed &&
+      input.run_id is Some(owner) &&
+      owner == owner_run_id &&
+      submission_ids.contains(input.submission_id) {
+      owned.push(input.submission_id)
+    }
+  }
+  if owned.is_empty() {
+    return self
+  }
+  let overlay = self.overlay.map(notice => {
+    match (notice.anchor, notice.reconciliation) {
+      (UncertainTail, Submission(id)) if owned.contains(id) =>
+        { ..notice, anchor: SnapshotCut(snapshot_generation~) }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// Mark one exact local submission unconfirmed. Legacy receipts have no id and
+/// therefore never enter here. The linked notice remains retractable by a late
+/// id-bearing receipt, but canonical transcript text cannot claim ownership.
+fn Conversation::mark_submission_unconfirmed(
+  self : Conversation,
+  submission_id : String,
+  content : String,
+  run_tail : Bool,
+  terminal_expected? : Bool = true,
+  terminal_snapshot_generation? : Int,
+) -> (Conversation, Bool) {
+  for index, input in self.input_ledger {
+    if input.submission_id == submission_id && input.state is Awaiting {
+      let input_ledger = self.input_ledger.copy()
+      input_ledger[index] = { ..input, state: Unconfirmed }
+      let next = { ..self, input_ledger, }
+      if next.has_notice_for_input(submission_id) {
+        return (next, true)
+      }
+      let next = if run_tail {
+        next.append_run_tail_notice(
+          Assistant(true),
+          content,
+          Submission(submission_id),
+          terminal_expected~,
+          terminal_snapshot_generation?,
+        )
+      } else {
+        next.append_notice(Assistant(true), content, Submission(submission_id))
+      }
+      return (next, true)
+    }
+  }
+  (self, false)
+}
+
+///|
+/// Remove one exact id-bearing receipt's ledger entry and provisional notice.
+/// `kind` prevents a malformed cross-kind echo from consuming an entry.
+fn PendingInput::matches_receipt(
+  self : PendingInput,
+  submission_id : String,
+  kind : InputKind,
+  run_id : String?,
+) -> Bool {
+  guard self.submission_id == submission_id else { return false }
+  match kind {
+    InitialPrompt => self.kind is InitialPrompt
+    SteerInput =>
+      self.kind is SteerInput &&
+      run_id is Some(run_id) &&
+      self.run_id is Some(owner) &&
+      owner == run_id
+  }
+}
+
+///|
+fn Conversation::acknowledge_submission(
+  self : Conversation,
+  submission_id : String,
+  kind : InputKind,
+  run_id : String?,
+) -> (Conversation, Bool) {
+  for index, input in self.input_ledger {
+    if input.matches_receipt(submission_id, kind, run_id) {
+      let input_ledger = self.input_ledger.copy()
+      let _ = input_ledger.remove(index)
+      let overlay = self.overlay.filter(notice => {
+        !(notice.reconciliation is Submission(id) && id == submission_id)
+      })
+      return ({ ..self, input_ledger, overlay }, true)
+    }
+  }
+  (self, false)
+}
+
+///|
+/// Attach an accepted initial submission to its run without treating the
+/// host's stdin-write response as durable proof. The draft remains recoverable
+/// until the run's canonical commit path proves it reached the store.
+fn Conversation::bind_initial_submission_to_run(
+  self : Conversation,
+  submission_id : String,
+  run_id : String,
+) -> Conversation {
+  let input_ledger = self.input_ledger.copy()
+  for index, input in input_ledger {
+    if input.kind is InitialPrompt && input.submission_id == submission_id {
+      input_ledger[index] = { ..input, run_id: Some(run_id) }
+      return { ..self, input_ledger, }
+    }
+  }
+  self
+}
+
+///|
+/// A normal terminal-backed finish proves this exact run got past its durable
+/// User append. Retire the bound prompt and any provisional transport notice;
+/// transcript content itself is still never used as ownership evidence.
+fn Conversation::acknowledge_initial_for_run(
+  self : Conversation,
+  run_id : String,
+) -> Conversation {
+  let retired : Array[String] = []
+  let input_ledger = self.input_ledger.filter(input => {
+    if input.kind is InitialPrompt &&
+      input.run_id is Some(owner) &&
+      owner == run_id {
+      retired.push(input.submission_id)
+      false
+    } else {
+      true
+    }
+  })
+  if retired.is_empty() {
+    return self
+  }
+  let overlay = self.overlay.filter(notice => {
+    !(notice.reconciliation is Submission(id) && retired.contains(id))
+  })
+  { ..self, input_ledger, overlay }
+}
+
+///|
+/// An abnormal finish does not prove the initial User append succeeded. Keep
+/// the exact draft in a truthful, retractable notice instead of consuming it
+/// on the earlier stdin-write response.
+fn Conversation::mark_initial_for_run_unconfirmed(
+  self : Conversation,
+  run_id : String,
+  durable_frontier? : Int,
+  terminal_snapshot_generation? : Int,
+) -> Conversation {
+  let mut next = self
+  for input in self.input_ledger {
+    if input.kind is InitialPrompt &&
+      input.run_id is Some(owner) &&
+      owner == run_id {
+      let updated = if input.state is Awaiting {
+        let (updated, _) = next.mark_submission_unconfirmed(
+          input.submission_id,
+          "Prompt delivery could not be confirmed before the run ended — " +
+          "check the transcript before resubmitting: " +
+          input.draft,
+          true,
+          terminal_expected=false,
+          terminal_snapshot_generation?,
+        )
+        updated
+      } else {
+        next
+      }
+      next = if durable_frontier is Some(frontier) {
+        updated.anchor_submission_notice_at_durable_frontier(
+          input.submission_id,
+          frontier,
+        )
+      } else if terminal_snapshot_generation is Some(snapshot_generation) {
+        updated.anchor_submission_notice_at_snapshot_cut(
+          input.submission_id,
+          snapshot_generation,
+        )
+      } else {
+        updated
+      }
+    }
+  }
+  next
+}
+
+///|
+/// An EOF frontier of zero, with no applied or buffered commit, proves this
+/// session record was never created. This is stronger than an unsuccessful
+/// snapshot read: the host observed the writer after process exit.
+fn Conversation::is_empty_at_durable_frontier(
+  self : Conversation,
+  frontier : Int,
+) -> Bool {
+  let reconciliation_buffer_empty = match self.sync {
+    Synced => true
+    Reloading(buffered~, ..) => buffered.is_empty()
+    ReloadFailed(buffered~, ..) => buffered.is_empty()
+  }
+  frontier == 0 &&
+  self.watermark == 0 &&
+  self.messages.is_empty() &&
+  reconciliation_buffer_empty
+}
+
+///|
+/// Recover the exact prompt whose run reached EOF before its first durable
+/// append. The draft returns to the composer (without overwriting newer text),
+/// exact-id ownership is retired, and the explanation becomes a retained
+/// local notice so reconnect never probes a record known not to exist.
+fn Conversation::restore_unpersisted_initial_for_run(
+  self : Conversation,
+  run_id : String,
+) -> Conversation {
+  for input in self.input_ledger {
+    if input.kind is InitialPrompt &&
+      input.run_id is Some(owner) &&
+      owner == run_id {
+      let (restored, _) = self.reject_submission(
+        input.submission_id,
+        InitialPrompt,
+        Some(run_id),
+        "The prompt was not saved before the run ended; it has been restored for resubmission.",
+      )
+      return restored
+    }
+  }
+  self
+}
+
+///|
+/// Restore a definitively refused submission without overwriting a draft the
+/// user typed while the request was in flight. Recovered text is placed first,
+/// followed by the newer draft; mention chips retain both submissions' order.
+fn Conversation::restore_submission(
+  self : Conversation,
+  submission : PendingInput,
+) -> Conversation {
+  let task = if self.task.is_empty() {
+    submission.draft
+  } else if submission.draft.is_empty() || self.task == submission.draft {
+    self.task
+  } else {
+    submission.draft + "\n\n" + self.task
+  }
+  let mentions = submission.mentions.copy()
+  for mention in self.mentions {
+    mentions.push(mention)
+  }
+  { ..self, task, mentions }
+}
+
+///|
+/// Recover everything the user can still resubmit when this conversation is
+/// archived out from under the composer. Initial prompts still in the local
+/// ownership ledger come first in send order, followed by text typed since;
+/// no run or receipt state crosses into the replacement conversation.
+fn Conversation::archive_salvage(
+  self : Conversation,
+) -> (String, Array[Mention], Bool) {
+  let drafts : Array[String] = []
+  let mentions : Array[Mention] = []
+  let mut pending_initial = false
+  for input in self.input_ledger {
+    if input.kind is InitialPrompt {
+      pending_initial = true
+      if !input.draft.trim().is_empty() {
+        drafts.push(input.draft)
+      }
+      for mention in input.mentions {
+        mentions.push(mention)
+      }
+    }
+  }
+  if !self.task.trim().is_empty() {
+    drafts.push(self.task)
+  }
+  for mention in self.mentions {
+    mentions.push(mention)
+  }
+  (drafts.join("\n\n"), mentions, pending_initial)
+}
+
+///|
+/// Retire one definitively refused local submission, restore its composer
+/// draft, and replace any provisional notice with one retained explanation.
+fn Conversation::reject_submission(
+  self : Conversation,
+  submission_id : String,
+  kind : InputKind,
+  run_id : String?,
+  notice : String,
+) -> (Conversation, Bool) {
+  for index, input in self.input_ledger {
+    if input.matches_receipt(submission_id, kind, run_id) {
+      let input_ledger = self.input_ledger.copy()
+      let _ = input_ledger.remove(index)
+      let overlay = self.overlay.filter(item => {
+        !(item.reconciliation is Submission(id) && id == submission_id)
+      })
+      let next = { ..self, input_ledger, overlay }
+      return (
+        next
+        .restore_submission(input)
+        .append_local_notice(Assistant(true), notice),
+        true,
+      )
+    }
+  }
+  (self, false)
+}
+
+///|
+/// A connection boundary makes every response still awaiting a receipt
+/// indeterminate. Awaiting starts and steers gain exact-id provisional
+/// notices.
+fn Conversation::mark_awaiting_inputs_unconfirmed(
+  self : Conversation,
+  snapshot_generation? : Int,
+) -> Conversation {
+  let mut conv = self
+  for input in self.input_ledger {
+    if input.state is Awaiting {
+      let label = match input.kind {
+        InitialPrompt =>
+          "Prompt delivery could not be confirmed after reconnect"
+        SteerInput => "Steer delivery could not be confirmed after reconnect"
+      }
+      let (next, _) = conv.mark_submission_unconfirmed(
+        input.submission_id,
+        label +
+        " — check the transcript before resubmitting: " +
+        input.content,
+        snapshot_generation is Some(_),
+        terminal_expected=false,
+        terminal_snapshot_generation?=snapshot_generation,
+      )
+      conv = next
+    }
+    // A transport failure may already have changed this exact entry to
+    // Unconfirmed before the connection boundary. Re-anchor both states:
+    // the reconnect snapshot, not the old display length, is the first safe
+    // chronology fence for commits received while this page was absent.
+    if snapshot_generation is Some(generation) {
+      conv = conv.anchor_submission_notice_at_snapshot_cut(
+        input.submission_id,
+        generation,
+      )
+    }
+  }
+  conv
+}
+
+///|
+/// A run ended before every steer receipt reached this client. Do not guess
+/// whether those steers landed: move each awaiting entry to an exact-id,
+/// retractable unconfirmed notice that follows the durable run tail. An
+/// abnormal EOF supplies an exact sequence because it may have no terminal.
+fn Conversation::mark_awaiting_steers_unconfirmed(
+  self : Conversation,
+  durable_frontier? : Int,
+  submission_ids? : Array[String],
+  owner_run_id? : String,
+  terminal_expected? : Bool = true,
+  terminal_snapshot_generation? : Int,
+) -> Conversation {
+  let mut conv = self
+  for input in self.input_ledger {
+    let included = match submission_ids {
+      Some(ids) => ids.contains(input.submission_id)
+      None => true
+    }
+    let owned = match owner_run_id {
+      Some(run_id) => input.run_id is Some(owner) && owner == run_id
+      None => true
+    }
+    if included && owned && input.kind is SteerInput && input.state is Awaiting {
+      let (next, _) = conv.mark_submission_unconfirmed(
+        input.submission_id,
+        steer_unconfirmed_notice(input.content),
+        true,
+        terminal_expected~,
+        terminal_snapshot_generation?,
+      )
+      conv = if durable_frontier is Some(frontier) {
+        next.anchor_submission_notice_at_durable_frontier(
+          input.submission_id,
+          frontier,
+        )
+      } else {
+        next
+      }
+    }
+  }
+  conv
+}
+
+///|
+/// A different id-bearing Started event in the same session proves an older
+/// unconfirmed start can no longer acquire a receipt. Retain its truthful
+/// notice but release ownership so repeated uncertain starts cannot accumulate
+/// forever.
+fn Conversation::retire_unconfirmed_initials_before(
+  self : Conversation,
+  current_submission_id : String,
+) -> Conversation {
+  let retired : Array[String] = []
+  let input_ledger = self.input_ledger.filter(input => {
+    if input.kind is InitialPrompt &&
+      input.state is Unconfirmed &&
+      input.submission_id != current_submission_id {
+      retired.push(input.submission_id)
+      false
+    } else {
+      true
+    }
+  })
+  if retired.is_empty() {
+    return self
+  }
+  let overlay = self.overlay.map(notice => {
+    match notice.reconciliation {
+      Submission(id) if retired.contains(id) =>
+        { ..notice, reconciliation: Retained }
+      _ => notice
+    }
+  })
+  { ..self, input_ledger, overlay }
+}
+
+///|
+/// Append one local notice unless the same text is already present. Reload
+/// exhaustion can happen in several rounds; one durable conversation should
+/// not accumulate an identical warning for every round.
+fn Conversation::append_local_notice_once(
+  self : Conversation,
+  kind : @transcript.ItemKind,
+  content : String,
+) -> Conversation {
+  for item in self.overlay {
+    if item.content == content {
+      return self
+    }
+  }
+  self.append_local_notice(kind, content)
+}
+
+///|
+
+///|
+/// Interleave local notices at their creation boundary. Future durable turns
+/// therefore render after an older failure instead of pushing it to the tail.
 fn Conversation::visible_items(
   self : Conversation,
 ) -> Array[@transcript.TranscriptItem] {
   if self.overlay.is_empty() {
     self.messages
   } else {
-    self.messages + self.overlay
+    let visible : Array[@transcript.TranscriptItem] = []
+    for index in 0..<self.messages.length() {
+      for notice in self.overlay {
+        if notice.anchor is AfterMessages(boundary) && boundary == index {
+          visible.push({ kind: notice.kind, content: notice.content })
+        }
+      }
+      visible.push(self.messages[index])
+    }
+    for notice in self.overlay {
+      match notice.anchor {
+        TerminalTail(_)
+        | PriorTerminalTail(..)
+        | SnapshotCut(..)
+        | UncertainTail
+        | DurableTail(_) =>
+          visible.push({ kind: notice.kind, content: notice.content })
+        AfterMessages(boundary) if boundary >= self.messages.length() =>
+          visible.push({ kind: notice.kind, content: notice.content })
+        _ => ()
+      }
+    }
+    visible
   }
 }
 
 ///|
-/// Apply one durable commit's item to the transcript and retire the overlay
-/// items it settles: for each transcript item the commit renders as, the
-/// first overlay item of the same kind drops (FIFO — the store commits in
-/// the same order the live stream reported). Returns whether the transcript
-/// visibly grew.
+/// A run-tail or abnormal-EOF notice still lacks a proven chronology boundary.
+/// Local submission waits rather than letting a later run make an older
+/// missing boundary look like the notice's owner. A bare `UncertainTail`
+/// never claims a durable event and has no proof left to wait for; the synced
+/// transcript gate is sufficient once its causal recovery read has completed.
+fn Conversation::has_unresolved_run_tail_notice(self : Conversation) -> Bool {
+  self.overlay
+  .iter()
+  .any(notice => {
+    match notice.anchor {
+      TerminalTail(_)
+      | PriorTerminalTail(..)
+      | SnapshotCut(..)
+      | DurableTail(_) => true
+      _ => false
+    }
+  })
+}
+
+///|
+/// A different run began before older run-tail notices were placed. A normal
+/// semantic finish guarantees that its Terminal was durable before Started,
+/// so a post-Started full snapshot can still locate the earliest terminal
+/// above its floor. An uncertain finish has no such proof and loses its floor
+/// immediately; otherwise the successor's terminal could claim it.
+fn Conversation::prepare_tail_notices_for_successor(
+  self : Conversation,
+  snapshot_generation : Int,
+) -> Conversation {
+  let overlay = self.overlay.map(notice => {
+    match notice.anchor {
+      TerminalTail(Some(floor)) =>
+        { ..notice, anchor: PriorTerminalTail(floor~, snapshot_generation~) }
+      TerminalTail(None) | UncertainTail =>
+        { ..notice, anchor: SnapshotCut(snapshot_generation~) }
+      SnapshotCut(_) => { ..notice, anchor: SnapshotCut(snapshot_generation~) }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// Freeze a current terminal-backed notice whose exclusive sequence floor is
+/// crossed by this durable terminal. `PriorTerminalTail` deliberately does
+/// not match live commits, while `UncertainTail` never matches any anonymous
+/// terminal: either could otherwise claim a successor's terminal.
+fn Conversation::freeze_run_tail_notices_at_terminal(
+  self : Conversation,
+  terminal_sequence : Int,
+  boundary : Int,
+) -> Conversation {
+  let overlay = self.overlay.map(notice => {
+    match notice.anchor {
+      TerminalTail(Some(floor)) if terminal_sequence > floor =>
+        { ..notice, anchor: AfterMessages(boundary) }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// Reconcile terminal-backed notices when a snapshot has already absorbed
+/// their terminal commits. An uncertain run is intentionally excluded: if it
+/// had no Terminal, the first one above its floor could belong to an entirely
+/// missed successor run. `event_boundaries` identifies terminals and carries
+/// each projected end because a deduplicated finished terminal may add no
+/// display item.
+fn Conversation::freeze_run_tail_notices_from_snapshot(
+  self : Conversation,
+  event_boundaries : Array[(Int, Bool, Int)],
+  generation : Int,
+) -> Conversation {
+  let overlay = self.overlay.map(notice => {
+    let floor = match notice.anchor {
+      TerminalTail(Some(floor)) => Some(floor)
+      PriorTerminalTail(floor~, snapshot_generation~) if generation >=
+        snapshot_generation => Some(floor)
+      _ => None
+    }
+    match floor {
+      Some(floor) => {
+        for event in event_boundaries {
+          let (sequence, is_terminal, boundary) = event
+          if is_terminal && sequence > floor {
+            return { ..notice, anchor: AfterMessages(boundary) }
+          }
+        }
+        notice
+      }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// A gap-free snapshot whose read began after an uncertain lifecycle event is
+/// a safe display fence even though it cannot identify which stored items
+/// belong to that run. Anchor at the snapshot cut itself, before commits that
+/// arrived later and were drained from the live buffer.
+fn Conversation::freeze_snapshot_cut_notices_from_snapshot(
+  self : Conversation,
+  generation : Int,
+  boundary : Int,
+) -> Conversation {
+  let overlay = self.overlay.map(notice => {
+    match notice.anchor {
+      SnapshotCut(snapshot_generation~) if generation >= snapshot_generation =>
+        { ..notice, anchor: AfterMessages(boundary) }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// A causal, gap-free snapshot should contain every terminal guaranteed before
+/// its Started boundary. If it does not, stop matching that notice rather than
+/// letting a future run's terminal claim it. The snapshot itself is still a
+/// safe observation fence; exact-id ownership remains, so a later receipt can
+/// retract the notice and `agent.durable` can still move it to an exact cut.
+fn Conversation::abandon_missing_prior_terminals(
+  self : Conversation,
+  generation : Int,
+  boundary : Int,
+) -> Conversation {
+  let overlay = self.overlay.map(notice => {
+    match notice.anchor {
+      PriorTerminalTail(snapshot_generation~, ..) if generation >=
+        snapshot_generation => { ..notice, anchor: AfterMessages(boundary) }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// Resolve abnormal-EOF notices when their exact final sequence is applied
+/// incrementally. Unlike a normal finish, the boundary event may be a User,
+/// assistant, tool result, or no-op projection rather than a Terminal.
+fn Conversation::freeze_durable_tail_notices_at_commit(
+  self : Conversation,
+  sequence : Int,
+  boundary : Int,
+) -> Conversation {
+  let overlay = self.overlay.map(notice => {
+    match notice.anchor {
+      DurableTail(frontier) if sequence == frontier =>
+        { ..notice, anchor: AfterMessages(boundary) }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// Resolve the same exact sequence when a snapshot has already absorbed the
+/// buffered commit. Every stored event carries its projected end, including
+/// events that add no visible item.
+fn Conversation::freeze_durable_tail_notices_from_snapshot(
+  self : Conversation,
+  event_boundaries : Array[(Int, Bool, Int)],
+) -> Conversation {
+  let overlay = self.overlay.map(notice => {
+    match notice.anchor {
+      DurableTail(frontier) => {
+        for event in event_boundaries {
+          let (sequence, _, boundary) = event
+          if sequence == frontier {
+            return { ..notice, anchor: AfterMessages(boundary) }
+          }
+        }
+        notice
+      }
+      _ => notice
+    }
+  })
+  { ..self, overlay, }
+}
+
+///|
+/// Apply one durable commit's item to the transcript. Local notices have no
+/// durable twin and are therefore never retired by item class. Returns
+/// whether the durable transcript visibly grew.
 fn Conversation::apply_commit(
   self : Conversation,
+  sequence : Int,
   kind : String,
   payload : Map[String, Json],
 ) -> (Bool, Conversation) {
+  // A canonical User is transcript data, never local-submission ownership.
+  // It is not a run boundary: the same kind also stores in-run steering.
   let messages = self.messages.copy()
   let before = messages.length()
   @transcript.apply_session_item(messages, kind, payload)
-  let mut overlay = self.overlay
-  for index in before..<messages.length() {
-    overlay = drop_first_overlay(overlay, messages[index].kind)
+  let conv = {
+    ..self,
+    messages,
+    run_durable_floor: if !(self.run is NoRun(..)) &&
+      self.run_durable_floor is None &&
+      self.run_floor_generation is None &&
+      kind != "terminal" {
+      Some(self.last_terminal_sequence)
+    } else {
+      self.run_durable_floor
+    },
+    last_terminal_sequence: if kind == "terminal" &&
+      sequence > self.last_terminal_sequence {
+      sequence
+    } else {
+      self.last_terminal_sequence
+    },
   }
-  (messages.length() > before, { ..self, messages, overlay })
+  let conv = if kind == "terminal" {
+    conv.freeze_run_tail_notices_at_terminal(sequence, messages.length())
+  } else {
+    conv
+  }
+  let conv = conv.freeze_durable_tail_notices_at_commit(
+    sequence,
+    messages.length(),
+  )
+  (messages.length() > before, conv)
 }
 
 ///|
-/// Remove the first overlay item of `kind`'s class, if any — the durable
-/// commit that just landed is its settled form.
-fn drop_first_overlay(
-  overlay : Array[@transcript.TranscriptItem],
-  kind : @transcript.ItemKind,
-) -> Array[@transcript.TranscriptItem] {
-  for index, item in overlay {
-    if same_item_class(item.kind, kind) {
-      let next = overlay.copy()
-      let _ = next.remove(index)
-      return next
+/// Start one reload unless this conversation already has a request in flight.
+/// Tokens come from the model rather than the conversation: a pruned or
+/// archived conversation can therefore be recreated without accepting a late
+/// reply issued to its earlier incarnation. Buffered commits from an exhausted
+/// retry round carry into the next one.
+fn Model::begin_transcript_reload(
+  self : Model,
+  conv : Conversation,
+) -> (Model, Int?) {
+  match conv.sync {
+    Reloading(..) => (self.replace_conversation(conv), None)
+    Synced => {
+      let generation = self.transcript_request_generation + 1
+      (
+        {
+          ..self.replace_conversation({
+            ..conv,
+            sync: Reloading(
+              generation~,
+              attempt=1,
+              buffered=[],
+              reload_after_current=false,
+            ),
+          }),
+          transcript_request_generation: generation,
+        },
+        Some(generation),
+      )
+    }
+    ReloadFailed(buffered~, ..) => {
+      let generation = self.transcript_request_generation + 1
+      (
+        {
+          ..self.replace_conversation({
+            ..conv,
+            sync: Reloading(
+              generation~,
+              attempt=1,
+              buffered=buffered.copy(),
+              reload_after_current=false,
+            ),
+          }),
+          transcript_request_generation: generation,
+        },
+        Some(generation),
+      )
     }
   }
-  overlay
 }
 
 ///|
-/// Kind classes for overlay retirement: constructor identity, payload
-/// ignored (a tool card's durable form may brief itself differently than the
-/// live event did).
-fn same_item_class(a : @transcript.ItemKind, b : @transcript.ItemKind) -> Bool {
-  match (a, b) {
-    (User, User)
-    | (Reasoning, Reasoning)
-    | (Summary, Summary)
-    | (Assistant(_), Assistant(_))
-    | (Tool(..), Tool(..)) => true
-    _ => false
+/// Require a snapshot whose read cut starts after the current transition.
+/// An existing read stays single-flight but is followed by one fresh
+/// generation; otherwise start that generation now.
+fn Model::ensure_transcript_reload_after_current(
+  self : Model,
+  conv : Conversation,
+) -> (Model, Int?) {
+  match conv.sync {
+    Reloading(generation~, attempt~, buffered~, reload_after_current=false) =>
+      (
+        self.replace_conversation({
+          ..conv,
+          sync: Reloading(
+            generation~,
+            attempt~,
+            buffered~,
+            reload_after_current=true,
+          ),
+        }),
+        None,
+      )
+    Reloading(reload_after_current=true, ..) =>
+      (self.replace_conversation(conv), None)
+    Synced | ReloadFailed(..) => self.begin_transcript_reload(conv)
+  }
+}
+
+///|
+/// Buffer a commit while a snapshot generation is unresolved. The array is
+/// copied so earlier Rabbita model snapshots remain immutable. Buffered
+/// terminals do not advance the applied terminal frontier: an earlier
+/// non-terminal must still capture the frontier that preceded it when the
+/// sorted buffer is eventually drained.
+fn Conversation::buffer_commit(
+  self : Conversation,
+  commit : BufferedCommit,
+) -> Conversation {
+  match self.sync {
+    Reloading(generation~, attempt~, buffered~, reload_after_current~) => {
+      let buffered = buffered.copy()
+      buffered.push(commit)
+      {
+        ..self,
+        sync: Reloading(generation~, attempt~, buffered~, reload_after_current~),
+      }
+    }
+    ReloadFailed(generation~, buffered~) => {
+      let buffered = buffered.copy()
+      buffered.push(commit)
+      { ..self, sync: ReloadFailed(generation~, buffered~) }
+    }
+    Synced => self
   }
 }
 
 ///|
 /// Adopt a fresh `session.load` snapshot: it replaces the durable transcript
-/// wholesale, clears the overlay (the snapshot is the settled truth for
-/// everything committed so far — an overlay item it does not contain will
-/// come back through its own commit), and drains the commits buffered while
-/// the read was in flight. Returns the conversation and whether buffered
-/// commits from beyond the snapshot failed to connect — a remaining gap the
-/// caller answers with another read.
+/// wholesale, preserves client-local notices, and drains commits buffered
+/// while the read was in flight. The caller has already checked generation
+/// and watermark monotonicity. Returns whether buffered commits from beyond
+/// the snapshot failed to connect — a remaining gap answered by a new read.
 fn Conversation::adopt_snapshot(
   self : Conversation,
   items : Array[@transcript.TranscriptItem],
   watermark : Int,
+  event_boundaries : Array[(Int, Bool, Int)],
 ) -> (Conversation, Bool) {
-  let pending = match self.sync {
-    Reloading(buffered~) => buffered.copy()
-    Synced => []
+  let (generation, pending) = match self.sync {
+    Reloading(generation~, buffered~, ..) => (generation, buffered.copy())
+    _ => return (self, false)
   }
   // Sequence order, whatever the arrival order was.
   pending.sort_by((a, b) => a.sequence - b.sequence)
+  let snapshot_boundary = items.length()
+  // This one local notice represents the reload state itself, so a current
+  // successful snapshot clears it by exact identity. Every unrelated local
+  // notice survives unchanged.
+  let mut last_terminal_sequence = self.last_terminal_sequence
+  let mut snapshot_terminal_sequence = 0
+  let mut snapshot_terminal_boundary = 0
+  for boundary in event_boundaries {
+    let (sequence, is_terminal, item_count) = boundary
+    if is_terminal && sequence > snapshot_terminal_sequence {
+      snapshot_terminal_sequence = sequence
+      snapshot_terminal_boundary = item_count
+      if sequence > last_terminal_sequence {
+        last_terminal_sequence = sequence
+      }
+    }
+  }
+  let floor_snapshot_is_causal = match self.run_floor_generation {
+    Some(required) => generation >= required
+    None => true
+  }
+  let reconciled = {
+      ..self,
+      last_terminal_sequence,
+      // A foreign/mid-run Started intentionally leaves the floor unknown. It
+      // becomes steerable only when the snapshot visibly has current-run data
+      // after its last terminal; a snapshot ending at a terminal may instead
+      // have beaten the lifecycle Finished event and proves no open floor.
+      run_durable_floor: if !(self.run is NoRun(..)) &&
+        self.run_durable_floor is None &&
+        floor_snapshot_is_causal &&
+        items.length() > snapshot_terminal_boundary {
+        Some(snapshot_terminal_sequence)
+      } else {
+        self.run_durable_floor
+      },
+      run_floor_generation: if floor_snapshot_is_causal {
+        None
+      } else {
+        self.run_floor_generation
+      },
+    }
+    .freeze_run_tail_notices_from_snapshot(event_boundaries, generation)
+    .freeze_durable_tail_notices_from_snapshot(event_boundaries)
+  let overlay = reconciled.overlay.filter(item => {
+    item.content != TranscriptRefreshFailedNotice
+  })
   let mut conv : Conversation = {
-    ..self,
+    ..reconciled,
     messages: items,
     watermark,
-    overlay: [],
+    overlay,
     sync: Synced,
   }
   let leftover : Array[BufferedCommit] = []
@@ -1309,16 +2962,39 @@ fn Conversation::adopt_snapshot(
       continue
     }
     if commit.sequence == conv.watermark + 1 && leftover.is_empty() {
-      let (_, next) = conv.apply_commit(commit.kind, commit.payload)
+      let (_, next) = conv.apply_commit(
+        commit.sequence,
+        commit.kind,
+        commit.payload,
+      )
       conv = { ..next, watermark: commit.sequence }
     } else {
       leftover.push(commit)
     }
   }
   if leftover.is_empty() {
-    (conv, false)
+    // Only a complete causal cut may give up on a supposedly guaranteed old
+    // terminal. Do this after the ordered buffer has drained; a gap schedules
+    // another snapshot and must keep every proof obligation intact.
+    (
+      conv
+      .freeze_snapshot_cut_notices_from_snapshot(generation, snapshot_boundary)
+      .abandon_missing_prior_terminals(generation, snapshot_boundary),
+      false,
+    )
   } else {
-    ({ ..conv, sync: Reloading(buffered=leftover) }, true)
+    let conv = if !(conv.run is NoRun(..)) {
+      {
+        ..conv,
+        run_durable_floor: None,
+        // The incomplete cut cannot establish this open run's predecessor.
+        // The retry generation is necessarily newer than this one.
+        run_floor_generation: Some(generation + 1),
+      }
+    } else {
+      conv
+    }
+    ({ ..conv, sync: ReloadFailed(generation~, buffered=leftover) }, true)
   }
 }
 
@@ -1332,45 +3008,11 @@ fn steer_dropped_notice(text : String) -> String {
 }
 
 ///|
-/// Remove the first pending steer matching `text`. The engine settles steers
-/// in wire order, but an identical-text steer must not steal a later one's
-/// acknowledgment, so exactly one entry settles per event; no match (already
-/// swept at run end) is a no-op.
-fn Conversation::settle_pending_steer(
-  self : Conversation,
-  text : String,
-) -> Conversation {
-  for index, pending in self.pending_steers {
-    if pending == text {
-      let pending_steers = self.pending_steers.copy()
-      let _ = pending_steers.remove(index)
-      return { ..self, pending_steers, }
-    }
-  }
-  self
-}
-
-///|
-/// Surface every still-pending steer as a dropped notice and clear the list.
-/// In the normal path the engine settles each steer before the turn's
-/// terminal event, so this only fires when the run died with steers in
-/// flight — the text must not vanish with it.
-fn Conversation::sweep_pending_steers(self : Conversation) -> Conversation {
-  let mut conv = self
-  for text in self.pending_steers {
-    conv = conv.append_overlay(Assistant(true), steer_dropped_notice(text))
-  }
-  { ..conv, pending_steers: [] }
-}
-
-///|
-fn Conversation::last_assistant_content(self : Conversation) -> String? {
-  let items = self.visible_items()
-  if items.get(items.length() - 1) is Some(item) && item.kind is Assistant(_) {
-    Some(item.content)
-  } else {
-    None
-  }
+/// The truthful notice for a steer whose receipt was lost at a run boundary.
+/// It intentionally does not claim the steer was dropped: a later exact-id
+/// receipt may still prove either outcome.
+fn steer_unconfirmed_notice(text : String) -> String {
+  "Steer delivery could not be confirmed — check the transcript before resubmitting: \{text}"
 }
 
 ///|
