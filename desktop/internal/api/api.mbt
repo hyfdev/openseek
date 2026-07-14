@@ -139,11 +139,27 @@ pub async fn dispatch(
       @engine.archived_sessions(state.manager).to_json()
     "session.archive" => {
       let payload : SessionPayload = decode(params)
-      @engine.archive_session(state.manager, payload.session).to_json()
+      let reply = @engine.archive_session(state.manager, payload.session).to_json()
+      // Every other client still lists (or has open) the conversation that
+      // just moved; without a broadcast only the requester learns, and a
+      // stale client could prompt into the archived record.
+      publish_session_changed(state, "archived", payload.session)
+      reply
     }
     "session.unarchive" => {
       let payload : SessionPayload = decode(params)
-      @engine.unarchive_session(state.manager, payload.session).to_json()
+      let reply = @engine.unarchive_session(state.manager, payload.session).to_json()
+      publish_session_changed(state, "unarchived", payload.session)
+      reply
+    }
+    "settings.get" => @engine.settings_status(state.manager)
+    "settings.set" => {
+      let payload : SettingsSetPayload = decode(params)
+      let status = @engine.update_settings(state.manager, payload.to_patch())
+      // Every client renders these settings (the Settings page, the
+      // composer's ready gate); the ones that did not ask must learn too.
+      state.hub.publish("settings.changed", status)
+      status
     }
     "workspace.list" => @engine.list_workspaces().to_json()
     "workspace.add" => {
@@ -154,7 +170,15 @@ pub async fn dispatch(
       let payload : WorkspacePayload = decode(params)
       @engine.detach_workspace(payload.path).to_json()
     }
-    "host.meta" => { "protocol": 2, "name": "openseek-host" }
+    "host.meta" =>
+      // `wsl` is the host's own capability: the engine runs here, so the
+      // client must not guess it from the page's user agent (a phone browser
+      // may drive a Windows host, a Windows browser a Mac one).
+      {
+        "protocol": 2,
+        "name": "openseek-host",
+        "wsl": Json::boolean(HostWslCapable),
+      }
     _ =>
       match @host.host_op(state.host, method_, params) {
         Some(reply) => reply
@@ -164,13 +188,38 @@ pub async fn dispatch(
 }
 
 ///|
+/// Whether this host can run the engine inside WSL — a Windows host.
+#cfg(platform="windows")
+const HostWslCapable = true
+
+///|
+#cfg(not(platform="windows"))
+const HostWslCapable = false
+
+///|
+/// Tell every client a conversation moved between the live and archived
+/// stores, so the ones that did not ask re-read both lists and drop live
+/// state for the moved record.
+fn publish_session_changed(
+  state : ApiState,
+  change : String,
+  session : String,
+) -> Unit {
+  state.hub.publish("session.changed", {
+    "change": Json::string(change),
+    "session": Json::string(session),
+  })
+}
+
+///|
 /// Every method in the catalog — the transport adapters register exactly
 /// this set.
 pub fn method_names() -> Array[String] {
   [
     "agent.start", "agent.cancel", "agent.steer", "agent.compact", "agent.runs",
     "session.list", "session.load", "session.list_archived", "session.archive", "session.unarchive",
-    "workspace.list", "workspace.add", "workspace.remove", "host.meta",
+    "settings.get", "settings.set", "workspace.list", "workspace.add", "workspace.remove",
+    "host.meta",
   ] +
   @host.host_method_names()
 }

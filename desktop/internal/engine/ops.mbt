@@ -17,14 +17,14 @@ pub async fn start_run(
   payload : StartRequest,
 ) -> StartReply {
   let sessions = manager.serving()
-  let config = run_config(payload, manager.engine)
+  let config = run_config(manager, payload)
   let key = session_key(config)
   let slot = slot_for(sessions, key)
   if slot.engine is Some(live) {
     match live.phase {
       Running(..) =>
         raise EngineError(
-          "OpenSeek run \{live.latest_run} is still active in this conversation",
+          "an OpenSeek run is still active in this conversation",
         )
       // A prompt accepted now would queue behind the compaction, where a
       // Stop (which cancels only the compaction) could not reach it.
@@ -59,9 +59,8 @@ pub async fn start_run(
   if live.phase is Compacting {
     raise EngineError("this conversation is compacting; wait for it to finish")
   }
-  let run_id = manager.next_run_id
-  manager.next_run_id = manager.next_run_id + 1
-  live.latest_run = run_id
+  let run_id = mint_run_id()
+  live.latest_run = Some(run_id)
   live.phase = Running(cancel_requested=false, compact_queued=false)
   live.steer_runs.begin_run()
   emit(
@@ -120,6 +119,18 @@ pub async fn start_run(
 }
 
 ///|
+/// A fresh run id: random, so it can never collide with a run from another
+/// host lifetime — a remote page that reconnects across a host restart may
+/// still hold pre-restart runs, and a counter reset to 1 would hand their
+/// ids to new runs, cross-wiring two conversations' event streams.
+fn mint_run_id() -> String raise EngineError {
+  guard @entropy.random_hex(8) is Some(hex) else {
+    raise EngineError("cannot mint a run id: OS entropy unavailable")
+  }
+  "r\{hex}"
+}
+
+///|
 /// Cancel an open turn by asking its serve engine to interrupt it — the
 /// process itself stays alive for the next prompt. The run is addressed by
 /// id across all conversations; with no matching open run there is nothing
@@ -143,7 +154,7 @@ pub async fn cancel_run(
     // The engine just died; its reader task closes the run.
     _ => ()
   }
-  { cancelled: true, run_id: Some(live.latest_run) }
+  { cancelled: true, run_id: live.latest_run }
 }
 
 ///|
@@ -201,7 +212,7 @@ pub async fn compact_run(
   let live = if slot.engine is Some(live) {
     live
   } else {
-    let config = compact_config(payload, manager.engine)
+    let config = compact_config(manager, payload)
     ensure_run_cwd(config)
     request_spawn(manager, config)
     guard slot.engine is Some(live) else {
@@ -279,10 +290,10 @@ pub async fn steer_run(
     // reached it, so roll back the record and report that rather than pretend.
     _ => {
       live.steer_runs.discard_sent(payload.text)
-      return { steered: false, run_id: Some(live.latest_run) }
+      return { steered: false, run_id: live.latest_run }
     }
   }
-  { steered: true, run_id: Some(live.latest_run) }
+  { steered: true, run_id: live.latest_run }
 }
 
 ///|

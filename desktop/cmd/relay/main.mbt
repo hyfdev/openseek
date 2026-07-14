@@ -171,6 +171,11 @@ async fn serve_control(
     physical_equal(current, device) {
     relay.devices.remove(id)
   })
+  // Close this session's queue on the way out either way: browser handlers
+  // that grabbed the device before the map entry went away may be blocked
+  // in `put` on the full queue, and only the close wakes them — otherwise
+  // they (and their pending entries) hang forever.
+  defer device.out.close()
   ws.send_text((Registered(device=id) : @tunnel.Frame).encode())
   println("openseek relay: device '\{id}' (\{device.name}) connected")
   @async.with_task_group(group => {
@@ -216,7 +221,13 @@ async fn serve_browser(
   }
   relay.pending[stream] = entry
   defer relay.pending.remove(stream)
-  device.out.put(Open(stream~))
+  device.out.put(Open(stream~)) catch {
+    error if @async.is_being_cancelled() => raise error
+    // The device's control connection tore down (closing its queue) between
+    // the lookup above and this put — the same answer as a device that was
+    // never connected.
+    _ => return res.send_json({ "error": "device offline" }, status=502)
+  }
   // Upgrade only once the rendezvous is armed: from here on the browser
   // socket is ours to close.
   let browser = res.upgrade(req)

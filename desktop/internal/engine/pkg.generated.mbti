@@ -44,11 +44,15 @@ pub async fn run_engine_pump(EventSink, EngineManager) -> PumpReply
 
 pub async fn session_cwd(String) -> String
 
+pub async fn settings_status(EngineManager) -> Json
+
 pub async fn start_run(EventSink, EngineManager, StartRequest) -> StartReply
 
 pub async fn steer_run(EngineManager, SteerRequest) -> SteerReply
 
 pub async fn unarchive_session(EngineManager, String) -> SessionsReply
+
+pub async fn update_settings(EngineManager, SettingsPatch) -> Json
 
 pub fn workspace_session_root(@path.Path) -> @path.Path
 
@@ -61,20 +65,17 @@ pub(all) suberror EngineError {
 type CancelReply derive(ToJson)
 
 pub(all) struct CancelRequest {
-  run_id : Int?
+  run_id : String?
 }
 
 type CompactReply derive(ToJson)
 
 pub(all) struct CompactRequest {
   session : String
-  api_key : String?
-  api_url : String?
   model : String?
   max_steps : Int?
   session_root : String?
   workspace : String?
-  wsl : WslRequest?
 }
 
 type ConnectedPayload derive(ToJson)
@@ -96,7 +97,7 @@ type EventPayload derive(ToJson)
 pub(all) struct EventSink(async (EngineEvent) -> Unit)
 
 pub struct FinishedPayload {
-  run_id : Int
+  run_id : String
   status : String
   answer : String?
   exit_code : Int?
@@ -115,18 +116,23 @@ type SessionGroup derive(ToJson)
 
 type SessionsReply derive(ToJson)
 
+pub(all) struct SettingsPatch {
+  provider : String?
+  custom_api_url : String?
+  deepseek_api_key : String?
+  custom_api_key : String?
+  wsl : WslPatch?
+}
+
 type StartReply derive(ToJson)
 
 pub(all) struct StartRequest {
   task : String
-  api_key : String?
-  api_url : String?
   model : String?
   max_steps : Int?
   session : String?
   session_root : String?
   workspace : String?
-  wsl : WslRequest?
 }
 
 type StartedPayload derive(ToJson)
@@ -135,12 +141,13 @@ type SteerReply derive(ToJson)
 
 pub(all) struct SteerRequest {
   text : String
-  run_id : Int?
+  run_id : String?
 }
 
 type WorkspacesReply derive(ToJson)
 
-pub(all) struct WslRequest {
+pub(all) struct WslPatch {
+  enabled : Bool
   distro : String?
   engine : String?
 }

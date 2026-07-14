@@ -22,7 +22,10 @@ priv struct ServeEngine {
   // config differs cannot reuse it.
   spec_key : String
   writer : @process.WriteToProcess
-  mut latest_run : Int
+  // The id of the run this engine saw most recently; None before the first
+  // prompt of this process's lifetime (a spawn for compaction, or events
+  // arriving before any turn opened).
+  mut latest_run : String?
   mut phase : EnginePhase
   steer_runs : SteerRunTracker
 }
@@ -71,7 +74,7 @@ fn EnginePhase::after_run_close(self : EnginePhase) -> EnginePhase {
 
 ///|
 priv struct SteerRunTracker {
-  mut settling_run : Int?
+  mut settling_run : String?
   open_steers : Array[String]
   settling_steers : Array[String]
 }
@@ -108,7 +111,7 @@ fn SteerRunTracker::discard_sent(self : SteerRunTracker, text : String) -> Unit 
 ///|
 fn SteerRunTracker::record_terminal(
   self : SteerRunTracker,
-  run_id : Int,
+  run_id : String,
 ) -> Unit {
   self.settling_steers.clear()
   if self.open_steers.length() > 0 {
@@ -126,8 +129,8 @@ fn SteerRunTracker::record_terminal(
 fn SteerRunTracker::run_id_for_event(
   self : SteerRunTracker,
   decoded : @event.AgentEvent?,
-  latest_run : Int,
-) -> Int {
+  latest_run : String?,
+) -> String? {
   match decoded {
     Some(SteerApplied(content)) | Some(SteerDropped(content)) => {
       if remove_first_text(self.settling_steers, content) &&
@@ -135,7 +138,7 @@ fn SteerRunTracker::run_id_for_event(
         if self.settling_steers.is_empty() {
           self.settling_run = None
         }
-        return run_id
+        return Some(run_id)
       }
       ignore(remove_first_text(self.open_steers, content))
     }
@@ -234,7 +237,6 @@ struct EngineManager {
   runtime_dir : @path.Path?
   commands : @async.Queue[PumpCommand]
   mut pump : PumpState
-  mut next_run_id : Int
 }
 
 ///|
@@ -285,26 +287,21 @@ pub fn new_engine_manager(
   engine : String,
   runtime_dir? : @path.Path,
 ) -> EngineManager {
-  {
-    engine,
-    runtime_dir,
-    commands: Queue(kind=Unbounded),
-    pump: Stopped,
-    next_run_id: 1,
-  }
+  { engine, runtime_dir, commands: Queue(kind=Unbounded), pump: Stopped }
 }
 
 ///|
 /// The engine that owns the open run `run_id` — or, when no id is given, the
 /// only open run if exactly one exists (with several conversations running
 /// concurrently, an unaddressed cancel/steer would be a guess).
-fn open_run_engine(manager : EngineManager, run_id? : Int) -> ServeEngine? {
+fn open_run_engine(manager : EngineManager, run_id? : String) -> ServeEngine? {
   guard manager.pump is Serving(sessions~) else { return None }
   if run_id is Some(id) {
     for _, slot in sessions {
       if slot.engine is Some(engine) &&
         engine.phase is Running(..) &&
-        engine.latest_run == id {
+        engine.latest_run is Some(latest) &&
+        latest == id {
         return Some(engine)
       }
     }
@@ -362,7 +359,7 @@ async fn read_engine_stdout(
 ///|
 async fn handle_decoded_event(
   sink : EventSink,
-  run_id : Int,
+  run_id : String,
   decoded : @event.AgentEvent,
 ) -> Bool {
   match decoded {
@@ -671,7 +668,7 @@ async fn[G] start_serve_engine(
     session_key: session_key(config),
     spec_key: engine_fingerprint(config),
     writer,
-    latest_run: 0,
+    latest_run: None,
     phase: Idle,
     steer_runs: SteerRunTracker::new(),
   }
@@ -713,19 +710,22 @@ async fn serve_engine_consumer(
         )
         match decoded {
           // The abort the user asked for: report it as a cancellation, the
-          // same wire status the pre-serve host used.
+          // same wire status the pre-serve host used. A Running phase is
+          // only entered after a run id is recorded, so the id is present.
           Some(AgentAborted(_)) if engine.phase
-            is Running(cancel_requested=true, ..) => {
-            emit_error(sink, "cancelled", run_id~)
-            emit_finished(sink, run_id, Cancelled)
+            is Running(cancel_requested=true, ..) &&
+            run_id is Some(id) => {
+            emit_error(sink, "cancelled", run_id=id)
+            emit_finished(sink, id, Cancelled)
             engine.phase = engine.phase.after_run_close()
-            engine.steer_runs.record_terminal(run_id)
+            engine.steer_runs.record_terminal(id)
           }
           Some(decoded) => {
             // Terminal failures are immediately normalized below; forwarding
             // their raw event as well would make the frontend render the same
-            // failure twice.
-            if !host_reports_terminal_error(decoded) {
+            // failure twice. With no run to close (no id recorded yet) the
+            // normalization cannot happen, so the raw event is the report.
+            if !host_reports_terminal_error(decoded) || run_id is None {
               emit(
                 sink,
                 StreamEvent({ run_id, session: engine.session_key, event: raw }),
@@ -745,9 +745,9 @@ async fn serve_engine_consumer(
               CompactionFinished | CompactionFailed => engine.phase = Idle
               _ => ()
             }
-            if handle_decoded_event(sink, run_id, decoded) {
+            if run_id is Some(id) && handle_decoded_event(sink, id, decoded) {
               engine.phase = engine.phase.after_run_close()
-              engine.steer_runs.record_terminal(run_id)
+              engine.steer_runs.record_terminal(id)
             }
           }
           None =>
@@ -758,7 +758,7 @@ async fn serve_engine_consumer(
         }
       }
       StreamReaderFailed(message) => {
-        emit_error(sink, message, run_id=engine.latest_run)
+        emit_error(sink, message, run_id?=engine.latest_run)
         // A broken stream can no longer deliver compaction_finished/failed;
         // report the compaction as failed now so the frontend does not stay
         // stuck with Send disabled (the exit branch below then has nothing
@@ -796,19 +796,23 @@ async fn serve_engine_consumer(
               emit_error(
                 sink,
                 "engine exited without a result",
-                run_id=engine.latest_run,
+                run_id?=engine.latest_run,
                 exit_code=code,
               )
             } else {
               emit_error(
                 sink,
                 "engine exited without a result:\n" + diagnostics,
-                run_id=engine.latest_run,
+                run_id?=engine.latest_run,
                 exit_code=code,
                 diagnostics~,
               )
             }
-            emit_finished(sink, engine.latest_run, Failed, exit_code=code)
+            // A Running phase is only entered after a run id is recorded,
+            // so the id is present here.
+            if engine.latest_run is Some(run) {
+              emit_finished(sink, run, Failed, exit_code=code)
+            }
             // A compaction queued behind the dead turn died with the engine;
             // only a terminal compaction event clears the frontend's queued
             // notice, so synthesize the failure it can no longer send.
@@ -886,11 +890,11 @@ async test "context yield reports a terminal finished event" {
   let emitted : Array[EngineEvent] = []
   let sink = EventSink(fn(event) { emitted.push(event) })
   let answer = "[context ceiling] checkpointed"
-  assert_true(handle_decoded_event(sink, 17, ContextYield(answer)))
+  assert_true(handle_decoded_event(sink, "r17", ContextYield(answer)))
   guard emitted is [Finished(payload)] else {
     fail("expected one finished event")
   }
-  assert_eq(payload.run_id, 17)
+  assert_eq(payload.run_id, "r17")
   assert_eq(payload.status, "context_yield")
   guard payload.answer is Some(emitted_answer) else {
     fail("expected continuation guidance")
@@ -915,13 +919,13 @@ test "trailing steer settle events keep the terminal run id" {
   let tracker = SteerRunTracker::new()
   tracker.begin_run()
   tracker.record_sent("old steer")
-  tracker.record_terminal(41)
+  tracker.record_terminal("r41")
   tracker.begin_run()
   tracker.record_sent("fresh steer")
   let old_drop : @event.AgentEvent? = Some(SteerDropped("old steer"))
   let fresh_apply : @event.AgentEvent? = Some(SteerApplied("fresh steer"))
-  assert_eq(tracker.run_id_for_event(old_drop, 42), 41)
-  assert_eq(tracker.run_id_for_event(fresh_apply, 42), 42)
+  assert_eq(tracker.run_id_for_event(old_drop, Some("r42")), Some("r41"))
+  assert_eq(tracker.run_id_for_event(fresh_apply, Some("r42")), Some("r42"))
 }
 
 ///|
@@ -929,10 +933,10 @@ test "new turn events clear stale settling state" {
   let tracker = SteerRunTracker::new()
   tracker.begin_run()
   tracker.record_sent("old steer")
-  tracker.record_terminal(7)
-  assert_eq(tracker.run_id_for_event(Some(AgentStep), 8), 8)
+  tracker.record_terminal("r7")
+  assert_eq(tracker.run_id_for_event(Some(AgentStep), Some("r8")), Some("r8"))
   let old_drop : @event.AgentEvent? = Some(SteerDropped("old steer"))
-  assert_eq(tracker.run_id_for_event(old_drop, 8), 8)
+  assert_eq(tracker.run_id_for_event(old_drop, Some("r8")), Some("r8"))
 }
 
 ///|

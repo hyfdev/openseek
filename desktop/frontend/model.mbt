@@ -5,25 +5,29 @@ const DefaultModel : String = "deepseek-v4-pro"
 const DefaultMaxSteps : String = "1000"
 
 ///|
-const ApiKeyStorageKey : String = "openseek.deepseek_api_key"
+/// Legacy localStorage keys from when the page stored the engine endpoint
+/// settings itself. Those now live on the host (`settings.get`/`set`); the
+/// keys remain only so the desktop window can migrate stored values up once
+/// and every page can purge the leftover secrets.
+const LegacyApiKeyStorageKey : String = "openseek.deepseek_api_key"
 
 ///|
-const CustomApiKeyStorageKey : String = "openseek.custom_api_key"
+const LegacyCustomApiKeyStorageKey : String = "openseek.custom_api_key"
 
 ///|
-const ApiProviderStorageKey : String = "openseek.api_provider"
+const LegacyApiProviderStorageKey : String = "openseek.api_provider"
 
 ///|
-const CustomApiUrlStorageKey : String = "openseek.custom_api_url"
+const LegacyCustomApiUrlStorageKey : String = "openseek.custom_api_url"
 
 ///|
-const WslEnabledStorageKey : String = "openseek.wsl_enabled"
+const LegacyWslEnabledStorageKey : String = "openseek.wsl_enabled"
 
 ///|
-const WslDistroStorageKey : String = "openseek.wsl_distro"
+const LegacyWslDistroStorageKey : String = "openseek.wsl_distro"
 
 ///|
-const WslEngineStorageKey : String = "openseek.wsl_engine"
+const LegacyWslEngineStorageKey : String = "openseek.wsl_engine"
 
 ///|
 const NotificationCornerStorageKey : String = "openseek.notification_corner"
@@ -38,20 +42,13 @@ const TreeLayoutStorageKey : String = "openseek.tree_layout"
 const UpdateChannelStorageKey : String = "openseek.update_channel"
 
 ///|
-/// The default OpenSeek endpoint: a DeepSeek-compatible proxy that does not
-/// require a user API key, so the app works out of the box. The path mirrors
-/// the official API because the engine posts to this URL verbatim. The host
-/// recognizes this URL by prefix (`OpenseekProxyPrefix` in
-/// `internal/engine/config.mbt`) and authenticates with the packaged client
-/// token — keep the two constants in sync.
-const OpenseekApiUrl : String = "https://openseek-api.moonbitlang.cn/chat/completions"
-
-///|
 /// Which chat-completions endpoint the engine talks to. `Openseek` is the
 /// zero-config default — the proxy does not validate API keys. `Deepseek` is
 /// the official endpoint and needs the user's own key. `Custom` is any other
 /// DeepSeek-compatible endpoint; whether it needs a key is the endpoint's
-/// business, so the key is optional there.
+/// business, so the key is optional there. The setting (and its
+/// credentials) live on the host; this mirror is what `settings.get`/`set`
+/// replies and the `settings.changed` broadcast last reported.
 priv enum ApiProvider {
   Openseek
   Deepseek
@@ -118,7 +115,7 @@ priv enum RunPhase {
   // Send accepted: the start op is in flight and no run id exists yet.
   Starting
   // The host's `started` event opened run `run_id`.
-  Open(run_id~ : Int, stage~ : TurnStage)
+  Open(run_id~ : String, stage~ : TurnStage)
 }
 
 ///|
@@ -175,7 +172,7 @@ priv struct Conversation {
   // finishes. Compaction is requested while the engine is idle, so its
   // engine events arrive stamped with this id once the run phase is already
   // back to `NoRun`; routing them needs the retained id.
-  last_run_id : Int?
+  last_run_id : String?
   // Where this conversation's compaction stands; see `CompactionPhase`.
   compaction : CompactionPhase
   // A run finished while this conversation was off screen and the user has
@@ -323,23 +320,37 @@ priv struct Model {
   bridge : BridgeState
   selected_model : String
   max_steps : String
-  api_key : String
-  custom_api_key : String
+  // Whether the host has a key stored for each keyed provider. The key text
+  // itself never reaches a client — the Settings page only needs presence
+  // (placeholder wording, the ready gate); a new key is staged in
+  // `setup_api_key` until saved through `settings.set`.
+  deepseek_key_saved : Bool
+  custom_key_saved : Bool
   setup_api_key : String
   // Which endpoint the engine talks to; `custom_api_url` only matters when
-  // the provider is `Custom`. Provider and URL persist as they change; keys
-  // are provider-specific and staged in `setup_api_key` until saved.
+  // the provider is `Custom`. Both mirror the host's settings store and are
+  // edited through `settings.set`.
   api_provider : ApiProvider
   custom_api_url : String
-  // Run the serve engine inside WSL instead of natively. Windows-only:
-  // `is_windows` (probed from the user agent once at startup) gates both
-  // the settings section and what `start` sends. `wsl_distro` empty means
-  // the user's default distro; `wsl_engine` empty means `openseek` on the
-  // distro's PATH. All three persist to localStorage as they change.
-  is_windows : Bool
+  // Host-settings writes still in flight. While any are, incoming
+  // `settings.changed` broadcasts and `settings.get` replies are stale by
+  // construction (they may predate the pending write) and are dropped; the
+  // last write's own reply reconciles the mirror.
+  settings_saves : Int
+  // A legacy localStorage migration's push is in flight; its success is
+  // what deletes the migrated secrets from localStorage.
+  legacy_cleanup_pending : Bool
+  // Run the serve engine inside WSL instead of natively. Windows-host-only:
+  // `host_wsl` (the host's own capability, from `host.meta` at bridge time —
+  // the page may run on any device while the engine runs on the host) gates
+  // both the settings section and what `start` sends. `wsl_distro` empty
+  // means the user's default distro; `wsl_engine` empty means `openseek` on
+  // the distro's PATH. The three settings persist to localStorage as they
+  // change.
+  host_wsl : Bool
   // Whether this page is the desktop window (the proton webview) rather than
-  // a browser reached through a relay. Probed once at startup, like
-  // `is_windows`. Gates the self-update flow: applying an update swaps the
+  // a browser reached through a relay. Probed once at startup. Gates the
+  // self-update flow: applying an update swaps the
   // bundle under the desktop process and relaunches through the window's
   // close path — from a browser tab, `window.close()` exits nothing, and the
   // update would yank the app out from under whoever is at the machine.
@@ -496,24 +507,56 @@ priv enum LauncherApps {
 }
 
 ///|
+/// One `settings.get`/`settings.set` reply (or `settings.changed`
+/// broadcast), decoded: the host's engine endpoint settings, with key
+/// material reduced to presence.
+priv struct HostSettings {
+  provider : String
+  custom_api_url : String
+  has_deepseek_key : Bool
+  has_custom_key : Bool
+  wsl_enabled : Bool
+  wsl_distro : String
+  wsl_engine : String
+}
+
+///|
 priv enum Msg {
   Init
   BridgeReady
   BridgeUnavailable(String)
-  // Persisted settings read back from localStorage at startup. `provider`
-  // is the wire name (`ApiProvider::parse` handles unknown values); the WSL
-  // fields arrive as the raw stored strings (`wsl_enabled` is "1"/"").
+  // The host's `host.meta` reply: whether the host itself can run the engine
+  // inside WSL (a Windows host). The page's own platform says nothing — a
+  // phone browser may drive a Windows host and a Windows browser a Mac one.
+  HostMetaLoaded(wsl~ : Bool)
+  // UI preferences read back from localStorage at startup. Engine endpoint
+  // settings are the host's (`HostSettingsLoaded`); only page-local looks
+  // live here.
   SettingsLoaded(
+    notification_corner~ : String,
+    tree_layout~ : String,
+    update_channel~ : String
+  )
+  // The host's settings, from a `settings.get` reply or a peer client's
+  // edit broadcast as `settings.changed`. Applied only while no local write
+  // is in flight — see `Model::settings_saves`.
+  HostSettingsLoaded(HostSettings)
+  // A `settings.set` this client sent came back with the post-write state.
+  HostSettingsApplied(HostSettings)
+  // A `settings.set` this client sent failed; the message pops as a toast.
+  HostSettingsSaveFailed(String)
+  // The legacy localStorage engine settings, read at bridge time. The
+  // desktop window migrates them up to the host once; a browser page only
+  // purges them (a stale secret in shared storage is the leak this design
+  // removes).
+  LegacySettingsRead(
     provider~ : String,
     custom_url~ : String,
     api_key~ : String,
     custom_api_key~ : String,
     wsl_enabled~ : String,
     wsl_distro~ : String,
-    wsl_engine~ : String,
-    notification_corner~ : String,
-    tree_layout~ : String,
-    update_channel~ : String
+    wsl_engine~ : String
   )
   TaskChanged(String)
   // Move the completion menu's highlight by a delta (−1 up, +1 down), wrapping
@@ -621,11 +664,14 @@ priv enum Msg {
   SessionRotated(String)
   SessionsLoaded(Array[@transcript.SessionListItem])
   SessionsFailed(String)
+  // The host's `session.changed` broadcast: another client archived or
+  // unarchived a conversation, so both sidebar lists must be re-read.
+  SessionsChanged
   OpenSession(String)
   // The user clicked the system notification a finished run posted: jump to
   // the conversation that owned that run (the window itself is already
   // brought forward natively).
-  NotificationClicked(run_id~ : Int)
+  NotificationClicked(run_id~ : String)
   SessionLoaded(session~ : String, items~ : Array[@transcript.TranscriptItem])
   // Loading a stored session failed before its conversation ever existed
   // (bridge call errored, or the data was malformed): pops an error toast
@@ -705,7 +751,7 @@ priv enum Msg {
   // `task` is the prompt text — a client that did not send it (another
   // window, a mid-run join) has no other live source for the prompt bubble.
   Started(
-    run_id~ : Int,
+    run_id~ : String,
     session~ : String,
     model~ : String,
     max_steps~ : Int,
@@ -716,13 +762,14 @@ priv enum Msg {
   // conversation still showing an open run this set lacks ended while the
   // client was away — its terminal event is gone for good (reconnect =
   // resync; transients are not replayed), so this is what closes it.
-  RunsSettled(live~ : Array[Int])
-  // A stream event from `run_id`'s engine. `session` is the conversation the
-  // host stamped on it (`None` when the payload carries no stamp): idle
-  // events (the compaction lifecycle, background notices) route by it,
-  // because a conversation compacted before its first prompt of this
+  RunsSettled(live~ : Array[String])
+  // A stream event from an engine. The run id is `None` for events emitted
+  // before any run of the engine process's lifetime. `session` is the
+  // conversation the host stamped on it (`None` when the payload carries no
+  // stamp): idle events (the compaction lifecycle, background notices) route
+  // by it, because a conversation compacted before its first prompt of this
   // app-lifetime has no run id to match.
-  Engine(Int, @transcript.EngineEvent, session~ : String?)
+  Engine(String?, @transcript.EngineEvent, session~ : String?)
   // The editor side-panel's own messages (tree, viewer, diagnostics,
   // comments), routed to the `fileeditor` package's update. The one
   // exception is `EditorCommentAdded`, which this update intercepts: the
@@ -735,14 +782,14 @@ priv enum Msg {
   // A host error without a run (`run_id` is `None` — a pre-run failure)
   // belongs to whatever conversation the user is looking at; `diagnostics`
   // is stderr worth appending, when the host captured any.
-  Error(run_id~ : Int?, message~ : String, diagnostics~ : String?)
+  Error(run_id~ : String?, message~ : String, diagnostics~ : String?)
   // The `compact` bridge request itself was rejected (no engine, host error):
   // nothing will report compaction events, so the conversation's queued /
   // in-flight compaction notice must be cleared here, not by the stream.
   CompactRejected(session~ : String, message~ : String)
   // `answer` accompanies normal success and context yield (where it is
   // continuation guidance); other terminal statuses carry none.
-  Finished(run_id~ : Int, status~ : String, answer~ : String?)
+  Finished(run_id~ : String, status~ : String, answer~ : String?)
 }
 
 ///|
@@ -800,12 +847,14 @@ fn initial_model() -> Model {
     bridge: Connecting,
     selected_model: DefaultModel,
     max_steps: DefaultMaxSteps,
-    api_key: "",
-    custom_api_key: "",
+    deepseek_key_saved: false,
+    custom_key_saved: false,
     setup_api_key: "",
     api_provider: Openseek,
     custom_api_url: "",
-    is_windows: host_is_windows(),
+    settings_saves: 0,
+    legacy_cleanup_pending: false,
+    host_wsl: false,
     is_desktop: @interop.using_proton_bridge(),
     wsl_enabled: false,
     wsl_distro: "",
@@ -856,46 +905,35 @@ fn Model::skill_installed(self : Model, source : String) -> Bool {
 }
 
 ///|
+/// Fold one host settings payload into the mirror. The default provider
+/// needs no setup, so the Settings page only takes over when the settings
+/// are incomplete (official endpoint without a key, custom endpoint without
+/// a URL); it never navigates away on its own.
+fn Model::apply_host_settings(self : Model, settings : HostSettings) -> Model {
+  let next = {
+    ..self,
+    api_provider: ApiProvider::parse(settings.provider),
+    custom_api_url: settings.custom_api_url,
+    deepseek_key_saved: settings.has_deepseek_key,
+    custom_key_saved: settings.has_custom_key,
+    wsl_enabled: settings.wsl_enabled,
+    wsl_distro: settings.wsl_distro,
+    wsl_engine: settings.wsl_engine,
+  }
+  { ..next, screen: if next.api_ready() { next.screen } else { Settings } }
+}
+
+///|
 /// Whether the configured endpoint is usable as it stands: the default
-/// OpenSeek proxy always is, the official endpoint needs the user's key, and
-/// a custom endpoint needs at least a URL.
+/// OpenSeek proxy always is, the official endpoint needs a key stored on
+/// the host, and a custom endpoint needs at least a URL. The credentials
+/// themselves live on the host; a start carries none.
 fn Model::api_ready(self : Model) -> Bool {
   match self.api_provider {
     Openseek => true
-    Deepseek => !self.api_key.trim().is_empty()
+    Deepseek => self.deepseek_key_saved
     Custom => !self.custom_api_url.trim().is_empty()
   }
-}
-
-///|
-/// The endpoint sent with `start`; empty means the engine's built-in default
-/// (the official DeepSeek endpoint).
-fn Model::effective_api_url(self : Model) -> String {
-  match self.api_provider {
-    Openseek => OpenseekApiUrl
-    Deepseek => ""
-    Custom => self.custom_api_url.trim().to_owned()
-  }
-}
-
-///|
-/// The key sent with `start`. OpenSeek ignores keys; DeepSeek and Custom keep
-/// separate credentials so switching endpoints never leaks one host's secret to
-/// another.
-fn Model::effective_api_key(self : Model) -> String {
-  match self.api_provider {
-    Openseek => ""
-    Deepseek => self.api_key
-    Custom => self.custom_api_key
-  }
-}
-
-///|
-/// Whether `start` should ask for a WSL-hosted engine. The setting only
-/// applies on Windows, so a stored profile read back on another platform
-/// degrades to the native engine instead of failing every run.
-fn Model::wsl_active(self : Model) -> Bool {
-  self.is_windows && self.wsl_enabled
 }
 
 ///|
@@ -1008,7 +1046,7 @@ fn Model::replace_conversation(self : Model, conv : Conversation) -> Model {
 ///|
 /// The conversation that owns run `run_id`. Engine events route by run id,
 /// so a backgrounded conversation keeps receiving its own stream.
-fn Model::conversation_by_run(self : Model, run_id : Int) -> Conversation? {
+fn Model::conversation_by_run(self : Model, run_id : String) -> Conversation? {
   for conv in self.conversations {
     if conv.run is Open(run_id=active, ..) && active == run_id {
       return Some(conv)
@@ -1021,7 +1059,10 @@ fn Model::conversation_by_run(self : Model, run_id : Int) -> Conversation? {
 /// The conversation that most recently owned run `run_id`, matched even after
 /// the run finished. Used to route compaction events, which the engine stamps
 /// with its last run id while sitting idle between turns.
-fn Model::conversation_by_last_run(self : Model, run_id : Int) -> Conversation? {
+fn Model::conversation_by_last_run(
+  self : Model,
+  run_id : String,
+) -> Conversation? {
   for conv in self.conversations {
     if conv.last_run_id is Some(last) && last == run_id {
       return Some(conv)

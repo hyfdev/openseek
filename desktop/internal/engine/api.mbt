@@ -11,16 +11,19 @@ impl Show for EngineError with fn output(self, logger) {
 }
 
 ///|
-pub(all) struct WslRequest {
+/// The engine-host input `settings_wsl_request` builds from the stored
+/// settings; requests no longer carry it.
+priv struct WslRequest {
   distro : String?
   engine : String?
 }
 
 ///|
+/// The endpoint (provider, credentials) and the WSL preference are the
+/// host-owned settings' business — a start names only the work and where it
+/// runs.
 pub(all) struct StartRequest {
   task : String
-  api_key : String?
-  api_url : String?
   model : String?
   max_steps : Int?
   session : String?
@@ -29,18 +32,17 @@ pub(all) struct StartRequest {
   // project itself and the session's durable record lands in its in-project
   // store. Overrides the derived scratch cwd and `session_root`.
   workspace : String?
-  wsl : WslRequest?
 }
 
 ///|
 pub(all) struct CancelRequest {
-  run_id : Int?
+  run_id : String?
 }
 
 ///|
 pub(all) struct SteerRequest {
   text : String
-  run_id : Int?
+  run_id : String?
 }
 
 ///|
@@ -52,13 +54,10 @@ pub(all) struct CompactRequest {
   // The same engine settings a start carries (minus the task): a conversation
   // resumed after a restart has no live serve process, and compacting it
   // spawns one on the durable session with exactly these settings.
-  api_key : String?
-  api_url : String?
   model : String?
   max_steps : Int?
   session_root : String?
   workspace : String?
-  wsl : WslRequest?
 }
 
 ///|
@@ -71,7 +70,7 @@ pub(all) struct LoadSessionRequest {
 
 ///|
 struct StartReply {
-  run_id : Int
+  run_id : String
   status : String
   exit_code : Int
 } derive(ToJson)
@@ -79,13 +78,13 @@ struct StartReply {
 ///|
 struct CancelReply {
   cancelled : Bool
-  run_id : Int?
+  run_id : String?
 } derive(ToJson)
 
 ///|
 struct SteerReply {
   steered : Bool
-  run_id : Int?
+  run_id : String?
 } derive(ToJson)
 
 ///|
@@ -137,7 +136,7 @@ struct ConnectedPayload {
 
 ///|
 struct StartedPayload {
-  run_id : Int
+  run_id : String
   task : String
   engine : String
   model : String
@@ -149,7 +148,9 @@ struct StartedPayload {
 
 ///|
 struct EventPayload {
-  run_id : Int
+  // The run this event belongs to — absent for events the engine emits
+  // before any run of this process's lifetime (a spawn for compaction).
+  run_id : String?
   // The conversation the event belongs to (the engine's session key, "" for
   // a session-less engine). Idle events — the compaction lifecycle and
   // background notices — are routed by it: run-id routing needs a `Started`
@@ -161,7 +162,7 @@ struct EventPayload {
 
 ///|
 pub struct FinishedPayload {
-  run_id : Int
+  run_id : String
   status : String
   answer : String?
   exit_code : Int?
@@ -169,7 +170,7 @@ pub struct FinishedPayload {
 
 ///|
 struct ErrorPayload {
-  run_id : Int?
+  run_id : String?
   message : String
   exit_code : Int?
   diagnostics : String?
@@ -218,7 +219,7 @@ async fn emit(sink : EventSink, event : EngineEvent) -> Unit {
 async fn emit_error(
   sink : EventSink,
   message : String,
-  run_id? : Int,
+  run_id? : String,
   exit_code? : Int,
   diagnostics? : String,
 ) -> Unit {
@@ -228,7 +229,7 @@ async fn emit_error(
 ///|
 async fn emit_finished(
   sink : EventSink,
-  run_id : Int,
+  run_id : String,
   status : RunStatus,
   answer? : String,
   exit_code? : Int,

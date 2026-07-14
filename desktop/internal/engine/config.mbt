@@ -34,19 +34,19 @@ priv struct RunConfig {
 }
 
 ///|
-/// The official OpenSeek proxy; must stay a prefix of the frontend's
-/// `OpenseekApiUrl`. Endpoints under it authenticate with the packaged
-/// client token instead of a user API key.
+/// The official OpenSeek proxy; must stay a prefix of `OpenseekProxyUrl`.
+/// Endpoints under it authenticate with the packaged client token instead
+/// of a user API key.
 const OpenseekProxyPrefix : String = "https://openseek-api.moonbitlang.cn/"
 
 ///|
 fn configured_api_key(
-  payload_key : String?,
+  stored_key : String?,
   api_url : String?,
   deepseek_env : String?,
   client_token? : String,
 ) -> String raise EngineError {
-  if payload_key is Some(value) {
+  if stored_key is Some(value) {
     return value
   }
   if api_url is Some(url) {
@@ -61,7 +61,7 @@ fn configured_api_key(
     return value
   }
   raise EngineError(
-    "DeepSeek API key is required; pass api_key or set DEEPSEEK",
+    "DeepSeek API key is required; add it in Settings or set DEEPSEEK",
   )
 }
 
@@ -83,20 +83,20 @@ fn configured_max_steps(value : Int?) -> Int raise EngineError {
 }
 
 ///|
-async fn run_config(payload : StartRequest, engine : String) -> RunConfig {
+async fn run_config(
+  manager : EngineManager,
+  payload : StartRequest,
+) -> RunConfig {
   let task = payload.task.trim().to_owned()
   guard !task.is_empty() else { raise EngineError("task must not be empty") }
   serve_config(
     task,
-    engine,
-    api_key?=payload.api_key,
-    api_url?=payload.api_url,
+    manager,
     model?=payload.model,
     max_steps?=payload.max_steps,
     session?=payload.session,
     session_root?=payload.session_root,
     workspace?=payload.workspace,
-    wsl?=payload.wsl,
   )
 }
 
@@ -106,49 +106,42 @@ async fn run_config(payload : StartRequest, engine : String) -> RunConfig {
 /// the same settings a start carries, pinned to the compacted session. The
 /// blank task is never sent — `compact_run` writes only the compact command,
 /// and the fingerprint deliberately excludes the task.
-async fn compact_config(payload : CompactRequest, engine : String) -> RunConfig {
+async fn compact_config(
+  manager : EngineManager,
+  payload : CompactRequest,
+) -> RunConfig {
   guard !payload.session.is_empty() else {
     raise EngineError("session id must not be empty")
   }
   serve_config(
     "",
-    engine,
-    api_key?=payload.api_key,
-    api_url?=payload.api_url,
+    manager,
     model?=payload.model,
     max_steps?=payload.max_steps,
     session=payload.session,
     session_root?=payload.session_root,
     workspace?=payload.workspace,
-    wsl?=payload.wsl,
   )
 }
 
 ///|
 /// The validated configuration shared by every op that can spawn a serve
-/// engine.
+/// engine. The endpoint (provider, key, URL) and the WSL preference come
+/// from the host-owned settings store, never from the request — a client
+/// carries no credentials (docs/remote-protocol.md).
 async fn serve_config(
   task : String,
-  engine : String,
-  api_key? : String,
-  api_url? : String,
+  manager : EngineManager,
   model? : String,
   max_steps? : Int,
   session? : String,
   session_root? : String,
   workspace? : String,
-  wsl? : WslRequest,
 ) -> RunConfig {
-  // Only the official endpoint strictly needs a key; a custom endpoint
-  // decides for itself, so a missing key becomes a placeholder there. Do
-  // not reuse the official DeepSeek env key for a custom/OpenSeek endpoint.
-  let api_key = configured_api_key(
-    api_key,
-    api_url,
-    @env.get("DEEPSEEK"),
-    client_token?=openseek_client_token(),
-  )
-  let host = engine_host(wsl, engine)
+  let engine = manager.engine
+  let settings = load_engine_settings(manager.runtime_dir)
+  let (api_key, api_url) = resolved_endpoint(settings)
+  let host = engine_host(settings_wsl_request(settings), engine)
   // A workspace run happens in the project directory itself, with the
   // session's durable record in the in-project store. Only registered
   // workspaces qualify — the registry, not the payload, decides which
@@ -369,37 +362,26 @@ test "official endpoint still uses DEEPSEEK env fallback" {
 }
 
 ///|
-async test "desktop start ignores OPENSEEK_API_URL without an explicit payload URL" {
+/// The endpoint comes from the settings store, never the process
+/// environment: an `OPENSEEK_API_URL` exported in the launching shell must
+/// not redirect the zero-config provider away from the proxy.
+async test "run config ignores OPENSEEK_API_URL in favor of the settings" {
   let previous = @sys.get_env_var("OPENSEEK_API_URL")
   @sys.set_env_var("OPENSEEK_API_URL", "https://env.example/chat/completions")
-  let config = run_config(
-    {
-      task: "hello",
-      api_key: Some("official-key"),
-      api_url: None,
-      model: None,
-      max_steps: None,
-      session: None,
-      session_root: None,
-      workspace: None,
-      wsl: None,
-    },
-    "openseek",
-  ) catch {
-    error => {
-      if previous is Some(value) {
-        @sys.set_env_var("OPENSEEK_API_URL", value)
-      } else {
-        @sys.unset_env_var("OPENSEEK_API_URL")
-      }
-      raise error
-    }
-  }
-  if previous is Some(value) {
+  defer (if previous is Some(value) {
     @sys.set_env_var("OPENSEEK_API_URL", value)
   } else {
     @sys.unset_env_var("OPENSEEK_API_URL")
-  }
-  assert_true(config.api_url is None)
-  assert_eq(config.api_key, "official-key")
+  })
+  // No settings file at all: the default provider is the OpenSeek proxy.
+  let manager = new_engine_manager("openseek")
+  let config = run_config(manager, {
+    task: "hello",
+    model: None,
+    max_steps: None,
+    session: None,
+    session_root: None,
+    workspace: None,
+  })
+  assert_true(config.api_url is Some(OpenseekProxyUrl))
 }

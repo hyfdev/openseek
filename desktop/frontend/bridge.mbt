@@ -28,6 +28,9 @@ fn bridge_msg(method_ : String, payload : Map[String, Json]) -> Msg? {
     "agent.event" => engine_msg(payload)
     "agent.error" => error_msg(payload)
     "agent.finished" => finished_msg(payload)
+    "session.changed" => Some(SessionsChanged)
+    "settings.changed" =>
+      decode_host_settings(payload).map(settings => HostSettingsLoaded(settings))
     "lsp.diagnostics" => diagnostics_msg(payload)
     "fs.changed" => fs_changed_msg(payload)
     _ => None
@@ -128,7 +131,7 @@ fn wire_proton_events(
     method_ in (
       [
         "agent.connected", "agent.started", "agent.event", "agent.error", "agent.finished",
-        "lsp.diagnostics", "fs.changed",
+        "session.changed", "settings.changed", "lsp.diagnostics", "fs.changed",
       ] : Array[String]) {
     on("openseek." + method_, payload => bridge_msg(method_, payload))
   }
@@ -232,10 +235,10 @@ fn fetch_runs(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
         _ => return
       }
       guard json is { "runs": Array(runs), .. } else { return }
-      let live : Array[Int] = []
+      let live : Array[String] = []
       for item in runs {
         guard item is Object(fields) else { continue }
-        if @jsonx.json_int(fields, "run_id") is Some(run_id) {
+        if @jsonx.json_text(fields, "run_id") is Some(run_id) {
           live.push(run_id)
         }
         if started_msg(fields) is Some(msg) {
@@ -248,13 +251,35 @@ fn fetch_runs(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
 }
 
 ///|
+/// Ask the host what it is: today only whether it can run the engine inside
+/// WSL (a Windows host). The page's own user agent says nothing about the
+/// host, so the capability must come over the wire. A failed or malformed
+/// reply leaves the default (no WSL) in place.
+fn fetch_host_meta(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+  @cmd.custom_cmd(scheduler => {
+    @js.async_run(() => {
+      let reply = @interop.bridge_request(
+        "host.meta",
+        @js.Object::new().to_value(),
+      ) catch {
+        _ => return
+      }
+      let json = @json.parse(@interop.reply_json_text(reply)) catch {
+        _ => return
+      }
+      scheduler.add(dispatch(HostMetaLoaded(wsl=json is { "wsl": true, .. })))
+    })
+  })
+}
+
+///|
 fn started_msg(payload : Map[String, Json]) -> Msg? {
   // `run_id`/`session`/`model`/`max_steps` are unconditional on this event
   // (the app's own start op always names a session); a payload missing one
   // is malformed and dropped. `cwd` is genuinely optional — omitted for a
   // scratch conversation — and the host resolved it itself, so this is the
   // decode boundary where its absolute provenance is collapsed into the type.
-  guard @jsonx.json_int(payload, "run_id") is Some(run_id) &&
+  guard @jsonx.json_text(payload, "run_id") is Some(run_id) &&
     @jsonx.json_text(payload, "session") is Some(session) &&
     @jsonx.json_text(payload, "model") is Some(model) &&
     @jsonx.json_int(payload, "max_steps") is Some(max_steps) else {
@@ -274,12 +299,18 @@ fn started_msg(payload : Map[String, Json]) -> Msg? {
 
 ///|
 fn engine_msg(payload : Map[String, Json]) -> Msg? {
-  guard @jsonx.json_int(payload, "run_id") is Some(run_id) &&
-    payload.get("event") is Some(Object(raw)) else {
-    return None
-  }
+  guard payload.get("event") is Some(Object(raw)) else { return None }
   guard @transcript.decode_engine_event(raw) is Some(event) else { return None }
-  Some(Engine(run_id, event, session=@jsonx.json_text(payload, "session")))
+  // `run_id` is absent for events the engine emits before any run of its
+  // process lifetime (a compaction on a freshly spawned engine); those still
+  // route by `session`.
+  Some(
+    Engine(
+      @jsonx.json_text(payload, "run_id"),
+      event,
+      session=@jsonx.json_text(payload, "session"),
+    ),
+  )
 }
 
 ///|
@@ -298,7 +329,7 @@ fn error_msg(payload : Map[String, Json]) -> Msg? {
   }
   Some(
     Error(
-      run_id=@jsonx.json_int(payload, "run_id"),
+      run_id=@jsonx.json_text(payload, "run_id"),
       message~,
       diagnostics=@jsonx.json_text(payload, "diagnostics"),
     ),
@@ -308,7 +339,7 @@ fn error_msg(payload : Map[String, Json]) -> Msg? {
 ///|
 fn finished_msg(payload : Map[String, Json]) -> Msg? {
   // `answer` is present only when the agent finished with one.
-  guard @jsonx.json_int(payload, "run_id") is Some(run_id) &&
+  guard @jsonx.json_text(payload, "run_id") is Some(run_id) &&
     @jsonx.json_text(payload, "status") is Some(status) else {
     return None
   }
@@ -343,12 +374,14 @@ fn fs_changed_msg(_payload : Map[String, Json]) -> Msg? {
 }
 
 ///|
-/// A clicked notification's payload is the decimal run id `notify.mbt`
-/// stamped on it; anything unparsable is dropped (a stale notification from
-/// an older build, or a payload another surface posted).
+/// A clicked notification's payload is the run id `notify.mbt` stamped on
+/// it; an empty payload is dropped (a stale notification from an older
+/// build, or a payload another surface posted).
 fn notification_clicked_msg(payload : Map[String, Json]) -> Msg? {
-  guard @jsonx.json_text(payload, "payload") is Some(text) else { return None }
-  let run_id = @string.parse_int(text) catch { _ => return None }
+  guard @jsonx.json_text(payload, "payload") is Some(run_id) &&
+    !run_id.is_empty() else {
+    return None
+  }
   Some(NotificationClicked(run_id~))
 }
 
@@ -358,25 +391,15 @@ fn start_openseek(
   task : String,
   selected_model : String,
   max_steps : String,
-  api_key : String,
-  api_url : String,
   session : String,
   workspace~ : @pathx.Absolute?,
-  wsl_enabled~ : Bool,
-  wsl_distro~ : String,
-  wsl_engine~ : String,
 ) -> @cmd.Cmd {
   let payload = start_payload(
     task,
     selected_model,
     max_steps,
-    api_key,
-    api_url,
     session,
     workspace~,
-    wsl_enabled~,
-    wsl_distro~,
-    wsl_engine~,
   )
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
@@ -396,21 +419,17 @@ fn start_openseek(
 
 ///|
 /// The start payload. Optional fields are trimmed and omitted when blank —
-/// the host documents that a present field always carries non-blank text —
-/// and it carries no `cwd`: `workspace` (the conversation's attached project,
-/// omitted for scratch conversations) is the only placement the host takes;
-/// everything else it derives from the session id.
+/// the host documents that a present field always carries non-blank text.
+/// It carries no `cwd` (`workspace`, the conversation's attached project,
+/// is the only placement the host takes; everything else it derives from
+/// the session id) and no credentials or WSL preference — the endpoint is
+/// resolved host-side from the settings store.
 fn start_payload(
   task : String,
   selected_model : String,
   max_steps : String,
-  api_key : String,
-  api_url : String,
   session : String,
   workspace~ : @pathx.Absolute?,
-  wsl_enabled~ : Bool,
-  wsl_distro~ : String,
-  wsl_engine~ : String,
 ) -> @js.Value {
   let payload = @js.Object::new()
   payload["task"] = task
@@ -418,13 +437,8 @@ fn start_payload(
     payload,
     model=selected_model,
     max_steps~,
-    api_key~,
-    api_url~,
     session~,
     workspace?,
-    wsl_enabled~,
-    wsl_distro~,
-    wsl_engine~,
   )
   payload.to_value()
 }
@@ -436,30 +450,14 @@ fn set_engine_settings(
   payload : @js.Object,
   model~ : String,
   max_steps~ : String,
-  api_key~ : String,
-  api_url~ : String,
   session~ : String,
   workspace? : @pathx.Absolute,
-  wsl_enabled~ : Bool,
-  wsl_distro~ : String,
-  wsl_engine~ : String,
 ) -> Unit {
   @interop.set_trimmed(payload, "model", model)
-  @interop.set_trimmed(payload, "api_key", api_key)
-  @interop.set_trimmed(payload, "api_url", api_url)
   @interop.set_trimmed(payload, "session", session)
   @interop.set_workspace(payload, workspace)
   if parsed_max_steps(max_steps) is Some(steps) {
     payload["max_steps"] = steps
-  }
-  // The presence of `wsl` is the opt-in; blank distro/engine fields are
-  // omitted so the host applies its defaults (default distro, `openseek`
-  // on the distro's PATH).
-  if wsl_enabled {
-    let wsl = @js.Object::new()
-    @interop.set_trimmed(wsl, "distro", wsl_distro)
-    @interop.set_trimmed(wsl, "engine", wsl_engine)
-    payload["wsl"] = wsl.to_value()
   }
 }
 
@@ -565,7 +563,7 @@ fn steer_openseek(
   dispatch : @cmd.Emit[Msg],
   session : String,
   text : String,
-  run_id : Int,
+  run_id : String,
 ) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
@@ -578,7 +576,7 @@ fn steer_openseek(
 }
 
 ///|
-async fn steer_delivered(text : String, run_id : Int) -> Bool {
+async fn steer_delivered(text : String, run_id : String) -> Bool {
   let payload = @js.Object::new()
   payload["text"] = text
   payload["run_id"] = run_id
@@ -600,26 +598,10 @@ fn compact_openseek(
   session~ : String,
   model~ : String,
   max_steps~ : String,
-  api_key~ : String,
-  api_url~ : String,
   workspace? : @pathx.Absolute,
-  wsl_enabled~ : Bool,
-  wsl_distro~ : String,
-  wsl_engine~ : String,
 ) -> @cmd.Cmd {
   let payload = @js.Object::new()
-  set_engine_settings(
-    payload,
-    model~,
-    max_steps~,
-    api_key~,
-    api_url~,
-    session~,
-    workspace?,
-    wsl_enabled~,
-    wsl_distro~,
-    wsl_engine~,
-  )
+  set_engine_settings(payload, model~, max_steps~, session~, workspace?)
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let _ : @js.Value = @interop.bridge_request(
@@ -646,7 +628,7 @@ fn compact_openseek(
 }
 
 ///|
-fn cancel_openseek(dispatch : @cmd.Emit[Msg], run_id : Int) -> @cmd.Cmd {
+fn cancel_openseek(dispatch : @cmd.Emit[Msg], run_id : String) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let payload = @js.Object::new()

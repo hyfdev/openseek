@@ -1,5 +1,6 @@
 import {
   "bobzhang/jsonl",
+  "openseek_desktop/internal/entropy",
   "openseek_desktop/internal/env",
   "openseek_desktop/internal/event",
   "openseek_desktop/internal/fsx",

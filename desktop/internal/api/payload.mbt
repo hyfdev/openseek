@@ -5,47 +5,29 @@
 ///|
 priv struct StartPayload {
   task : String
-  api_key : String?
-  api_url : String?
   model : String?
   max_steps : Int?
   session : String?
   session_root : String?
   // A registered workspace directory to run in; absent = scratch workspace.
   workspace : String?
-  // Present = run the engine inside WSL (Windows only); absent = native.
-  wsl : WslPayload?
 } derive(FromJson)
-
-///|
-priv struct WslPayload {
-  distro : String?
-  engine : String?
-} derive(FromJson)
-
-///|
-fn WslPayload::to_request(self : WslPayload) -> @engine.WslRequest {
-  { distro: self.distro, engine: self.engine }
-}
 
 ///|
 fn StartPayload::to_request(self : StartPayload) -> @engine.StartRequest {
   {
     task: self.task,
-    api_key: self.api_key,
-    api_url: self.api_url,
     model: self.model,
     max_steps: self.max_steps,
     session: self.session,
     session_root: self.session_root,
     workspace: self.workspace,
-    wsl: self.wsl.map(wsl => wsl.to_request()),
   }
 }
 
 ///|
 priv struct CancelPayload {
-  run_id : Int?
+  run_id : String?
 } derive(FromJson)
 
 ///|
@@ -56,7 +38,7 @@ fn CancelPayload::to_request(self : CancelPayload) -> @engine.CancelRequest {
 ///|
 priv struct SteerPayload {
   text : String
-  run_id : Int?
+  run_id : String?
 } derive(FromJson)
 
 ///|
@@ -70,26 +52,56 @@ fn SteerPayload::to_request(self : SteerPayload) -> @engine.SteerRequest {
 /// compacting it spawns one with these settings.
 priv struct CompactPayload {
   session : String
-  api_key : String?
-  api_url : String?
   model : String?
   max_steps : Int?
   session_root : String?
   workspace : String?
-  wsl : WslPayload?
 } derive(FromJson)
 
 ///|
 fn CompactPayload::to_request(self : CompactPayload) -> @engine.CompactRequest {
   {
     session: self.session,
-    api_key: self.api_key,
-    api_url: self.api_url,
     model: self.model,
     max_steps: self.max_steps,
     session_root: self.session_root,
     workspace: self.workspace,
-    wsl: self.wsl.map(wsl => wsl.to_request()),
+  }
+}
+
+///|
+/// `settings.set`: every field optional (absent = unchanged); a present
+/// string field is trimmed, and empty clears the stored value; a present
+/// `wsl` replaces the whole group.
+priv struct SettingsSetPayload {
+  provider : String?
+  custom_api_url : String?
+  deepseek_api_key : String?
+  custom_api_key : String?
+  wsl : SettingsWslPayload?
+} derive(FromJson)
+
+///|
+priv struct SettingsWslPayload {
+  enabled : Bool
+  distro : String?
+  engine : String?
+} derive(FromJson)
+
+///|
+fn SettingsSetPayload::to_patch(
+  self : SettingsSetPayload,
+) -> @engine.SettingsPatch {
+  {
+    provider: self.provider,
+    custom_api_url: self.custom_api_url,
+    deepseek_api_key: self.deepseek_api_key,
+    custom_api_key: self.custom_api_key,
+    wsl: self.wsl.map(wsl => {
+      (
+        { enabled: wsl.enabled, distro: wsl.distro, engine: wsl.engine } :
+        @engine.WslPatch)
+    }),
   }
 }
 

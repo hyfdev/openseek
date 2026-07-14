@@ -264,12 +264,7 @@ fn run_slash_command(
             session=conv.session_id,
             model=model.selected_model,
             max_steps=model.max_steps,
-            api_key=model.effective_api_key(),
-            api_url=model.effective_api_url(),
             workspace?=conv.workspace,
-            wsl_enabled=model.wsl_active(),
-            wsl_distro=model.wsl_distro,
-            wsl_engine=model.wsl_engine,
           ),
           {
             ..model.replace_conversation({
@@ -548,6 +543,26 @@ fn update(
 }
 
 ///|
+/// Push the model's (already-updated) WSL view to the host as one whole
+/// group — the shared tail of the three WSL edit handlers.
+fn push_wsl_settings(
+  dispatch : @cmd.Emit[Msg],
+  model : Model,
+) -> (@cmd.Cmd, Model) {
+  (
+    push_host_settings(
+      dispatch,
+      wsl_settings_patch(
+        enabled=model.wsl_enabled,
+        distro=model.wsl_distro,
+        engine=model.wsl_engine,
+      ),
+    ),
+    { ..model, settings_saves: model.settings_saves + 1 },
+  )
+}
+
+///|
 fn update_msg(
   dispatch : @cmd.Emit[Msg],
   msg : Msg,
@@ -576,6 +591,11 @@ fn update_msg(
         // learns each live run's identity — the resync half of the
         // protocol's reconnect story (docs/remote-protocol.md).
         fetch_runs(dispatch),
+        fetch_host_meta(dispatch),
+        fetch_host_settings(dispatch),
+        // Legacy client-stored engine settings: the desktop migrates them
+        // up to the host, a browser purges them (see `LegacySettingsRead`).
+        read_legacy_engine_settings(dispatch),
         fetch_installed_skills(dispatch),
         fetch_archived(dispatch),
         fetch_workspaces(dispatch),
@@ -612,6 +632,11 @@ fn update_msg(
         {
           ..model,
           bridge: Connected,
+          // The host this bridge just (re)connected to may be a fresh
+          // process with no filesystem watcher; forgetting what was watched
+          // makes the post-dispatch panel sync re-issue `fs.watch` instead
+          // of reading the stale record as "already placed".
+          file_panel: { ..model.file_panel, watching: "" },
           loading_session: match reload {
             Some(session_id) => session_id
             None => model.loading_session
@@ -626,49 +651,100 @@ fn update_msg(
         },
       )
     }
+    HostMetaLoaded(wsl~) => (@cmd.none, { ..model, host_wsl: wsl })
     BridgeUnavailable(message) =>
       (@cmd.none, { ..model, bridge: BridgeLost(message) })
-    SettingsLoaded(
+    SettingsLoaded(notification_corner~, tree_layout~, update_channel~) =>
+      (
+        @cmd.none,
+        {
+          ..model,
+          notification_corner: NotificationCorner::parse(notification_corner),
+          tree_layout: @fileeditor.TreeLayout::parse(tree_layout),
+          update_channel: UpdateChannel::parse(update_channel),
+        },
+      )
+    // The host's settings, from the bridge-time `settings.get` or a peer's
+    // edit broadcast. Dropped while this client's own writes are in flight —
+    // the payload may predate them; the last write's reply reconciles.
+    HostSettingsLoaded(settings) =>
+      if model.settings_saves > 0 {
+        (@cmd.none, model)
+      } else {
+        (@cmd.none, model.apply_host_settings(settings))
+      }
+    HostSettingsApplied(settings) => {
+      let next = { ..model, settings_saves: model.settings_saves - 1 }
+      // The migration's secrets leave localStorage only once the host
+      // confirmed it holds them.
+      let cleanup = if next.legacy_cleanup_pending {
+        clear_legacy_engine_settings()
+      } else {
+        @cmd.none
+      }
+      let next = { ..next, legacy_cleanup_pending: false }
+      (
+        cleanup,
+        if next.settings_saves > 0 {
+          next
+        } else {
+          next.apply_host_settings(settings)
+        },
+      )
+    }
+    HostSettingsSaveFailed(message) => {
+      let next = {
+        ..model,
+        settings_saves: model.settings_saves - 1,
+        // The push never landed; the legacy values stay in localStorage for
+        // the next launch's retry.
+        legacy_cleanup_pending: false,
+      }
+      next.notify_error(dispatch, "Saving settings failed: \{message}")
+    }
+    LegacySettingsRead(
       provider~,
       custom_url~,
       api_key~,
       custom_api_key~,
       wsl_enabled~,
       wsl_distro~,
-      wsl_engine~,
-      notification_corner~,
-      tree_layout~,
-      update_channel~
-    ) => {
-      let next = {
-        ..model,
-        api_provider: ApiProvider::parse(provider),
-        custom_api_url: custom_url.trim().to_owned(),
-        api_key: api_key.trim().to_owned(),
-        custom_api_key: custom_api_key.trim().to_owned(),
-        wsl_enabled: wsl_enabled == "1",
-        wsl_distro: wsl_distro.trim().to_owned(),
-        wsl_engine: wsl_engine.trim().to_owned(),
-        notification_corner: NotificationCorner::parse(notification_corner),
-        tree_layout: @fileeditor.TreeLayout::parse(tree_layout),
-        update_channel: UpdateChannel::parse(update_channel),
-        setup_api_key: "",
+      wsl_engine~
+    ) =>
+      // Only the desktop window migrates: it is the one client whose stored
+      // values are unambiguously this host's. A browser page's copy may
+      // belong to a different device behind the same origin — pushing it is
+      // exactly the leak the host-side store removes — so it is purged.
+      if model.is_desktop {
+        let patch = legacy_settings_patch(
+          provider~,
+          custom_url~,
+          api_key~,
+          custom_api_key~,
+          wsl_enabled~,
+          wsl_distro~,
+          wsl_engine~,
+        )
+        // Mirror the pushed values optimistically so the Settings page and
+        // the ready gate reflect the migration immediately.
+        let next = {
+          ..model,
+          api_provider: ApiProvider::parse(provider),
+          custom_api_url: custom_url.trim().to_owned(),
+          deepseek_key_saved: model.deepseek_key_saved ||
+          !api_key.trim().is_empty(),
+          custom_key_saved: model.custom_key_saved ||
+          !custom_api_key.trim().is_empty(),
+          wsl_enabled: wsl_enabled == "1",
+          wsl_distro: wsl_distro.trim().to_owned(),
+          wsl_engine: wsl_engine.trim().to_owned(),
+          settings_saves: model.settings_saves + 1,
+          legacy_cleanup_pending: true,
+        }
+        (push_host_settings(dispatch, patch), next)
+      } else {
+        (clear_legacy_engine_settings(), model)
       }
-      // The default provider needs no setup, so the Settings page only takes
-      // over when the stored settings are incomplete (official endpoint
-      // without a key, custom endpoint without a URL).
-      (
-        @cmd.none,
-        {
-          ..next,
-          screen: if next.api_ready() {
-            next.screen
-          } else {
-            Settings
-          },
-        },
-      )
-    }
     TaskChanged(value) => {
       let session = model.active().session_id
       (
@@ -781,20 +857,30 @@ fn update_msg(
     ProviderChanged(value) => {
       let provider = ApiProvider::parse(value)
       (
-        save_api_provider(provider),
-        { ..model, api_provider: provider, setup_api_key: "" },
+        push_host_settings(dispatch, provider_settings_patch(provider)),
+        {
+          ..model,
+          api_provider: provider,
+          setup_api_key: "",
+          settings_saves: model.settings_saves + 1,
+        },
       )
     }
     CustomApiUrlChanged(value) =>
-      (save_custom_api_url(value), { ..model, custom_api_url: value })
-    WslModeChanged(value) => {
-      let enabled = value == "wsl"
-      (save_wsl_enabled(enabled), { ..model, wsl_enabled: enabled })
-    }
+      (
+        push_host_settings(dispatch, custom_url_settings_patch(value)),
+        {
+          ..model,
+          custom_api_url: value,
+          settings_saves: model.settings_saves + 1,
+        },
+      )
+    WslModeChanged(value) =>
+      push_wsl_settings(dispatch, { ..model, wsl_enabled: value == "wsl" })
     WslDistroChanged(value) =>
-      (save_wsl_distro(value), { ..model, wsl_distro: value })
+      push_wsl_settings(dispatch, { ..model, wsl_distro: value })
     WslEngineChanged(value) =>
-      (save_wsl_engine(value), { ..model, wsl_engine: value })
+      push_wsl_settings(dispatch, { ..model, wsl_engine: value })
     NotificationCornerChanged(value) => {
       let corner = NotificationCorner::parse(value)
       (
@@ -990,19 +1076,24 @@ fn update_msg(
         (@cmd.none, model)
       } else {
         match model.api_provider {
-          // Saving the key that completes the setup returns to the chat —
-          // the same auto-dismiss the popup used to have.
-          Deepseek => {
-            let next = { ..model, api_key, setup_api_key: "" }
+          // The key goes straight to the host's store; the mirror keeps
+          // only its presence. Saving the key that completes the setup
+          // returns to the chat — the same auto-dismiss the popup used to
+          // have — optimistically; a failed save comes back as a toast.
+          Deepseek | Custom as provider => {
+            let next = {
+              ..model,
+              deepseek_key_saved: model.deepseek_key_saved ||
+              provider is Deepseek,
+              custom_key_saved: model.custom_key_saved || provider is Custom,
+              setup_api_key: "",
+              settings_saves: model.settings_saves + 1,
+            }
             (
-              save_api_key(api_key),
-              { ..next, screen: if next.api_ready() { Chat } else { Settings } },
-            )
-          }
-          Custom => {
-            let next = { ..model, custom_api_key: api_key, setup_api_key: "" }
-            (
-              save_custom_api_key(api_key),
+              push_host_settings(
+                dispatch,
+                api_key_settings_patch(provider, api_key),
+              ),
               { ..next, screen: if next.api_ready() { Chat } else { Settings } },
             )
           }
@@ -1129,13 +1220,8 @@ fn update_msg(
               task,
               model.selected_model,
               model.max_steps,
-              model.effective_api_key(),
-              model.effective_api_url(),
               conv.session_id,
               workspace=conv.workspace,
-              wsl_enabled=model.wsl_active(),
-              wsl_distro=model.wsl_distro,
-              wsl_engine=model.wsl_engine,
             ),
             scroll_transcript_after_render(),
           ]),
@@ -1358,6 +1444,11 @@ fn update_msg(
       model.notify_error(dispatch, "Archive failed: \{message}")
     SessionsFailed(message) =>
       model.notify_error(dispatch, "Session list unavailable: \{message}")
+    // Another client archived or unarchived a conversation; both sidebar
+    // lists are stale, and `ArchivedLoaded` drops any live state this client
+    // still holds for a now-archived conversation.
+    SessionsChanged =>
+      (@cmd.batch([fetch_sessions(dispatch), fetch_archived(dispatch)]), model)
     NotificationClicked(run_id~) => {
       // The run has finished by the time its notification is clicked, so the
       // owner usually matches by last run id; a still-running owner (steered
@@ -1618,18 +1709,21 @@ fn update_msg(
     Engine(run_id, event, session~) => {
       // Compaction and background notices happen between turns, so their
       // events arrive after the run that owned `run_id` cleared
-      // `active_run_id`. The host stamps them with their session, which also
-      // covers a conversation compacted before its first prompt of this
-      // app-lifetime (its engine has no run id at all); the conversation
-      // that last held the id remains the fallback for unstamped events.
-      let conv = if model.conversation_by_run(run_id) is Some(conv) {
+      // `active_run_id` — or with no run id at all (an engine spawned just
+      // to compact). The host stamps them with their session, which covers
+      // that case too; the conversation that last held the id remains the
+      // fallback for unstamped events.
+      let conv = if run_id is Some(id) &&
+        model.conversation_by_run(id) is Some(conv) {
         Some(conv)
       } else if is_idle_event(event) {
         if session is Some(session) &&
           model.find_conversation(session) is Some(conv) {
           Some(conv)
+        } else if run_id is Some(id) {
+          model.conversation_by_last_run(id)
         } else {
-          model.conversation_by_last_run(run_id)
+          None
         }
       } else {
         None
@@ -1792,7 +1886,7 @@ fn test_conversation() -> Conversation {
 
 ///|
 fn running_conversation() -> Conversation {
-  { ..test_conversation(), run: Open(run_id=7, stage=Opened) }
+  { ..test_conversation(), run: Open(run_id="r7", stage=Opened) }
 }
 
 ///|
@@ -1800,7 +1894,6 @@ fn test_model() -> Model {
   {
     ..initial_model(),
     bridge: Connected,
-    api_key: "sk-test",
     active_session: "desktop-test",
     conversations: [test_conversation()],
   }
@@ -1816,12 +1909,12 @@ test "assistant deltas accumulate into the streaming response" {
   let dispatch = test_dispatch()
   let (_, first) = update(
     dispatch,
-    Engine(7, AssistantDelta("Hello"), session=None),
+    Engine(Some("r7"), AssistantDelta("Hello"), session=None),
     running_model(),
   )
   let (_, second) = update(
     dispatch,
-    Engine(7, AssistantDelta(", world"), session=None),
+    Engine(Some("r7"), AssistantDelta(", world"), session=None),
     first,
   )
   inspect(second.active().streaming_response, content="Hello, world")
@@ -1837,12 +1930,12 @@ test "update is pure: replaying a delta on the same model is idempotent" {
   })
   let (_, once) = update(
     dispatch,
-    Engine(7, AssistantDelta("!"), session=None),
+    Engine(Some("r7"), AssistantDelta("!"), session=None),
     model,
   )
   let (_, twice) = update(
     dispatch,
-    Engine(7, AssistantDelta("!"), session=None),
+    Engine(Some("r7"), AssistantDelta("!"), session=None),
     model,
   )
   inspect(once.active().streaming_response, content="partial!")
@@ -1854,7 +1947,7 @@ test "deltas from an unknown run are dropped" {
   let dispatch = test_dispatch()
   let (_, next) = update(
     dispatch,
-    Engine(99, AssistantDelta("stale"), session=None),
+    Engine(Some("r99"), AssistantDelta("stale"), session=None),
     running_model(),
   )
   inspect(next.active().streaming_response, content="")
@@ -1869,7 +1962,7 @@ test "reasoning message commits a thinking item and clears its stream" {
   })
   let (_, next) = update(
     dispatch,
-    Engine(7, ReasoningMessage("full thought"), session=None),
+    Engine(Some("r7"), ReasoningMessage("full thought"), session=None),
     model,
   )
   inspect(next.active().streaming_reasoning, content="")
@@ -1890,7 +1983,7 @@ test "assistant message replaces the live stream with a committed item" {
   })
   let (_, next) = update(
     dispatch,
-    Engine(7, AssistantMessage("answer"), session=None),
+    Engine(Some("r7"), AssistantMessage("answer"), session=None),
     model,
   )
   inspect(next.active().streaming_response, content="")
@@ -1909,7 +2002,7 @@ test "a new agent step clears both live streams" {
   })
   let (_, next) = update(
     dispatch,
-    Engine(7, AgentStep(Some(2)), session=None),
+    Engine(Some("r7"), AgentStep(Some(2)), session=None),
     model,
   )
   inspect(next.active().streaming_response, content="")
@@ -1925,7 +2018,7 @@ test "finished run clears any leftover stream" {
   })
   let (_, next) = update(
     dispatch,
-    Finished(run_id=7, status="finished", answer=Some("done")),
+    Finished(run_id="r7", status="finished", answer=Some("done")),
     model,
   )
   inspect(next.active().streaming_response, content="")
@@ -1937,7 +2030,7 @@ test "a finish the user watched leaves no unseen dot" {
   let dispatch = test_dispatch()
   let (_, next) = update(
     dispatch,
-    Finished(run_id=7, status="finished", answer=Some("done")),
+    Finished(run_id="r7", status="finished", answer=Some("done")),
     running_model(),
   )
   inspect(next.active().unseen_finish, content="false")
@@ -1950,7 +2043,7 @@ test "a background finish marks its conversation until it is opened" {
   let model = { ..running_model(), active_session: "desktop-elsewhere" }
   let (_, next) = update(
     dispatch,
-    Finished(run_id=7, status="finished", answer=Some("done")),
+    Finished(run_id="r7", status="finished", answer=Some("done")),
     model,
   )
   guard next.find_conversation("desktop-test") is Some(conv) else {
@@ -1971,12 +2064,12 @@ test "an idle background notice routes by the last run id" {
   // memory ties the id back to its conversation.
   let model = test_model().replace_conversation({
     ..test_conversation(),
-    last_run_id: Some(7),
+    last_run_id: Some("r7"),
   })
   let notice = "[moon_check update]\nstatus=failed\nmain.mbt:1 error"
   let (_, next) = update(
     dispatch,
-    Engine(7, RuntimeUpdate(notice), session=None),
+    Engine(Some("r7"), RuntimeUpdate(notice), session=None),
     model,
   )
   inspect(next.active().watcher_status, content="failed")
@@ -2033,7 +2126,6 @@ test "session rotation activates a fresh conversation, keeping the old one" {
   inspect(next.active_session, content="desktop-fresh")
   inspect(next.active().messages.length(), content="0")
   inspect(next.active().usage_tokens, content="0")
-  inspect(next.api_key, content="sk-test")
   assert_true(next.display_status() is Ready)
   // The previous conversation keeps running in the background.
   guard next.find_conversation("desktop-test") is Some(old) else {
@@ -2100,7 +2192,7 @@ test "open session keeps live state on screen while re-reading the store" {
   let dispatch = test_dispatch()
   let background = {
     ..empty_conversation("desktop-bg"),
-    run: Open(run_id=9, stage=Opened),
+    run: Open(run_id="r9", stage=Opened),
     streaming_response: "mid-stream",
     messages: [{ kind: User, content: "background task" }],
   }
@@ -2285,7 +2377,7 @@ test "started routes by session and records the host's workspace" {
   let (_, next) = update(
     dispatch,
     Started(
-      run_id=7,
+      run_id="r7",
       session="desktop-test",
       model="deepseek-v4-pro",
       max_steps=1000,
@@ -2299,7 +2391,7 @@ test "started routes by session and records the host's workspace" {
     is Some(Absolute("/home/u/Documents/OpenSeek/desktop-test")),
   )
   inspect(next.active().is_running(), content="true")
-  guard next.active().run is Open(run_id=7, ..) else {
+  guard next.active().run is Open(run_id="r7", ..) else {
     fail("expected the run id to be recorded")
   }
   // A run this client did not send: the store gained its prompt, so the
@@ -2313,7 +2405,7 @@ test "started for an unknown session materializes its conversation" {
   let (_, next) = update(
     dispatch,
     Started(
-      run_id=7,
+      run_id="r7",
       session="desktop-ghost",
       model="deepseek-v4-pro",
       max_steps=1000,
@@ -2328,7 +2420,7 @@ test "started for an unknown session materializes its conversation" {
     fail("expected the foreign run's conversation to materialize")
   }
   inspect(ghost.is_running(), content="true")
-  guard ghost.run is Open(run_id=7, ..) else {
+  guard ghost.run is Open(run_id="r7", ..) else {
     fail("expected the run id to be recorded")
   }
   // The pushed prompt becomes the bubble — a materialized conversation has
@@ -2347,7 +2439,7 @@ test "runs settled closes runs the host no longer has, sparing live and starting
   // gone for good, so only the `agent.runs` reply can close it.
   let stale = {
     ..empty_conversation("desktop-stale"),
-    run: Open(run_id=9, stage=AtStep(Some(4))),
+    run: Open(run_id="r9", stage=AtStep(Some(4))),
     streaming_response: "mid-step",
   }
   // A send still in flight has no run id yet; its own `started` (or
@@ -2356,7 +2448,7 @@ test "runs settled closes runs the host no longer has, sparing live and starting
   let model = running_model()
     .replace_conversation(stale)
     .replace_conversation(starting)
-  let (_, next) = update(dispatch, RunsSettled(live=[7]), model)
+  let (_, next) = update(dispatch, RunsSettled(live=["r7"]), model)
   // Run 7 is still in flight on the host: untouched.
   inspect(next.active().is_running(), content="true")
   guard next.find_conversation("desktop-stale") is Some(settled) else {
@@ -2378,12 +2470,12 @@ test "concurrent conversations keep their streams apart" {
   let dispatch = test_dispatch()
   let second = {
     ..empty_conversation("desktop-second"),
-    run: Open(run_id=8, stage=Opened),
+    run: Open(run_id="r8", stage=Opened),
   }
   let model = running_model().replace_conversation(second)
   let (_, next) = update(
     dispatch,
-    Engine(8, AssistantDelta("for B"), session=None),
+    Engine(Some("r8"), AssistantDelta("for B"), session=None),
     model,
   )
   // Run 8 belongs to the background conversation; the active one is untouched.
@@ -2399,13 +2491,13 @@ test "a background run finishes without disturbing the conversation on screen" {
   let dispatch = test_dispatch()
   let second = {
     ..empty_conversation("desktop-second"),
-    run: Open(run_id=8, stage=Opened),
+    run: Open(run_id="r8", stage=Opened),
     messages: [{ kind: User, content: "background ask" }],
   }
   let model = running_model().replace_conversation(second)
   let (_, next) = update(
     dispatch,
-    Finished(run_id=8, status="finished", answer=Some("done")),
+    Finished(run_id="r8", status="finished", answer=Some("done")),
     model,
   )
   guard next.find_conversation("desktop-second") is Some(bg) else {
@@ -2443,7 +2535,7 @@ test "a cancelling turn cannot be steered; the text stays in the composer" {
   let dispatch = test_dispatch()
   let model = running_model().replace_conversation({
     ..running_conversation(),
-    run: Open(run_id=7, stage=Cancelling),
+    run: Open(run_id="r7", stage=Cancelling),
     task: "too late",
   })
   let (_, next) = update(dispatch, Send, model)
@@ -2476,7 +2568,7 @@ test "steer_applied commits the pending steer as a user message" {
   })
   let (_, next) = update(
     dispatch,
-    Engine(7, SteerApplied("go left"), session=None),
+    Engine(Some("r7"), SteerApplied("go left"), session=None),
     model,
   )
   inspect(next.active().pending_steers.length(), content="0")
@@ -2496,7 +2588,7 @@ test "steer_dropped settles the pending steer with a visible notice" {
   })
   let (_, next) = update(
     dispatch,
-    Engine(7, SteerDropped("go left"), session=None),
+    Engine(Some("r7"), SteerDropped("go left"), session=None),
     model,
   )
   inspect(next.active().pending_steers.length(), content="0")
@@ -2516,7 +2608,7 @@ test "an identical-text settle removes exactly one pending entry" {
   })
   let (_, next) = update(
     dispatch,
-    Engine(7, SteerApplied("again"), session=None),
+    Engine(Some("r7"), SteerApplied("again"), session=None),
     model,
   )
   inspect(next.active().pending_steers.length(), content="1")
@@ -2553,7 +2645,7 @@ test "a run that ends with steers in flight sweeps them into notices" {
   })
   let (_, next) = update(
     dispatch,
-    Finished(run_id=7, status="finished", answer=Some("")),
+    Finished(run_id="r7", status="finished", answer=Some("")),
     model,
   )
   inspect(next.active().pending_steers.length(), content="0")
@@ -2573,7 +2665,7 @@ test "late undelivered steer is dropped after run-end sweep" {
   })
   let (_, finished) = update(
     dispatch,
-    Finished(run_id=7, status="finished", answer=Some("")),
+    Finished(run_id="r7", status="finished", answer=Some("")),
     model,
   )
   let (_, next) = update(
@@ -2588,36 +2680,17 @@ test "late undelivered steer is dropped after run-end sweep" {
 
 ///|
 test "the default provider needs no API key to be ready" {
-  let model = { ..test_model(), api_key: "" }
+  let model = test_model()
+  assert_false(model.deepseek_key_saved)
   assert_true(model.api_ready())
-  inspect(model.effective_api_url(), content=OpenseekApiUrl)
-  inspect(model.effective_api_key(), content="")
-}
-
-///|
-test "custom endpoints never reuse the saved DeepSeek key" {
-  let openseek = { ..test_model(), api_provider: Openseek }
-  inspect(openseek.effective_api_key(), content="")
-  let official = { ..test_model(), api_provider: Deepseek }
-  inspect(official.effective_api_key(), content="sk-test")
-  let unauthenticated_custom = {
-    ..test_model(),
-    api_provider: Custom,
-    custom_api_url: "https://proxy.example/v1/chat/completions",
-  }
-  inspect(unauthenticated_custom.effective_api_key(), content="")
-  let authenticated_custom = {
-    ..unauthenticated_custom,
-    custom_api_key: "sk-custom",
-  }
-  inspect(authenticated_custom.effective_api_key(), content="sk-custom")
 }
 
 ///|
 test "the official endpoint requires a key, a custom endpoint a URL" {
-  let official = { ..test_model(), api_provider: Deepseek, api_key: "" }
+  let official = { ..test_model(), api_provider: Deepseek }
   assert_false(official.api_ready())
   assert_true(official.display_status() is ApiKeyRequired)
+  assert_true({ ..official, deepseek_key_saved: true }.api_ready())
   let custom = { ..test_model(), api_provider: Custom, custom_api_url: "" }
   assert_false(custom.api_ready())
   assert_true(custom.display_status() is SetupRequired)
@@ -2626,29 +2699,57 @@ test "the official endpoint requires a key, a custom endpoint a URL" {
     custom_api_url: "https://proxy.example/chat/completions",
   }
   assert_true(configured.api_ready())
-  inspect(
-    configured.effective_api_url(),
-    content="https://proxy.example/chat/completions",
-  )
 }
 
 ///|
-test "loaded settings open the popup only when incomplete" {
+test "loaded UI preferences parse their wire names" {
+  let dispatch = test_dispatch()
+  let (_, restored) = update(
+    dispatch,
+    SettingsLoaded(
+      notification_corner="top-left",
+      tree_layout="",
+      update_channel="staging",
+    ),
+    test_model(),
+  )
+  assert_true(restored.notification_corner is TopLeft)
+  assert_true(restored.update_channel is Staging)
+  // Unknown stored values fall back to the defaults.
+  let (_, unknown) = update(
+    dispatch,
+    SettingsLoaded(notification_corner="", tree_layout="", update_channel=""),
+    test_model(),
+  )
+  assert_true(unknown.notification_corner is BottomRight)
+  assert_true(unknown.update_channel is Production)
+}
+
+///|
+fn host_settings(
+  provider~ : String,
+  has_deepseek_key? : Bool = false,
+  wsl_enabled? : Bool = false,
+  wsl_distro? : String = "",
+  wsl_engine? : String = "",
+) -> HostSettings {
+  {
+    provider,
+    custom_api_url: "",
+    has_deepseek_key,
+    has_custom_key: false,
+    wsl_enabled,
+    wsl_distro,
+    wsl_engine,
+  }
+}
+
+///|
+test "host settings open the settings page only when incomplete" {
   let dispatch = test_dispatch()
   let (_, zero_config) = update(
     dispatch,
-    SettingsLoaded(
-      provider="",
-      custom_url="",
-      api_key="",
-      custom_api_key="",
-      wsl_enabled="",
-      wsl_distro="",
-      wsl_engine="",
-      notification_corner="",
-      tree_layout="",
-      update_channel="",
-    ),
+    HostSettingsLoaded(host_settings(provider="openseek")),
     test_model(),
   )
   assert_true(zero_config.screen is Chat)
@@ -2656,67 +2757,95 @@ test "loaded settings open the popup only when incomplete" {
   assert_true(zero_config.display_status() is Ready)
   let (_, keyless) = update(
     dispatch,
-    SettingsLoaded(
-      provider="deepseek",
-      custom_url="",
-      api_key="",
-      custom_api_key="",
-      wsl_enabled="",
-      wsl_distro="",
-      wsl_engine="",
-      notification_corner="",
-      tree_layout="",
-      update_channel="",
-    ),
+    HostSettingsLoaded(host_settings(provider="deepseek")),
     test_model(),
   )
   assert_true(keyless.screen is Settings)
   assert_true(keyless.display_status() is ApiKeyRequired)
   let (_, restored) = update(
     dispatch,
-    SettingsLoaded(
-      provider="deepseek",
-      custom_url="",
-      api_key="sk-stored",
-      custom_api_key="sk-custom-stored",
-      wsl_enabled="1",
-      wsl_distro=" Ubuntu ",
-      wsl_engine="/usr/local/bin/openseek",
-      notification_corner="top-left",
-      tree_layout="",
-      update_channel="staging",
+    HostSettingsLoaded(
+      host_settings(
+        provider="deepseek",
+        has_deepseek_key=true,
+        wsl_enabled=true,
+        wsl_distro="Ubuntu",
+        wsl_engine="/usr/local/bin/openseek",
+      ),
     ),
     test_model(),
   )
   assert_true(restored.screen is Chat)
-  inspect(restored.api_key, content="sk-stored")
-  inspect(restored.custom_api_key, content="sk-custom-stored")
+  assert_true(restored.deepseek_key_saved)
   inspect(restored.wsl_enabled, content="true")
   inspect(restored.wsl_distro, content="Ubuntu")
   inspect(restored.wsl_engine, content="/usr/local/bin/openseek")
-  assert_true(restored.notification_corner is TopLeft)
-  assert_true(restored.update_channel is Staging)
-  // An unknown stored corner or channel falls back to the default.
-  assert_true(zero_config.notification_corner is BottomRight)
-  assert_true(zero_config.update_channel is Production)
-  let (_, custom) = update(
+}
+
+///|
+test "host settings are dropped while this client's writes are in flight" {
+  let dispatch = test_dispatch()
+  let model = { ..test_model(), settings_saves: 1 }
+  // A broadcast (or a stale get reply) arriving mid-write must not clobber
+  // the optimistic mirror.
+  let (_, ignored) = update(
     dispatch,
-    SettingsLoaded(
-      provider="custom",
-      custom_url="https://proxy.example/chat/completions",
-      api_key="sk-deepseek",
-      custom_api_key="sk-custom",
-      wsl_enabled="",
-      wsl_distro="",
-      wsl_engine="",
-      notification_corner="",
-      tree_layout="",
-      update_channel="",
-    ),
-    test_model(),
+    HostSettingsLoaded(host_settings(provider="deepseek")),
+    model,
   )
-  assert_true(custom.screen is Chat)
-  inspect(custom.effective_api_key(), content="sk-custom")
+  assert_true(ignored.api_provider is Openseek)
+  inspect(ignored.settings_saves, content="1")
+  // The write's own reply reconciles once it is the last one out.
+  let (_, settled) = update(
+    dispatch,
+    HostSettingsApplied(
+      host_settings(provider="deepseek", has_deepseek_key=true),
+    ),
+    model,
+  )
+  inspect(settled.settings_saves, content="0")
+  assert_true(settled.api_provider is Deepseek)
+  assert_true(settled.deepseek_key_saved)
+  // With more writes still out, even a reply only decrements.
+  let stacked = { ..model, settings_saves: 2 }
+  let (_, still_pending) = update(
+    dispatch,
+    HostSettingsApplied(host_settings(provider="deepseek")),
+    stacked,
+  )
+  inspect(still_pending.settings_saves, content="1")
+  assert_true(still_pending.api_provider is Openseek)
+}
+
+///|
+test "legacy client settings migrate up only from the desktop window" {
+  let dispatch = test_dispatch()
+  let legacy = LegacySettingsRead(
+    provider="deepseek",
+    custom_url="",
+    api_key="sk-legacy",
+    custom_api_key="",
+    wsl_enabled="1",
+    wsl_distro="Ubuntu",
+    wsl_engine="",
+  )
+  let (_, desktop) = update(dispatch, legacy, {
+    ..test_model(),
+    is_desktop: true,
+  })
+  assert_true(desktop.api_provider is Deepseek)
+  assert_true(desktop.deepseek_key_saved)
+  inspect(desktop.wsl_distro, content="Ubuntu")
+  inspect(desktop.settings_saves, content="1")
+  assert_true(desktop.legacy_cleanup_pending)
+  // A browser page only purges — its copy may belong to another device.
+  let (_, browser) = update(dispatch, legacy, {
+    ..test_model(),
+    is_desktop: false,
+  })
+  assert_false(browser.deepseek_key_saved)
+  inspect(browser.settings_saves, content="0")
+  assert_false(browser.legacy_cleanup_pending)
 }
 
 ///|
@@ -2753,43 +2882,43 @@ test "the tree-layout setting parses its wire names" {
 ///|
 test "update is pure: a provider change is idempotent" {
   let dispatch = test_dispatch()
-  let model = { ..test_model(), api_key: "", setup_api_key: "typed" }
+  let model = { ..test_model(), setup_api_key: "typed" }
   let (_, once) = update(dispatch, ProviderChanged("deepseek"), model)
   let (_, twice) = update(dispatch, ProviderChanged("deepseek"), model)
   assert_true(once.api_provider is Deepseek)
   assert_true(twice.api_provider is Deepseek)
   inspect(once.setup_api_key, content="")
   inspect(twice.setup_api_key, content="")
+  inspect(once.settings_saves, content="1")
+  inspect(twice.settings_saves, content="1")
   assert_true(once.display_status() is ApiKeyRequired)
   assert_true(twice.display_status() is ApiKeyRequired)
 }
 
 ///|
-test "saving a key writes the active provider credential only" {
+test "saving a key marks the active provider credential only" {
   let dispatch = test_dispatch()
   let deepseek = {
     ..test_model(),
     api_provider: Deepseek,
-    api_key: "sk-old",
-    custom_api_key: "sk-custom-old",
     setup_api_key: "  sk-new  ",
     screen: Settings,
   }
   let (_, saved_deepseek) = update(dispatch, SaveApiKey, deepseek)
-  inspect(saved_deepseek.api_key, content="sk-new")
-  inspect(saved_deepseek.custom_api_key, content="sk-custom-old")
+  assert_true(saved_deepseek.deepseek_key_saved)
+  assert_false(saved_deepseek.custom_key_saved)
+  inspect(saved_deepseek.setup_api_key, content="")
+  inspect(saved_deepseek.settings_saves, content="1")
   assert_true(saved_deepseek.screen is Chat)
   let custom = {
     ..deepseek,
     api_provider: Custom,
     custom_api_url: "https://proxy.example/chat/completions",
-    api_key: "sk-deepseek",
     setup_api_key: "  sk-custom-new  ",
   }
   let (_, saved_custom) = update(dispatch, SaveApiKey, custom)
-  inspect(saved_custom.api_key, content="sk-deepseek")
-  inspect(saved_custom.custom_api_key, content="sk-custom-new")
-  inspect(saved_custom.effective_api_key(), content="sk-custom-new")
+  assert_false(saved_custom.deepseek_key_saved)
+  assert_true(saved_custom.custom_key_saved)
   assert_true(saved_custom.screen is Chat)
 }
 
@@ -2806,12 +2935,7 @@ test "changing settings mid-run leaves the run status alone" {
 /// even while the endpoint is unusable (the composer blocks sending then).
 test "sidebar navigation leaves the settings page" {
   let dispatch = test_dispatch()
-  let model = {
-    ..test_model(),
-    api_provider: Deepseek,
-    api_key: "",
-    screen: Settings,
-  }
+  let model = { ..test_model(), api_provider: Deepseek, screen: Settings }
   let (_, next) = update(dispatch, SessionRotated("s-fresh"), model)
   assert_true(next.screen is Chat)
 }
@@ -2942,7 +3066,7 @@ test "an unpinned transcript stays unpinned while a stream grows" {
   let model = { ..running_model(), transcript_pinned: false }
   let (_, next) = update(
     dispatch,
-    Engine(7, AssistantDelta("more"), session=None),
+    Engine(Some("r7"), AssistantDelta("more"), session=None),
     model,
   )
   inspect(next.transcript_pinned, content="false")
@@ -3358,7 +3482,7 @@ test "a mid-turn /compact stays visibly queued until compaction starts" {
   let dispatch = test_dispatch()
   let model = test_model().replace_conversation({
     ..running_conversation(),
-    last_run_id: Some(7),
+    last_run_id: Some("r7"),
   })
   let (_, queued) = run_slash_command(dispatch, model, "compact")
   assert_true(queued.active().compaction is Queued)
@@ -3369,7 +3493,7 @@ test "a mid-turn /compact stays visibly queued until compaction starts" {
   // that gap would queue behind the compaction, out of Stop's reach.
   let (_, ended) = update(
     dispatch,
-    Finished(run_id=7, status="completed", answer=None),
+    Finished(run_id="r7", status="completed", answer=None),
     again,
   )
   assert_true(ended.active().compaction is Queued)
@@ -3382,7 +3506,7 @@ test "a mid-turn /compact stays visibly queued until compaction starts" {
   // The engine reaches the queued compaction: queued flips into compacting.
   let (_, started) = update(
     dispatch,
-    Engine(7, CompactionStarted, session=None),
+    Engine(Some("r7"), CompactionStarted, session=None),
     held,
   )
   assert_true(started.active().compaction is Compacting)
@@ -3412,7 +3536,7 @@ test "an idle /compact holds the send gate until the engine confirms" {
   // The engine confirms; the session stamp routes it (no run id exists yet).
   let (_, started) = update(
     dispatch,
-    Engine(0, CompactionStarted, session=Some("desktop-test")),
+    Engine(None, CompactionStarted, session=Some("desktop-test")),
     held,
   )
   assert_true(started.active().compaction is Compacting)
@@ -3430,12 +3554,12 @@ test "update is pure: automatic checkpoint appends a summary" {
   })
   let (_, once) = update(
     dispatch,
-    Engine(7, AutoCompactionFinished("checkpoint recap"), session=None),
+    Engine(Some("r7"), AutoCompactionFinished("checkpoint recap"), session=None),
     model,
   )
   let (_, twice) = update(
     dispatch,
-    Engine(7, AutoCompactionFinished("checkpoint recap"), session=None),
+    Engine(Some("r7"), AutoCompactionFinished("checkpoint recap"), session=None),
     model,
   )
   inspect(model.active().messages.length(), content="0")
@@ -3470,12 +3594,12 @@ test "update is pure: context yield appends continuation guidance" {
   })
   let (_, once) = update(
     dispatch,
-    Engine(7, ContextYield(answer), session=None),
+    Engine(Some("r7"), ContextYield(answer), session=None),
     model,
   )
   let (_, twice) = update(
     dispatch,
-    Engine(7, ContextYield(answer), session=None),
+    Engine(Some("r7"), ContextYield(answer), session=None),
     model,
   )
   inspect(model.active().messages.length(), content="0")
@@ -3509,18 +3633,18 @@ test "context yield settles after its automatic checkpoint" {
   let answer = "[context ceiling] continue in a new turn"
   let (_, checkpointed) = update(
     dispatch,
-    Engine(7, AutoCompactionFinished("checkpoint recap"), session=None),
+    Engine(Some("r7"), AutoCompactionFinished("checkpoint recap"), session=None),
     running_model(),
   )
   let (_, yielded) = update(
     dispatch,
-    Engine(7, ContextYield(answer), session=None),
+    Engine(Some("r7"), ContextYield(answer), session=None),
     checkpointed,
   )
   assert_true(yielded.active().is_running())
   let (_, settled) = update(
     dispatch,
-    Finished(run_id=7, status="context_yield", answer=Some(answer)),
+    Finished(run_id="r7", status="context_yield", answer=Some(answer)),
     yielded,
   )
   inspect(settled.active().messages.length(), content="2")
@@ -3551,11 +3675,15 @@ test "compaction_finished appends a standalone summary item" {
   let model = test_model().replace_conversation({
     ..test_conversation(),
     compaction: Compacting,
-    last_run_id: Some(7),
+    last_run_id: Some("r7"),
   })
   let (_, next) = update(
     dispatch,
-    Engine(7, CompactionFinished("earlier turns compacted"), session=None),
+    Engine(
+      Some("r7"),
+      CompactionFinished("earlier turns compacted"),
+      session=None,
+    ),
     model,
   )
   guard next.active().messages.last() is Some(item) && item.kind is Summary else {
@@ -3578,14 +3706,14 @@ test "compaction events route by session when no run id matches" {
   })
   let (_, started) = update(
     dispatch,
-    Engine(0, CompactionStarted, session=Some("desktop-test")),
+    Engine(None, CompactionStarted, session=Some("desktop-test")),
     model,
   )
   assert_true(started.active().compaction is Compacting)
   let (_, next) = update(
     dispatch,
     Engine(
-      0,
+      None,
       CompactionFinished("earlier turns compacted"),
       session=Some("desktop-test"),
     ),
@@ -3606,11 +3734,11 @@ test "compaction_failed settles a still-queued compaction" {
   let model = test_model().replace_conversation({
     ..test_conversation(),
     compaction: Queued,
-    last_run_id: Some(7),
+    last_run_id: Some("r7"),
   })
   let (_, next) = update(
     dispatch,
-    Engine(7, CompactionFailed("engine exited"), session=None),
+    Engine(Some("r7"), CompactionFailed("engine exited"), session=None),
     model,
   )
   assert_true(next.active().compaction is NotCompacting)

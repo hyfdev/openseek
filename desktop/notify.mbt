@@ -24,11 +24,7 @@ fn notify_run_finished(payload : @engine.FinishedPayload) -> Unit {
   // (native side) and the frontend jumps to the run's conversation via the
   // `proton.notification_clicked` event.
   ignore(
-    @proton_native.post_notification(
-      Some(title),
-      body,
-      payload=payload.run_id.to_string(),
-    ),
+    @proton_native.post_notification(Some(title), body, payload=payload.run_id),
   )
 }
 

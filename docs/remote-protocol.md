@@ -132,12 +132,17 @@ absence as `""`, `0`, or another in-band sentinel.
 
 ### agent.* — runs
 
+Run ids are opaque strings minted by the host, one per accepted prompt.
+They are random, never reused, and never collide across host restarts — a
+client may hold a pre-restart run id without any risk of it addressing a
+new run. Clients compare them for equality only.
+
 | method | params | result |
 |---|---|---|
-| `agent.start` | `{task, api_key?, api_url?, model?, max_steps?, session?, session_root?, workspace?, wsl?: {distro?, engine?}}` | `{run_id, status, …}` — accepted once the run is public; pre-`started` failures are the error response |
+| `agent.start` | `{task, model?, max_steps?, session?, session_root?, workspace?}` — no credentials and no WSL preference: the host resolves the endpoint from its settings store (`settings.*`) | `{run_id, status, …}` — accepted once the run is public; pre-`started` failures are the error response |
 | `agent.cancel` | `{run_id?}` (absent = the latest run) | cancel outcome |
 | `agent.steer` | `{text, run_id?}` | steer outcome |
-| `agent.compact` | `{session, api_key?, api_url?, model?, max_steps?, session_root?, workspace?, wsl?}` — `agent.start` minus `task`: a conversation resumed after a restart has no live process, and compacting spawns one with these settings | compaction outcome |
+| `agent.compact` | `{session, model?, max_steps?, session_root?, workspace?}` — `agent.start` minus `task`: a conversation resumed after a restart has no live process, and compacting spawns one with these settings | compaction outcome |
 | `agent.runs` | `{}` | `{runs: […]}` — every in-flight run's `agent.started` params, replayed through the same decoder; the resync replacement for v1's sticky `started` replay |
 
 Notifications:
@@ -145,7 +150,7 @@ Notifications:
 | method | params |
 |---|---|
 | `agent.started` | `{run_id, task, session, model, max_steps, cwd?}` — `task` is the prompt text, the only live source of the prompt bubble for a client that did not send it |
-| `agent.event` | `{run_id, session?, event: {…}}` — the engine's event object verbatim (`assistant_delta`, `tool_result`, `agent_finished`, …) |
+| `agent.event` | `{run_id?, session, event: {…}}` — the engine's event object verbatim (`assistant_delta`, `tool_result`, `agent_finished`, …); `run_id` is absent for events emitted before any run of the engine process's lifetime (a compaction on a freshly spawned engine), which route by `session` |
 | `agent.error` | `{message, run_id?, diagnostics?}` |
 | `agent.finished` | `{run_id, status, answer?}` |
 
@@ -158,6 +163,44 @@ Notifications:
 | `session.list_archived` | `{}` | the archived index |
 | `session.archive` | `{session}` | outcome |
 | `session.unarchive` | `{session}` | outcome |
+
+Notification:
+
+| method | params |
+|---|---|
+| `session.changed` | `{change: "archived" \| "unarchived", session}` — broadcast to every client (the requester included) when a conversation moves between the live and archived stores; recipients re-read both lists and drop live state for an archived record |
+
+### settings.* — the host-owned engine endpoint settings
+
+The provider, its credentials, and the WSL preference live on the **host**
+(`engine-settings.json` in its runtime dir, versioned, 0600) — never in a
+client. Clients edit them here and consume them as status; key material
+never travels down the wire, only presence. Runs read the store at config
+time, so a change replaces the conversation's engine process on its next
+start.
+
+| method | params | result |
+|---|---|---|
+| `settings.get` | `{}` | the status shape below |
+| `settings.set` | `{provider?, custom_api_url?, deepseek_api_key?, custom_api_key?, wsl?: {enabled, distro?, engine?}}` — absent fields stay unchanged; a present string field is trimmed and, when empty, **clears** the stored value; a present `wsl` replaces the whole group; an unknown `provider` is refused | the status shape below, post-write |
+
+The status shape, also the params of every `settings.changed` notification:
+
+```jsonc
+{
+  "provider": "openseek" | "deepseek" | "custom",
+  "custom_api_url": "https://…",   // absent when unset
+  "has_deepseek_key": false,       // presence only — the key text never leaves the host
+  "has_custom_key": false,
+  "wsl": {"enabled": false, "distro": "…", "engine": "…"}  // distro/engine absent when unset
+}
+```
+
+Notification:
+
+| method | params |
+|---|---|
+| `settings.changed` | the status shape — broadcast to every client (the requester included) after each successful `settings.set`, so every page renders the same configuration |
 
 ### workspace.*
 
@@ -271,7 +314,7 @@ never calls them and shows no update UI.
 | `app.list` | `{}` | `{apps: [{id, name, icon}]}` — `icon` is a `data:image/png` URL, empty when extraction failed |
 | `app.launch` | `{session, cwd?, app}` | `{launched}` |
 | `host.open_path` | `{session, cwd?, path}` | `{opened}` — hand a transcript-referenced path to the system opener; relative paths resolve against the conversation's working directory (`cwd` when the client has it, else derived from `session`); deliberately no workspace containment — the user clicked a path the agent itself surfaced |
-| `host.meta` | `{}` | `{protocol: 2, name}` |
+| `host.meta` | `{}` | `{protocol: 2, name, wsl}` — `wsl` is whether the **host** can run the engine inside WSL (a Windows host); clients must consume this rather than sniff their own user agent, since the page may run on any device |
 
 Reserved notification (not yet emitted over the wire):
 `host.notification_clicked` `{session}` — a system notification was clicked.

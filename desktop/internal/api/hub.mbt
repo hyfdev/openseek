@@ -26,8 +26,9 @@ priv struct Hub {
   subscribers : Array[@async.Queue[Notification]]
   // The `agent.started` params of every run still in flight, keyed by run
   // id — the source for `agent.runs`, which is how a client that joins (or
-  // reconnects) mid-run learns the run's identity.
-  active_starts : Map[Int, Json]
+  // reconnects) mid-run learns the run's identity. Insertion order is
+  // run-start order.
+  active_starts : Map[String, Json]
 }
 
 ///|
@@ -65,12 +66,11 @@ fn Hub::publish(self : Hub, method_ : String, params : Json) -> Unit {
 }
 
 ///|
-fn params_run_id(params : Json) -> Int? {
-  guard params is Object(fields) &&
-    fields.get("run_id") is Some(Number(run_id, ..)) else {
+fn params_run_id(params : Json) -> String? {
+  guard params is Object(fields) && fields.get("run_id") is Some(String(run_id)) else {
     return None
   }
-  Some(run_id.to_int())
+  Some(run_id)
 }
 
 ///|
@@ -98,15 +98,11 @@ fn Hub::unsubscribe(self : Hub, queue : @async.Queue[Notification]) -> Unit {
 
 ///|
 /// The `agent.runs` reply: every in-flight run's `agent.started` params, in
-/// run-id order.
+/// run-start order (the map preserves insertion order).
 fn Hub::runs(self : Hub) -> Json {
-  let ids = self.active_starts.keys().collect()
-  ids.sort()
   let runs : Array[Json] = []
-  for id in ids {
-    if self.active_starts.get(id) is Some(params) {
-      runs.push(params)
-    }
+  for _, params in self.active_starts {
+    runs.push(params)
   }
   { "runs": Json::array(runs) }
 }
