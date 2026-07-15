@@ -83,18 +83,6 @@ pub fn ws_connect(
   }
   active_session.val = Some(session)
   socket.set_with_string("onopen", (_event : @js.Value) => {
-    // Negotiate before exposing the socket to request senders. Old hosts
-    // ignore client notifications; new hosts can omit full semantic
-    // transcript events whose durable form arrives through `session.event`.
-    let capabilities = @js.Object::new()
-    capabilities["durable_session_events"] = true
-    let frame = @js.Object::new()
-    frame["jsonrpc"] = "2.0"
-    frame["method"] = "client.capabilities"
-    frame["params"] = capabilities.to_value()
-    let _ : @js.Value = socket.apply_with_string("send", [
-      @js.Value::cast_from(json_text(frame.to_value())),
-    ])
     session.open_ = true
   })
   socket.set_with_string("onmessage", (event : @js.Value) => {

@@ -36,9 +36,6 @@ Frames are JSON text, shaped as **JSON-RPC 2.0**:
 // client → host: request
 {"jsonrpc": "2.0", "id": 1, "method": "agent.start", "params": {…}}
 
-// client → host: optional connection capability (no reply expected)
-{"jsonrpc": "2.0", "method": "client.capabilities", "params": {"durable_session_events": true}}
-
 // host → client: response (exactly one per request, either form)
 {"jsonrpc": "2.0", "id": 1, "result": {…}}
 {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "…"}}
@@ -51,13 +48,11 @@ Request `id`s are client-assigned and client-scoped (a monotonic counter is
 fine). Responses may arrive out of order relative to other requests — the
 `id` is the correlation. Batch requests are not supported.
 
-`client.capabilities` is an optional, connection-scoped notification. A
-browser that sets `durable_session_events` to `true` asks the host to trim
-high-volume transcript objects whose canonical form is delivered by
-`session.event`. This trimming applies only to named durable sessions;
-session-less runs retain the complete legacy stream because they have no
-`session.event` source. For a durable run, the pushed `agent.started` remains
-with `task: ""`;
+Remote delivery trims high-volume transcript objects whose canonical form is
+delivered by `session.event`. This is the protocol baseline and applies only to
+named durable sessions. Session-less runs retain the complete legacy stream
+because they have no `session.event` source. For a durable run, the pushed
+`agent.started` remains with `task: ""`;
 `reasoning_message` and `assistant_message` remain as stream-settlement signals
 with `content: ""`; `tool_result`, `auto_compaction_finished`, `agent_finished`,
 and `context_yield` are omitted. The separate `agent.finished` lifecycle
@@ -65,9 +60,8 @@ notification remains, including its optional `answer`;
 `compaction_finished` remains with an empty `summary` so it still closes the
 lifecycle state. Deltas, usage, step progress, tool-decode errors, runtime
 status, steer receipts, and all other run/compaction lifecycle and error events
-are unchanged. Missing, false, malformed, and unknown capabilities retain the
-legacy stream. Old hosts ignore the notification, and the desktop's in-process
-bridge does not negotiate it.
+are unchanged. The desktop's in-process bridge continues to receive the hub's
+complete stream; this trimming is specific to remote WebSocket delivery.
 
 ## Authentication
 
@@ -126,9 +120,8 @@ it is a state query, not an event log. A connection delivers events from the
 moment it exists; whatever a client missed while disconnected it recovers by
 re-reading state:
 
-1. Connect the WebSocket. A capable client immediately sends
-   `client.capabilities`; notifications start flowing immediately, and the
-   capability applies once the host receives it.
+1. Connect the WebSocket. The host sends `agent.connected` as the connection's
+   first notification, then starts forwarding the remote delivery stream.
 2. Resync: `session.list` + `agent.runs` (and reload whatever conversation
    is open via `session.load`). The client gives `agent.runs` the exact owners
    from its request-time frontier: `{session, run_id}` after Started, or
@@ -253,9 +246,8 @@ record, and `sequence` is the item's one-based position there — contiguous
 per session. Everything else on the wire is transient stream or lifecycle
 state: commit-aware clients may show deltas live, but full semantic messages,
 `agent.started`'s `task`, and steer receipts never append transcript items —
-their durable form arrives as a commit. A negotiated
-`durable_session_events` connection receives the lightweight forms described
-above instead of duplicate full semantic payloads.
+their durable form arrives as a commit. A remote WebSocket receives the
+lightweight forms described above instead of duplicate full semantic payloads.
 
 Client algorithm, per session: keep a watermark `W`, starting at the
 snapshot's. For each `session.event`: `sequence ≤ W` → drop (re-broadcasts

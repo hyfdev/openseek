@@ -40,10 +40,9 @@ async fn open_client_subscription(state : @api.ApiState) -> ClientSubscription {
 priv enum Inbound {
   // The raw `id` (echoed back verbatim), the method, and the params.
   Request(Json, String, Json)
-  // A client notification: method and params. The sole recognized one is
-  // the connection-scoped capability negotiation; unknown notifications
-  // remain harmless and are dropped.
-  ClientNotification(String, Json)
+  // Client notifications are valid JSON-RPC but this transport currently
+  // has none to act on, so they are ignored without a response.
+  ClientNotification
   // Not JSON at all (-32700).
   Unparsable
   // JSON, but not a JSON-RPC request (-32600).
@@ -100,9 +99,6 @@ pub async fn serve_client(
   let subscription = open_client_subscription(state)
   let out = subscription.out
   let notifications = subscription.notifications
-  // Local to this WebSocket. The hub and every other transport continue to
-  // see the complete legacy stream.
-  let durable_session_events = Ref(false)
   defer state.unsubscribe(notifications)
   @async.with_task_group(group => {
     group.spawn_bg(() => {
@@ -119,8 +115,7 @@ pub async fn serve_client(
       // protocol promises a disconnect over a silent gap in the stream).
       for ;; {
         let notification = notifications.get()
-        guard notification_for_client(notification, durable_session_events.val)
-          is Some(notification) else {
+        guard notification_for_client(notification) is Some(notification) else {
           continue
         }
         guard out.try_put(Notify(notification)) else {
@@ -151,11 +146,7 @@ pub async fn serve_client(
           group.spawn_bg(() => {
             out.put(Response(run_request(state, id, method_, params)))
           })
-        ClientNotification(method_, params) =>
-          match durable_session_events_capability(method_, params) {
-            Some(enabled) => durable_session_events.val = enabled
-            None => ()
-          }
+        ClientNotification => ()
         Unparsable =>
           out.put(
             Response(
@@ -202,43 +193,25 @@ fn classify(text : String) -> Inbound {
   }
   match fields.get("id") {
     Some(id) => Request(id, method_, params)
-    None => ClientNotification(method_, params)
+    None => ClientNotification
   }
 }
 
 ///|
-/// Decode the one optional client capability this WebSocket understands.
-/// Missing, malformed, and unknown notifications leave the connection's
-/// legacy default untouched; an explicit false can turn a prior opt-in off.
-fn durable_session_events_capability(method_ : String, params : Json) -> Bool? {
-  guard method_ == "client.capabilities" && params is Object(fields) else {
-    return None
-  }
-  match fields.get("durable_session_events") {
-    Some(True) => Some(true)
-    Some(False) => Some(false)
-    _ => None
-  }
-}
-
-///|
-/// Apply the optional connection's delivery profile at the WebSocket edge.
+/// Apply the remote delivery profile at the WebSocket edge.
 /// Full semantic transcript objects have a canonical `session.event` twin;
 /// deltas, metrics, errors, acknowledgements, and lifecycle state pass
 /// through. Lifecycle frames carrying large durable text are copied and
-/// trimmed so the hub's original notification stays untouched.
+/// trimmed so the hub's original notification stays untouched for local
+/// transports.
 fn notification_for_client(
   notification : @api.Notification,
-  durable_session_events : Bool,
 ) -> @api.Notification? {
-  if !durable_session_events {
-    return Some(notification)
-  }
   let method_ = notification.method_
   let params = notification.params
   // A session-less run has no store and therefore no `session.event` twin.
-  // Keep its legacy semantic stream intact even on an opted-in connection;
-  // the same browser may interleave durable and ephemeral runs.
+  // Keep its complete semantic stream intact; the same browser may interleave
+  // durable and ephemeral runs.
   let has_durable_session = params is Object(fields) &&
     fields.get("session") is Some(String(session)) &&
     !session.is_empty()
@@ -341,47 +314,16 @@ async test "readiness precedes the first forwarded hub notification" {
 }
 
 ///|
-test "classify keeps client notification method and params" {
+test "classify accepts client notifications" {
   let message : Json = {
     "jsonrpc": "2.0",
-    "method": "client.capabilities",
-    "params": { "durable_session_events": true },
+    "method": "client.notice",
+    "params": { "value": true },
   }
   match classify(message.stringify()) {
-    ClientNotification(
-      "client.capabilities",
-      { "durable_session_events": True, .. }
-    ) => ()
-    _ => fail("expected a client capability notification")
+    ClientNotification => ()
+    _ => fail("expected a client notification")
   }
-}
-
-///|
-test "durable session capability accepts booleans only" {
-  assert_eq(
-    durable_session_events_capability("client.capabilities", {
-      "durable_session_events": true,
-    }),
-    Some(true),
-  )
-  assert_eq(
-    durable_session_events_capability("client.capabilities", {
-      "durable_session_events": false,
-    }),
-    Some(false),
-  )
-  assert_eq(
-    durable_session_events_capability("client.capabilities", {
-      "durable_session_events": "true",
-    }),
-    None,
-  )
-  assert_eq(
-    durable_session_events_capability("client.other", {
-      "durable_session_events": true,
-    }),
-    None,
-  )
 }
 
 ///|
@@ -391,42 +333,26 @@ fn expect_notification(value : @api.Notification?) -> @api.Notification raise {
 }
 
 ///|
-test "legacy clients retain the original notification" {
-  let original = @api.Notification::{
-    method_: "agent.event",
-    params: {
-      "session": "session-1",
-      "event": { "event": "assistant_message", "content": "answer" },
-    },
-  }
-  let delivered = expect_notification(notification_for_client(original, false))
-  assert_true(physical_equal(delivered, original))
-}
-
-///|
-test "durable clients omit only canonical transcript duplicates" {
+test "remote delivery omits only canonical transcript duplicates" {
   for
     event_name in [
       "tool_result", "auto_compaction_finished", "agent_finished", "context_yield",
     ] {
     assert_true(
-      notification_for_client(
-        {
-          method_: "agent.event",
-          params: {
-            "session": "session-1",
-            "event": { "event": Json::string(event_name) },
-          },
+      notification_for_client({
+        method_: "agent.event",
+        params: {
+          "session": "session-1",
+          "event": { "event": Json::string(event_name) },
         },
-        true,
-      )
+      })
       is None,
     )
   }
 }
 
 ///|
-test "durable clients retain streaming runtime and error events" {
+test "remote delivery retains streaming runtime and error events" {
   for
     event_name in [
       "agent_step", "assistant_delta", "reasoning_delta", "usage", "tool_call_decode_error",
@@ -435,42 +361,36 @@ test "durable clients retain streaming runtime and error events" {
       "unknown_future_event",
     ] {
     assert_true(
-      notification_for_client(
-        {
-          method_: "agent.event",
-          params: {
-            "session": "session-1",
-            "event": { "event": Json::string(event_name) },
-          },
+      notification_for_client({
+        method_: "agent.event",
+        params: {
+          "session": "session-1",
+          "event": { "event": Json::string(event_name) },
         },
-        true,
-      )
+      })
       is Some(_),
     )
   }
   assert_true(
-    notification_for_client(
-      { method_: "session.event", params: Json::empty_object() },
-      true,
-    )
+    notification_for_client({
+      method_: "session.event",
+      params: Json::empty_object(),
+    })
     is Some(_),
   )
 }
 
 ///|
-test "durable lifecycle frames keep state and trim transcript text" {
+test "remote lifecycle frames keep state and trim transcript text" {
   let started = expect_notification(
-    notification_for_client(
-      {
-        method_: "agent.started",
-        params: {
-          "run_id": "run-1",
-          "session": "session-1",
-          "task": "large prompt",
-        },
+    notification_for_client({
+      method_: "agent.started",
+      params: {
+        "run_id": "run-1",
+        "session": "session-1",
+        "task": "large prompt",
       },
-      true,
-    ),
+    }),
   )
   assert_eq(started.params, {
     "run_id": "run-1",
@@ -478,17 +398,14 @@ test "durable lifecycle frames keep state and trim transcript text" {
     "task": "",
   })
   let finished = expect_notification(
-    notification_for_client(
-      {
-        method_: "agent.finished",
-        params: {
-          "run_id": "run-1",
-          "status": "finished",
-          "answer": "large answer",
-        },
+    notification_for_client({
+      method_: "agent.finished",
+      params: {
+        "run_id": "run-1",
+        "status": "finished",
+        "answer": "large answer",
       },
-      true,
-    ),
+    }),
   )
   assert_eq(finished.params, {
     "run_id": "run-1",
@@ -496,19 +413,16 @@ test "durable lifecycle frames keep state and trim transcript text" {
     "answer": "large answer",
   })
   let compacted = expect_notification(
-    notification_for_client(
-      {
-        method_: "agent.event",
-        params: {
-          "session": "session-1",
-          "event": {
-            "event": "compaction_finished",
-            "summary": "large summary",
-          },
+    notification_for_client({
+      method_: "agent.event",
+      params: {
+        "session": "session-1",
+        "event": {
+          "event": "compaction_finished",
+          "summary": "large summary",
         },
       },
-      true,
-    ),
+    }),
   )
   assert_eq(compacted.params, {
     "session": "session-1",
@@ -516,19 +430,16 @@ test "durable lifecycle frames keep state and trim transcript text" {
   })
   for event_name in ["reasoning_message", "assistant_message"] {
     let settled = expect_notification(
-      notification_for_client(
-        {
-          method_: "agent.event",
-          params: {
-            "session": "session-1",
-            "event": {
-              "event": Json::string(event_name),
-              "content": "large content",
-            },
+      notification_for_client({
+        method_: "agent.event",
+        params: {
+          "session": "session-1",
+          "event": {
+            "event": Json::string(event_name),
+            "content": "large content",
           },
         },
-        true,
-      ),
+      }),
     )
     assert_eq(settled.params, {
       "session": "session-1",
@@ -538,16 +449,16 @@ test "durable lifecycle frames keep state and trim transcript text" {
 }
 
 ///|
-test "durable capability preserves session-less transcript events" {
+test "remote delivery preserves session-less transcript events" {
   let started_params : Json = {
     "run_id": "run-ephemeral",
     "task": "ephemeral prompt",
   }
   let started = expect_notification(
-    notification_for_client(
-      { method_: "agent.started", params: started_params },
-      true,
-    ),
+    notification_for_client({
+      method_: "agent.started",
+      params: started_params,
+    }),
   )
   assert_eq(started.params, started_params)
   for
@@ -562,7 +473,7 @@ test "durable capability preserves session-less transcript events" {
       },
     }
     let delivered = expect_notification(
-      notification_for_client({ method_: "agent.event", params }, true),
+      notification_for_client({ method_: "agent.event", params }),
     )
     assert_eq(delivered.params, params)
   }
@@ -575,7 +486,7 @@ test "empty session is not treated as durable" {
     "event": { "event": "tool_result", "content": "ephemeral result" },
   }
   let delivered = expect_notification(
-    notification_for_client({ method_: "agent.event", params }, true),
+    notification_for_client({ method_: "agent.event", params }),
   )
   assert_eq(delivered.params, params)
 }
