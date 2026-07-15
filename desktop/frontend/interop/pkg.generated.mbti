@@ -4,6 +4,7 @@ package "openseek_desktop/frontend/interop"
 import {
   "moonbit-community/rabbita/dom",
   "moonbit-community/rabbita/js",
+  "moonbitlang/core/debug",
   "openseek_desktop/internal/pathx",
 }
 
@@ -55,8 +56,10 @@ pub fn ws_connect(String, on_notification~ : (String, Map[String, Json]) -> Unit
 // Types and methods
 pub(all) enum ChannelId {
   Local
-  Device(String)
-} derive(Eq, Hash)
+  Remote(String)
+} derive(Eq, Hash, @debug.Debug)
+pub fn ChannelId::from_uri_authority(String) -> Self?
+pub fn ChannelId::uri_authority(Self) -> String
 
 // Type aliases
 

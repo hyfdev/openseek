@@ -1,7 +1,7 @@
 // The engine-host calling core: one `bridge_request` for every frontend
 // package that talks to a host, routed by channel. `Local` is the desktop
-// window's injected `__MoonBit__.openseek` op; `Device(id)` is a relay
-// device reached over its WebSocket (docs/remote-protocol.md). The method
+// window's injected `__MoonBit__.openseek` op; `Remote(id)` is currently a
+// relay device reached over its WebSocket (docs/remote-protocol.md). The method
 // names and payloads are identical either way — callers and reply decoders
 // cannot tell the transports apart.
 
@@ -51,7 +51,7 @@ pub async fn bridge_request(
       }
       js_method_promise(api, op, payload).wait()
     }
-    Device(_) => ws_request(channel, op, payload)
+    Remote(_) => ws_request(channel, op, payload)
   }
 }
 

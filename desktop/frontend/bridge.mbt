@@ -14,7 +14,7 @@ fn install_bridge(
 ) -> @cmd.Cmd {
   match channel {
     Local => install_proton_bridge(dispatch, 0)
-    Device(device) => connect_ws(dispatch, device)
+    Remote(device) => connect_ws(dispatch, device)
   }
 }
 
@@ -240,7 +240,7 @@ const WsLostAfter = 3
 /// successful connection (the host's `agent.connected`) resets the count.
 fn connect_ws(dispatch : @cmd.Emit[Msg], device : String) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
-    let channel : @interop.ChannelId = Device(device)
+    let channel : @interop.ChannelId = Remote(device)
     @interop.ws_connect(
       device,
       on_notification=(method_, params) => {

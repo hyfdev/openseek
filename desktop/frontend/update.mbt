@@ -2029,7 +2029,7 @@ fn update_device_msg(
       )
     }
     ReconnectDue => {
-      guard channel is Device(device) else { return (@cmd.none, model) }
+      guard channel is Remote(device) else { return (@cmd.none, model) }
       (connect_ws(dispatch, device), model)
     }
     HostSettingsLoaded(settings, connection_generation~) => {
@@ -4485,7 +4485,7 @@ test "BridgeReady clears every non-replayable stream and compaction phase" {
 ///|
 test "socket losses mark the bridge lost at the third consecutive drop" {
   let dispatch = test_dispatch()
-  let channel : @interop.ChannelId = Device("d1")
+  let channel : @interop.ChannelId = Remote("d1")
   let model = {
     ..initial_model(),
     devices: [{ ..empty_device_state(channel), bridge: Connected }],
@@ -4502,7 +4502,7 @@ test "socket losses mark the bridge lost at the third consecutive drop" {
 ///|
 test "BridgeReady resets the reconnect failure count" {
   let dispatch = test_dispatch()
-  let channel : @interop.ChannelId = Device("d1")
+  let channel : @interop.ChannelId = Remote("d1")
   let model = {
     ..initial_model(),
     devices: [
@@ -4522,7 +4522,7 @@ test "BridgeReady resets the reconnect failure count" {
 ///|
 test "a late reconnect tick for a removed device changes nothing" {
   let dispatch = test_dispatch()
-  let channel : @interop.ChannelId = Device("gone")
+  let channel : @interop.ChannelId = Remote("gone")
   let model = test_model()
   let (_, next) = update(dispatch, FromDevice(channel, ReconnectDue), model)
   inspect(next.devices.length(), content="1")

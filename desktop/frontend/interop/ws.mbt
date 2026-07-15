@@ -91,7 +91,7 @@ pub fn ws_connect(
     on_down()
     return
   }
-  let channel = Device(device)
+  let channel = Remote(device)
   let ctor : @js.Value = @js.globalThis.get_with_string("WebSocket")
   let socket : @js.Value = ctor.new([url])
   let session : RpcSession = {
