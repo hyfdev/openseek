@@ -854,6 +854,88 @@
         letter-spacing: normal;
         text-transform: none;
       }
+      .device-menu-button {
+        margin-left: auto;
+        letter-spacing: normal;
+      }
+      .device-heading:hover .device-menu-button {
+        opacity: 1;
+      }
+      .device-menu {
+        display: flex;
+        gap: 6px;
+        margin: 0 8px 4px;
+      }
+      .device-menu-item {
+        padding: 2px 8px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--surface-2);
+        color: var(--ink-2);
+        font-size: 11.5px;
+        cursor: pointer;
+      }
+      .device-menu-item:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .device-menu-item.danger {
+        color: var(--warn);
+      }
+      .device-rename {
+        flex: 1 1 auto;
+        min-width: 0;
+        padding: 2px 6px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--surface-1);
+        color: var(--ink-1);
+        font-size: 12px;
+      }
+
+      /* the console's account row in the sidebar footer */
+      .console-account {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 8px;
+        color: var(--ink-2);
+        font-size: 11.5px;
+      }
+      .console-avatar {
+        flex: none;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+      }
+      .console-login {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .console-account-action {
+        flex: none;
+        padding: 2px 6px;
+        border: none;
+        background: none;
+        color: var(--ink-3);
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .console-account-action:hover {
+        color: var(--ink-1);
+      }
+      .console-account-action:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .console-notice {
+        padding: 2px 8px 6px;
+        color: var(--warn);
+        font-size: 11px;
+      }
 
       .conversation-row {
         display: flex;

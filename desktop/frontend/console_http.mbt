@@ -112,6 +112,122 @@ fn fetch_console_roster(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
 }
 
 ///|
+/// The error line of a failed mutation: the relay's `{error}` body when it
+/// sent one, the HTTP status otherwise.
+fn mutation_error(status : Int, body : String) -> String {
+  if (@json.parse(body) catch { _ => Json::null() }) is Object(fields) &&
+    @jsonx.json_text(fields, "error") is Some(message) {
+    return message
+  }
+  "the relay answered HTTP \{status}"
+}
+
+///|
+/// PATCH `/v1/devices/:id` with the new name.
+fn rename_device(
+  dispatch : @cmd.Emit[Msg],
+  device : String,
+  name : String,
+) -> @cmd.Cmd {
+  let body : Json = { "name": name.to_json() }
+  @cmd.custom_cmd(scheduler => {
+    js_fetch(
+      "/v1/devices/\{device}",
+      "PATCH",
+      true,
+      body.stringify(),
+      (status, body) => {
+        scheduler.add(
+          dispatch(
+            Console(
+              if status is (200 | 204) {
+                MutationDone
+              } else {
+                MutationFailed(mutation_error(status, body))
+              },
+            ),
+          ),
+        )
+      },
+      detail => {
+        scheduler.add(
+          dispatch(
+            Console(MutationFailed("the relay is unreachable: \{detail}")),
+          ),
+        )
+      },
+    )
+  })
+}
+
+///|
+/// DELETE `/v1/devices/:id` — revoke the device's token and drop any live
+/// tunnel.
+fn delete_device(dispatch : @cmd.Emit[Msg], device : String) -> @cmd.Cmd {
+  @cmd.custom_cmd(scheduler => {
+    js_fetch(
+      "/v1/devices/\{device}",
+      "DELETE",
+      false,
+      "",
+      (status, body) => {
+        scheduler.add(
+          dispatch(
+            Console(
+              if status is (200 | 204) {
+                MutationDone
+              } else {
+                MutationFailed(mutation_error(status, body))
+              },
+            ),
+          ),
+        )
+      },
+      detail => {
+        scheduler.add(
+          dispatch(
+            Console(MutationFailed("the relay is unreachable: \{detail}")),
+          ),
+        )
+      },
+    )
+  })
+}
+
+///|
+/// POST `/v1/auth/logout`.
+fn sign_out(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+  @cmd.custom_cmd(scheduler => {
+    js_fetch(
+      "/v1/auth/logout",
+      "POST",
+      false,
+      "",
+      (status, body) => {
+        scheduler.add(
+          dispatch(
+            Console(
+              if status is (200 | 204) {
+                SignOutDone
+              } else {
+                MutationFailed(mutation_error(status, body))
+              },
+            ),
+          ),
+        )
+      },
+      detail => {
+        scheduler.add(
+          dispatch(
+            Console(MutationFailed("the relay is unreachable: \{detail}")),
+          ),
+        )
+      },
+    )
+  })
+}
+
+///|
 fn parse_console_roster(body : String) -> Array[DeviceMeta]? {
   guard (@json.parse(body) catch { _ => return None }) is Object(fields) else {
     return None

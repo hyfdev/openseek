@@ -51,8 +51,22 @@ priv struct ConsoleState {
   // boot half (session rotation, the transcript scroll watcher) — it waits
   // for a device to focus, since no transcript DOM exists before sign-in.
   booted : Bool
+  // The device id whose "⋯" actions menu is open, if any.
+  menu_open : String?
+  // An in-progress rename: the device and the field's current text.
+  rename : ConsoleRename?
+  // The device id whose Remove is waiting for its confirming second click.
+  confirm_delete : String?
+  // A mutation (rename/revoke/sign-out) on the wire; gates the buttons.
+  busy : Bool
   // The last account-level failure, shown until the next action clears it.
   notice : String?
+}
+
+///|
+priv struct ConsoleRename {
+  device : String
+  input : String
 }
 
 ///|
@@ -67,6 +81,10 @@ fn empty_console_state(
     preselect_device,
     preselect_workspace,
     booted: false,
+    menu_open: None,
+    rename: None,
+    confirm_delete: None,
+    busy: false,
     notice: None,
   }
 }
@@ -83,6 +101,23 @@ priv enum ConsoleMsg {
   RosterFailed(String)
   // The gate card's retry / the account row's refresh — re-runs the load.
   RefreshClicked
+  // A device group's "⋯" actions menu was toggled.
+  MenuToggled(String)
+  // The rename flow: open the field, edit it, commit or drop it.
+  RenameStarted(device~ : String, current~ : String)
+  RenameEdited(String)
+  RenameCancelled
+  RenameSubmitted
+  // The revoke flow: Remove arms the confirmation, the second click acts.
+  DeleteAsked(String)
+  DeleteCancelled
+  DeleteConfirmed(String)
+  // A rename/revoke settled; done refetches the roster, whose application
+  // reconciles the removal (closes the channel, moves focus).
+  MutationDone
+  MutationFailed(String)
+  SignOutClicked
+  SignOutDone
 }
 
 ///|
@@ -134,6 +169,124 @@ fn update_console_msg(
           console: Some({ ..console, roster_sync: RosterLoading, notice: None }),
         },
       )
+    MenuToggled(device) => {
+      // Opening one device's menu closes any other; a second toggle on the
+      // same device closes it. Either way any armed Remove is disarmed.
+      let menu_open = if console.menu_open == Some(device) {
+        None
+      } else {
+        Some(device)
+      }
+      (
+        @cmd.none,
+        {
+          ..model,
+          console: Some({ ..console, menu_open, confirm_delete: None }),
+        },
+      )
+    }
+    RenameStarted(device~, current~) =>
+      (
+        @cmd.none,
+        {
+          ..model,
+          console: Some({
+            ..console,
+            rename: Some({ device, input: current }),
+            menu_open: None,
+            confirm_delete: None,
+            notice: None,
+          }),
+        },
+      )
+    RenameEdited(value) => {
+      guard console.rename is Some(rename) else { return (@cmd.none, model) }
+      (
+        @cmd.none,
+        {
+          ..model,
+          console: Some({ ..console, rename: Some({ ..rename, input: value }) }),
+        },
+      )
+    }
+    RenameCancelled =>
+      (@cmd.none, { ..model, console: Some({ ..console, rename: None }) })
+    RenameSubmitted => {
+      guard console.rename is Some(rename) && !console.busy else {
+        return (@cmd.none, model)
+      }
+      let name = rename.input.trim().to_owned()
+      guard !name.is_empty() else { return (@cmd.none, model) }
+      (
+        rename_device(dispatch, rename.device, name),
+        { ..model, console: Some({ ..console, busy: true, notice: None }) },
+      )
+    }
+    DeleteAsked(device) =>
+      // The confirmation replaces the menu's Remove item in place; the menu
+      // stays open so the second click lands where the first did.
+      (
+        @cmd.none,
+        {
+          ..model,
+          console: Some({
+            ..console,
+            confirm_delete: Some(device),
+            rename: None,
+            notice: None,
+          }),
+        },
+      )
+    DeleteCancelled =>
+      (
+        @cmd.none,
+        {
+          ..model,
+          console: Some({ ..console, confirm_delete: None, menu_open: None }),
+        },
+      )
+    DeleteConfirmed(device) => {
+      guard !console.busy else { return (@cmd.none, model) }
+      (
+        delete_device(dispatch, device),
+        {
+          ..model,
+          console: Some({ ..console, busy: true, menu_open: None, notice: None }),
+        },
+      )
+    }
+    MutationDone =>
+      // The refetched roster's application reconciles a revoke: it closes
+      // the channel, drops its state, and refocuses a survivor.
+      (
+        fetch_console_roster(dispatch),
+        {
+          ..model,
+          console: Some({
+            ..console,
+            busy: false,
+            rename: None,
+            menu_open: None,
+            confirm_delete: None,
+          }),
+        },
+      )
+    MutationFailed(message) =>
+      (
+        @cmd.none,
+        {
+          ..model,
+          console: Some({ ..console, busy: false, notice: Some(message) }),
+        },
+      )
+    SignOutClicked => {
+      guard !console.busy else { return (@cmd.none, model) }
+      (
+        sign_out(dispatch),
+        { ..model, console: Some({ ..console, busy: true, notice: None }) },
+      )
+    }
+    SignOutDone => console_signed_out(model, console)
   }
 }
 
@@ -445,6 +598,120 @@ test "a row click that raced its device's removal is dropped" {
 }
 
 ///|
+test "the actions menu toggles per device and disarms a pending remove" {
+  let dispatch = test_dispatch()
+  let (_, signed) = update(
+    dispatch,
+    Console(MeLoaded(login="o", avatar="")),
+    console_test_model(),
+  )
+  let (_, listed) = update(
+    dispatch,
+    Console(RosterLoaded(console_test_roster())),
+    signed,
+  )
+  let (_, opened) = update(dispatch, Console(MenuToggled("d_on")), listed)
+  assert_true(opened.console is Some({ menu_open: Some("d_on"), .. }))
+  // Opening another device's menu closes the first.
+  let (_, switched) = update(dispatch, Console(MenuToggled("d_off")), opened)
+  assert_true(switched.console is Some({ menu_open: Some("d_off"), .. }))
+  // Arming Remove keeps the menu; toggling it away disarms.
+  let (_, armed) = update(dispatch, Console(DeleteAsked("d_off")), switched)
+  assert_true(
+    armed.console
+    is Some({ confirm_delete: Some("d_off"), menu_open: Some("d_off"), .. }),
+  )
+  let (_, closed) = update(dispatch, Console(MenuToggled("d_off")), armed)
+  assert_true(
+    closed.console is Some({ confirm_delete: None, menu_open: None, .. }),
+  )
+  // Rename from the menu closes it and opens the field.
+  let (_, reopened) = update(dispatch, Console(MenuToggled("d_on")), closed)
+  let (_, renaming) = update(
+    dispatch,
+    Console(RenameStarted(device="d_on", current="Mac")),
+    reopened,
+  )
+  assert_true(
+    renaming.console
+    is Some({ menu_open: None, rename: Some({ device: "d_on", .. }), .. }),
+  )
+}
+
+///|
+test "rename commits only a non-blank name and clears on done" {
+  let dispatch = test_dispatch()
+  let (_, signed) = update(
+    dispatch,
+    Console(MeLoaded(login="o", avatar="")),
+    console_test_model(),
+  )
+  let (_, listed) = update(
+    dispatch,
+    Console(RosterLoaded(console_test_roster())),
+    signed,
+  )
+  let (_, editing) = update(
+    dispatch,
+    Console(RenameStarted(device="d_on", current="Mac")),
+    listed,
+  )
+  let (_, blank) = update(dispatch, Console(RenameEdited("   ")), editing)
+  let (_, still) = update(dispatch, Console(RenameSubmitted), blank)
+  // A blank name never leaves the page.
+  assert_true(still.console is Some({ busy: false, .. }))
+  let (_, edited) = update(dispatch, Console(RenameEdited("Studio")), editing)
+  let (_, saving) = update(dispatch, Console(RenameSubmitted), edited)
+  assert_true(saving.console is Some({ busy: true, .. }))
+  let (_, done) = update(dispatch, Console(MutationDone), saving)
+  assert_true(done.console is Some({ busy: false, rename: None, .. }))
+}
+
+///|
+test "delete needs its confirming second click" {
+  let dispatch = test_dispatch()
+  let (_, signed) = update(
+    dispatch,
+    Console(MeLoaded(login="o", avatar="")),
+    console_test_model(),
+  )
+  let (_, listed) = update(
+    dispatch,
+    Console(RosterLoaded(console_test_roster())),
+    signed,
+  )
+  let (_, armed) = update(dispatch, Console(DeleteAsked("d_off")), listed)
+  assert_true(armed.console is Some({ confirm_delete: Some("d_off"), .. }))
+  let (_, kept) = update(dispatch, Console(DeleteCancelled), armed)
+  assert_true(kept.console is Some({ confirm_delete: None, .. }))
+  let (_, deleting) = update(dispatch, Console(DeleteConfirmed("d_off")), armed)
+  assert_true(deleting.console is Some({ busy: true, .. }))
+}
+
+///|
+test "sign-out tears every channel down and returns to the gate" {
+  let dispatch = test_dispatch()
+  let (_, signed) = update(
+    dispatch,
+    Console(MeLoaded(login="o", avatar="")),
+    console_test_model(),
+  )
+  let (_, listed) = update(
+    dispatch,
+    Console(RosterLoaded(console_test_roster())),
+    signed,
+  )
+  let (_, out) = update(dispatch, Console(SignOutDone), listed)
+  guard out.console is Some(console) else { fail("console lost") }
+  assert_true(console.auth is AuthSignedOut)
+  assert_false(console.busy)
+  inspect(out.devices.length(), content="0")
+  inspect(out.conversations.length(), content="0")
+  inspect(out.active_session, content="")
+  assert_true(out.focused == @interop.ChannelId::Local)
+}
+
+///|
 test "a roster failure reports without leaving the signed-in frame" {
   let dispatch = test_dispatch()
   let (_, signed) = update(
@@ -482,6 +749,10 @@ fn console_signed_out(
         auth: AuthSignedOut,
         roster: [],
         roster_sync: RosterLoading,
+        menu_open: None,
+        rename: None,
+        confirm_delete: None,
+        busy: false,
         notice: None,
       }),
     },

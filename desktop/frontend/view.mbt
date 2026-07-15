@@ -233,7 +233,10 @@ fn console_session_rows(
       }
   }
   for meta in console.roster {
-    rows.push(device_group_header(model, meta))
+    rows.push(device_group_header(dispatch, model, console, meta))
+    if console.menu_open == Some(meta.id) && console.rename is None {
+      rows.push(device_menu(dispatch, console, meta))
+    }
     match model.device_state(Remote(meta.id)) {
       Some(dev) =>
         for row in device_section_rows(dispatch, model, dev) {
@@ -258,11 +261,18 @@ fn dim_row(text : String) -> @html.Html {
 }
 
 ///|
-/// One roster device's group header: the online/bridge dot, the name, and
-/// the connection state. Focus follows session and new-chat clicks inside
-/// the group, so the header itself is inert chrome (the ⋯ device menu
-/// arrives with device management).
-fn device_group_header(model : Model, meta : DeviceMeta) -> @html.Html {
+/// One roster device's group header: the online/bridge dot, the name, the
+/// connection state, and the "⋯" actions menu. Focus follows session and
+/// new-chat clicks inside the group, so the header itself is inert chrome.
+/// While renaming, the field replaces the identity block after the stable
+/// leading dot — the header's position in the list does not move, so the
+/// input keeps focus across re-renders.
+fn device_group_header(
+  dispatch : @cmd.Emit[Msg],
+  model : Model,
+  console : ConsoleState,
+  meta : DeviceMeta,
+) -> @html.Html {
   let dev = model.device_state(Remote(meta.id))
   let connected = dev is Some(dev) && dev.bridge is Connected
   let dot = if meta.online && connected {
@@ -270,31 +280,114 @@ fn device_group_header(model : Model, meta : DeviceMeta) -> @html.Html {
   } else {
     "device-dot"
   }
-  let children : Array[@html.Html] = [
-    @html.span(class=dot, ""),
-    @html.span(class="sidebar-label device-name", meta.name),
-  ]
-  let status : String? = if !meta.online {
-    Some("offline")
+  let children : Array[@html.Html] = [@html.span(class=dot, "")]
+  if console.rename is Some(rename) && rename.device == meta.id {
+    children.push(
+      @html.input(
+        class="device-rename",
+        value=rename.input,
+        autofocus=true,
+        on_input=dispatch.map(value => Console(RenameEdited(value))),
+        attrs=@html.Attrs::build().aria_label("Device name"),
+      ),
+    )
+    children.push(
+      @html.button(
+        class="device-menu-item",
+        disabled=console.busy || rename.input.trim().is_empty(),
+        on_click=dispatch(Console(RenameSubmitted)),
+        "Save",
+      ),
+    )
+    children.push(
+      @html.button(
+        class="device-menu-item",
+        on_click=dispatch(Console(RenameCancelled)),
+        "Cancel",
+      ),
+    )
   } else {
-    match dev {
-      Some(dev) =>
-        match dev.bridge {
-          Connected => None
-          Connecting => Some("connecting…")
-          BridgeLost(_) => Some("reconnecting…")
-        }
-      None => Some("connecting…")
+    children.push(@html.span(class="sidebar-label device-name", meta.name))
+    let status : String? = if !meta.online {
+      Some("offline")
+    } else {
+      match dev {
+        Some(dev) =>
+          match dev.bridge {
+            Connected => None
+            Connecting => Some("connecting…")
+            BridgeLost(_) => Some("reconnecting…")
+          }
+        None => Some("connecting…")
+      }
     }
-  }
-  if status is Some(text) {
-    children.push(@html.span(class="device-status", text))
+    if status is Some(text) {
+      children.push(@html.span(class="device-status", text))
+    }
+    children.push(
+      @html.button(
+        class="row-archive device-menu-button",
+        type_="button",
+        disabled=console.busy,
+        title="Device actions",
+        attrs=@html.Attrs::build().aria_label("Actions for \{meta.name}"),
+        on_click=dispatch(Console(MenuToggled(meta.id))),
+        "⋯",
+      ),
+    )
   }
   let title = match meta.hostname {
     Some(hostname) => "\{meta.name} — \{hostname}"
     None => meta.name
   }
   @html.div(class="sidebar-heading device-heading", title~, children)
+}
+
+///|
+/// The "⋯" menu: Rename, and the two-click Remove — the confirmation
+/// replaces the Remove item in place.
+fn device_menu(
+  dispatch : @cmd.Emit[Msg],
+  console : ConsoleState,
+  meta : DeviceMeta,
+) -> @html.Html {
+  let items : Array[@html.Html] = [
+    @html.button(
+      class="device-menu-item",
+      disabled=console.busy,
+      on_click=dispatch(
+        Console(RenameStarted(device=meta.id, current=meta.name)),
+      ),
+      "Rename",
+    ),
+  ]
+  if console.confirm_delete is Some(pending) && pending == meta.id {
+    items.push(
+      @html.button(
+        class="device-menu-item danger",
+        disabled=console.busy,
+        on_click=dispatch(Console(DeleteConfirmed(meta.id))),
+        "Really remove?",
+      ),
+    )
+    items.push(
+      @html.button(
+        class="device-menu-item",
+        on_click=dispatch(Console(DeleteCancelled)),
+        "Keep",
+      ),
+    )
+  } else {
+    items.push(
+      @html.button(
+        class="device-menu-item danger",
+        disabled=console.busy,
+        on_click=dispatch(Console(DeleteAsked(meta.id))),
+        "Remove",
+      ),
+    )
+  }
+  @html.div(class="device-menu", items)
 }
 
 ///|
@@ -680,6 +773,37 @@ fn sidebar_footer_buttons(
       ],
     ),
   )
+  // The console's account row: who is signed in, a roster refresh, and the
+  // sign-out — with the last account-level failure inline beneath it.
+  if model.console is Some(console) &&
+    console.auth is AuthSignedIn(login~, avatar~) {
+    let account : Array[@html.Html] = []
+    if !avatar.is_empty() {
+      account.push(@html.img(class="console-avatar", src=avatar, alt=login))
+    }
+    account.push(@html.span(class="console-login", "@\{login}"))
+    account.push(
+      @html.button(
+        class="console-account-action",
+        disabled=console.busy,
+        title="Refresh the device list",
+        on_click=dispatch(Console(RefreshClicked)),
+        "Refresh",
+      ),
+    )
+    account.push(
+      @html.button(
+        class="console-account-action",
+        disabled=console.busy,
+        on_click=dispatch(Console(SignOutClicked)),
+        "Sign out",
+      ),
+    )
+    buttons.push(@html.div(class="console-account", account))
+    if console.notice is Some(notice) {
+      buttons.push(@html.div(class="console-notice", notice))
+    }
+  }
   buttons
 }
 
