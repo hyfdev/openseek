@@ -183,18 +183,22 @@ pub async fn dispatch(
       // while its manager-owned lock is still held, preserving revision order
       // across concurrent clients even if the requester disconnects.
       let status = @async.protect_from_cancel(() => {
-        @engine.update_settings(state.manager, payload.to_patch(), on_committed=fn(
-          status,
-        ) {
-          // Every client renders these settings (the Settings page, the
-          // composer's ready gate); clients that did not ask must learn too.
-          state.hub.publish("settings.changed", status)
-        })
+        let status = @engine.update_settings(
+          state.manager,
+          payload.to_patch(),
+          on_committed=fn(status) {
+            // Every client renders these settings (the Settings page, the
+            // composer's ready gate); clients that did not ask must learn too.
+            state.hub.publish("settings.changed", status)
+          },
+        )
+        // A committed server switch orphans any sign-in bound to the old
+        // server. Cleanup belongs to the same protected transaction as the
+        // write, so requester cancellation cannot commit one without the
+        // other.
+        sign_out_after_server_switch(state)
+        status
       })
-      // A committed server switch orphans any sign-in bound to the old
-      // server; drop it (and its connector) rather than keep dialing a
-      // relay the settings no longer point at.
-      sign_out_after_server_switch(state)
       status
     }
     "workspace.list" => @engine.list_workspaces().to_json()

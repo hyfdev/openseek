@@ -67,6 +67,19 @@ const PingIntervalMs = 30_000
 const OutboundQueueCapacity = 64
 
 ///|
+/// Enforce one outbound bound for notifications and responses. A producer
+/// must never park behind a stalled socket: raising from any request task or
+/// the notification pump tears down the task group and reconnects cleanly.
+fn enqueue_outgoing(
+  out : @async.Queue[Outgoing],
+  item : Outgoing,
+) -> Unit raise {
+  guard out.try_put(item) else {
+    raise SlowClient("client not draining outbound frames")
+  }
+}
+
+///|
 /// JSON-RPC error codes (docs/remote-protocol.md).
 const CodeParseError = -32700
 
@@ -118,9 +131,7 @@ pub async fn serve_client(
         guard notification_for_client(notification) is Some(notification) else {
           continue
         }
-        guard out.try_put(Notify(notification)) else {
-          raise SlowClient("client not draining notifications")
-        }
+        enqueue_outgoing(out, Notify(notification))
       }
     })
     group.spawn_bg(() => {
@@ -144,17 +155,22 @@ pub async fn serve_client(
           // start, a big file read) never blocks the reader; replies are
           // correlated by id, not order.
           group.spawn_bg(() => {
-            out.put(Response(run_request(state, id, method_, params)))
+            enqueue_outgoing(
+              out,
+              Response(run_request(state, id, method_, params)),
+            )
           })
         ClientNotification => ()
         Unparsable =>
-          out.put(
+          enqueue_outgoing(
+            out,
             Response(
               error_envelope(Json::null(), CodeParseError, "unparsable frame"),
             ),
           )
         Invalid =>
-          out.put(
+          enqueue_outgoing(
+            out,
             Response(
               error_envelope(
                 Json::null(),
@@ -314,6 +330,18 @@ async test "readiness precedes the first forwarded hub notification" {
 }
 
 ///|
+test "a full outbound queue rejects responses instead of blocking tasks" {
+  let out : @async.Queue[Outgoing] = Queue(kind=Blocking(1))
+  enqueue_outgoing(out, Response(Json::null()))
+  try enqueue_outgoing(out, Response(Json::null())) catch {
+    SlowClient(_) => ()
+    error => raise error
+  } noraise {
+    _ => fail("a full outbound queue accepted another response")
+  }
+}
+
+///|
 test "classify accepts client notifications" {
   let message : Json = {
     "jsonrpc": "2.0",
@@ -417,10 +445,7 @@ test "remote lifecycle frames keep state and trim transcript text" {
       method_: "agent.event",
       params: {
         "session": "session-1",
-        "event": {
-          "event": "compaction_finished",
-          "summary": "large summary",
-        },
+        "event": { "event": "compaction_finished", "summary": "large summary" },
       },
     }),
   )
@@ -455,10 +480,7 @@ test "remote delivery preserves session-less transcript events" {
     "task": "ephemeral prompt",
   }
   let started = expect_notification(
-    notification_for_client({
-      method_: "agent.started",
-      params: started_params,
-    }),
+    notification_for_client({ method_: "agent.started", params: started_params }),
   )
   assert_eq(started.params, started_params)
   for

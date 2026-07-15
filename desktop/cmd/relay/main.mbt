@@ -233,6 +233,10 @@ async fn serve_browser(
   }
   relay.pending[stream] = entry
   defer relay.pending.remove(stream)
+  // Arm release before announcing the rendezvous. Once the host can claim
+  // the entry, every later failure — including browser upgrade — must wake
+  // the data handler that owns its WebSocket.
+  defer entry.released.close()
   device.out.put(Open(stream~)) catch {
     error if @async.is_being_cancelled() => raise error
     // The device's control connection tore down (closing its queue) between
@@ -244,9 +248,6 @@ async fn serve_browser(
   // socket is ours to close.
   let browser = res.upgrade(req)
   defer browser.close()
-  // When the splice ends — either peer hanging up, or the timeout below —
-  // release the data handler blocked on this queue.
-  defer entry.released.close()
   guard @async.with_timeout_opt(DialBackTimeoutMs, () => entry.conn.get())
     is Some(data) else {
     return

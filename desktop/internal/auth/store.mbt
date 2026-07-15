@@ -169,12 +169,7 @@ pub async fn AuthStore::handle_refusal(self : AuthStore) -> Unit {
     return
   }
   guard self.session is Some(_) else { return }
-  @async.protect_from_cancel(() => {
-    self.session = None
-    if self.runtime_dir is Some(dir) {
-      delete_session_file(dir)
-    }
-  })
+  self.clear_local_session()
 }
 
 ///|
@@ -256,17 +251,26 @@ pub async fn AuthStore::sign_out(self : AuthStore) -> Unit {
     raise AuthError("a sign-in is in progress")
   }
   guard self.session is Some(session) else { return }
-  @async.protect_from_cancel(() => {
-    self.session = None
-    self.connected = false
-    if self.runtime_dir is Some(dir) {
-      delete_session_file(dir)
-    }
-  })
+  self.clear_local_session()
   revoke_device(session) catch {
     error if @async.is_being_cancelled() => raise error
     error =>
       @xlog.warn(category="auth") <?
         { "message": "device revoke failed", "error": "\{error}" }
   }
+}
+
+///|
+/// Clear local authority and wake the connector as one cancellation-safe
+/// transition. File deletion is best-effort, but neither its suspension nor
+/// requester cancellation may leave the old connector running.
+async fn AuthStore::clear_local_session(self : AuthStore) -> Unit {
+  @async.protect_from_cancel(() => {
+    self.session = None
+    self.connected = false
+    self.poke()
+    if self.runtime_dir is Some(dir) {
+      delete_session_file(dir)
+    }
+  })
 }

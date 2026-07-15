@@ -12,8 +12,8 @@ const ExchangeTimeoutMs = 30_000
 
 ///|
 /// The full sign-in flow against `server_url`. On success the session is
-/// committed (memory + auth.json); the caller owns poking the supervisor
-/// and publishing `auth.changed`. Raises `AuthError` for every failure a
+/// committed (auth.json + memory) and the supervisor is poked; the caller
+/// owns publishing `auth.changed`. Raises `AuthError` for every failure a
 /// user can act on.
 pub async fn AuthStore::sign_in(self : AuthStore, server_url~ : String) -> Unit {
   guard !self.sign_in_active else {
@@ -115,15 +115,29 @@ pub async fn AuthStore::sign_in(self : AuthStore, server_url~ : String) -> Unit 
     raise AuthError("the sign-in was cancelled")
   }
 
-  // Commit: memory + disk, shielded — a persisted token is never half
-  // committed by a disconnecting requester.
-  @async.protect_from_cancel(() => {
-    self.session = Some(session)
-    self.connected = false
-    if self.runtime_dir is Some(dir) {
-      save_session_file(dir, session)
-    }
-  })
+  self.commit_session(session)
+}
+
+///|
+/// Commit one exchanged session without exposing a token that failed to
+/// persist. `resume_on_cancel` lets the API finish its server-selection
+/// revalidation and `auth.changed` publication after this point; the next
+/// unprotected suspension still observes the requester's cancellation.
+async fn AuthStore::commit_session(
+  self : AuthStore,
+  session : AuthSession,
+) -> Unit {
+  @async.protect_from_cancel(
+    () => {
+      if self.runtime_dir is Some(dir) {
+        save_session_file(dir, session)
+      }
+      self.session = Some(session)
+      self.connected = false
+      self.poke()
+    },
+    resume_on_cancel=true,
+  )
 }
 
 ///|

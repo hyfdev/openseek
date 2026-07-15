@@ -188,12 +188,30 @@ fn legacy_settings_patch(
   @interop.set_trimmed(patch, "custom_api_url", custom_url)
   @interop.set_trimmed(patch, "deepseek_api_key", api_key)
   @interop.set_trimmed(patch, "custom_api_key", custom_api_key)
-  if wsl_enabled == "1" {
+  if wsl_enabled == "1" ||
+    !wsl_distro.trim().is_empty() ||
+    !wsl_engine.trim().is_empty() {
     let wsl = @js.Object::new()
-    wsl["enabled"] = true
+    wsl["enabled"] = wsl_enabled == "1"
     @interop.set_trimmed(wsl, "distro", wsl_distro)
     @interop.set_trimmed(wsl, "engine", wsl_engine)
     patch["wsl"] = wsl.to_value()
   }
   patch.to_value()
+}
+
+///|
+test "legacy migration preserves disabled WSL preferences" {
+  let patch = legacy_settings_patch(
+    provider="",
+    custom_url="",
+    api_key="",
+    custom_api_key="",
+    wsl_enabled="",
+    wsl_distro=" Ubuntu ",
+    wsl_engine=" /opt/openseek ",
+  ).to_json()
+  json_inspect(patch, content={
+    "wsl": { "enabled": false, "distro": "Ubuntu", "engine": "/opt/openseek" },
+  })
 }

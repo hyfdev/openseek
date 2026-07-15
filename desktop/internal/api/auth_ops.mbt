@@ -37,12 +37,33 @@ async fn auth_connect(state : ApiState) -> Json {
     @auth.AuthError(message) => raise @host.HostError(message)
     error => raise @host.HostError("sign-in failed: \{error}")
   }
-  // The token is persisted: the wake-up and the announcement must not be
-  // lost to a disconnecting requester.
-  @async.protect_from_cancel(() => {
-    store.poke()
-    state.hub.publish("auth.changed", store.status_json())
-  })
+  // The persisted session is not final until its issuer still matches the
+  // selected server. This protected completion also runs when cancellation
+  // landed during the commit shield in `sign_in`.
+  @async.protect_from_cancel(
+    () => {
+      if @engine.remote_server_base(state.manager) != Some(server_url) {
+        // Publish the final local state even if cleanup itself raises after
+        // clearing it.
+        defer state.hub.publish("auth.changed", store.status_json())
+        store.sign_out() catch {
+          @auth.AuthError(message) =>
+            raise @host.HostError(
+              "could not discard the superseded sign-in: \{message}",
+            )
+          error =>
+            raise @host.HostError(
+              "could not discard the superseded sign-in: \{error}",
+            )
+        }
+        raise @host.HostError(
+          "the server changed during sign-in; connect again for the selected server",
+        )
+      }
+      state.hub.publish("auth.changed", store.status_json())
+    },
+    resume_on_cancel=true,
+  )
   auth_status(state)
 }
 
@@ -55,12 +76,19 @@ async fn auth_disconnect(state : ApiState) -> Json {
     raise @host.HostError("remote access is configured through the environment")
   }
   store.sign_out() catch {
-    error if @async.is_being_cancelled() => raise error
+    error if @async.is_being_cancelled() => {
+      // `sign_out` has already cleared local authority and poked the
+      // supervisor before cancellation can escape its local transition.
+      @async.protect_from_cancel(
+        () => state.hub.publish("auth.changed", store.status_json()),
+        resume_on_cancel=true,
+      )
+      raise error
+    }
     @auth.AuthError(message) => raise @host.HostError(message)
     error => raise @host.HostError("sign-out failed: \{error}")
   }
   @async.protect_from_cancel(() => {
-    store.poke()
     state.hub.publish("auth.changed", store.status_json())
   })
   auth_status(state)
@@ -97,7 +125,6 @@ async fn sign_out_after_server_switch(state : ApiState) -> Unit {
         }
   }
   @async.protect_from_cancel(() => {
-    store.poke()
     state.hub.publish("auth.changed", store.status_json())
   })
 }

@@ -134,6 +134,51 @@ async test "auth.json persists 0600 and deletes cleanly" {
 }
 
 ///|
+async test "session commit persists before memory and wakes each local transition" {
+  let session : AuthSession = {
+    server_url: "https://relay.example",
+    device_token: "odt_secret",
+    device_id: "d_abc",
+    device_name: "My Mac",
+    user_login: "octocat",
+    user_avatar_url: "",
+  }
+  let store = AuthStore::empty()
+  store.commit_session(session)
+  assert_true(store.session_server() is Some("https://relay.example"))
+  assert_true(store.wakeups().try_get() is Some(_))
+  store.connected = true
+  store.clear_local_session()
+  assert_false(store.connected)
+  assert_true(store.session_server() is None)
+  assert_true(store.wakeups().try_get() is Some(_))
+
+  let root : @path.Path = Path(@fs.tmpdir(prefix="openseek-auth-fail-"))
+  let unavailable = root.join("missing")
+  let failing = AuthStore::load(runtime_dir=unavailable)
+  failing.session = Some({
+    server_url: "https://old.example",
+    device_token: "old_secret",
+    device_id: "d_old",
+    device_name: "Old Mac",
+    user_login: "octocat",
+    user_avatar_url: "",
+  })
+  failing.connected = true
+  try failing.commit_session(session) catch {
+    AuthError(_) => ()
+    error => raise error
+  } noraise {
+    _ => fail("commit unexpectedly succeeded without a runtime directory")
+  }
+  // A failed write exposes neither the new token nor a connector wakeup.
+  assert_true(failing.session_server() is Some("https://old.example"))
+  assert_true(failing.connected)
+  assert_true(failing.wakeups().try_get() is None)
+  @fs.rmdir(root.to_string(), recursive=true)
+}
+
+///|
 test "store transitions dedup their auth.changed edges" {
   let store = AuthStore::empty()
   assert_true(store.desired_connector() is None)

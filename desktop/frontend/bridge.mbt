@@ -147,8 +147,15 @@ fn proton_event_methods() -> Array[String] {
   [
     "agent.connected", "agent.started", "agent.event", "agent.error", "agent.finished",
     "agent.durable", "session.event", "session.changed", "workspace.changed", "settings.changed",
-    "lsp.diagnostics", "fs.changed",
+    "auth.changed", "lsp.diagnostics", "fs.changed",
   ]
+}
+
+///|
+test "proton subscribes to remote-access status changes" {
+  assert_true(
+    proton_event_methods().iter().any(method_ => method_ == "auth.changed"),
+  )
 }
 
 ///|
