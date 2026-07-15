@@ -37,6 +37,8 @@ fn bridge_msg(method_ : String, payload : Map[String, Json]) -> Msg? {
       decode_host_settings(payload).map(settings => {
         HostSettingsLoaded(settings, connection_generation=None)
       })
+    "auth.changed" =>
+      decode_remote_access(payload).map(status => RemoteStatusLoaded(status))
     "lsp.diagnostics" => diagnostics_msg(payload)
     "fs.changed" => fs_changed_msg(payload)
     _ => None

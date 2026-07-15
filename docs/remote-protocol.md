@@ -21,8 +21,8 @@ APIs live under `/v1`:
 
 | Route | What |
 |---|---|
-| `GET /` | The frontend bundle: sign-in + device picker |
-| `GET /d/<device>/` (and asset paths under it) | The same bundle, one device's console |
+| `GET /` | The frontend bundle's portal: sign-in, every online device's workspaces flattened into one list, device management |
+| `GET /d/<device>/` (and asset paths under it) | The same bundle, one device's console; `?workspace=<path>` preselects the workspace new conversations land in |
 | `GET /healthz` | Relay liveness probe, `200 ok` |
 | `/v1/auth/*`, `/v1/devices…` | The relay's own auth and device APIs (see Authentication) |
 
@@ -84,9 +84,11 @@ not secrets — the barrier is ownership:
   bounces a one-time code to the listener, and the host swaps it (plus
   its PKCE verifier, `challenge = hex(sha256(verifier))`) at
   `POST /v1/auth/desktop/exchange` for `{device_token, device, user}` —
-  the exchange **is** device registration. The host persists the token;
-  `OPENSEEK_DEVICE_TOKEN` / `OPENSEEK_RELAY_URL` remain as development
-  overrides.
+  the exchange **is** device registration. The host persists the token
+  (`auth.json` in its runtime dir, 0600). Development overrides:
+  `OPENSEEK_DEVICE_TOKEN` + `OPENSEEK_RELAY_URL` pin the connector config
+  directly (bypassing sign-in), and `OPENSEEK_SERVER_URL` points the
+  sign-in flow at an ad-hoc server regardless of the settings' selection.
 
 The relay's own HTTP surface (OAuth routes, the devices API, schema) is
 specified in the openseek-api repo's `docs/relay-auth-design.md`. The
@@ -298,12 +300,19 @@ has opened the same run.
 
 ### settings.* — the host-owned engine endpoint settings
 
-The provider, its credentials, and the WSL preference live on the **host**
-(`engine-settings.json` in its runtime dir, versioned, 0600) — never in a
-client. Clients edit them here and consume them as status; key material
-never travels down the wire, only presence. Runs read the store at config
-time, so a change replaces the conversation's engine process on its next
-start.
+The server selection, its credentials, and the WSL preference live on the
+**host** (`engine-settings.json` in its runtime dir, versioned, 0600) —
+never in a client. Clients edit them here and consume them as status; key
+material never travels down the wire, only presence. Runs read the store
+at config time, so a change replaces the conversation's engine process on
+its next start.
+
+`provider` is the one **server selection**: it decides the
+chat-completions endpoint, the update channel `update.check` should be
+asked with (`openseek-staging` → `"staging"`, everything else →
+`"production"`), and which relay `auth.connect` signs in to (only the
+OpenSeek servers have one). Committing a switch away from a signed-in
+session's server signs that session out (`auth.changed` follows).
 
 | method | params | result |
 |---|---|---|
@@ -315,7 +324,7 @@ The status shape, also the params of every `settings.changed` notification:
 ```jsonc
 {
   "revision": 7,                    // host-process monotonic revision
-  "provider": "openseek" | "deepseek" | "custom",
+  "provider": "openseek" | "openseek-staging" | "deepseek" | "custom",
   "custom_api_url": "https://…",   // absent when unset
   "has_deepseek_key": false,       // presence only — the key text never leaves the host
   "has_custom_key": false,
@@ -423,15 +432,19 @@ no business operating. A browser signs in with the relay directly
 | method | params | result |
 |---|---|---|
 | `auth.status` | `{}` | the status shape below |
-| `auth.connect` | `{}` | the status shape — resolves only when the loopback flow finishes (browser round-trip included), so it can take minutes; errors are the JSON-RPC error response |
-| `auth.disconnect` | `{}` | the status shape — deletes the local token, best-effort revokes the device at the relay, and stops the connector |
+| `auth.connect` | `{}` | the status shape — resolves only when the loopback flow finishes (browser round-trip included), so it can take minutes; errors are the JSON-RPC error response. While signed in it runs no browser flow (an exchange mints a new device row) and only makes sure the connector runs. Refused when the selected server has no relay (`deepseek`/`custom`) or when the environment override manages the connector |
+| `auth.disconnect` | `{}` | the status shape — deletes the local token, best-effort revokes the device at the relay, and stops the connector. Refused in override mode |
 
 The status shape, also the params of every `auth.changed` notification:
 
 ```jsonc
 {
   "server_url": "https://openseek-api.moonbitlang.cn",
+                                 // signed in: the token's issuer; signed out: the
+                                 // selection's server — absent when that server has
+                                 // no relay (deepseek/custom) or in a supervisor push
   "connected": false,            // control WS currently registered
+  "managed_by_env": true,        // present only under the OPENSEEK_RELAY_URL override
   "user":   {"login": "…", "avatar_url": "…"},   // absent when signed out
   "device": {"id": "d_…", "name": "…", "url": "…/d/d_…/"}  // absent when signed out
 }

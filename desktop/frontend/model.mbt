@@ -40,8 +40,8 @@ const NotificationCornerStorageKey : String = "openseek.notification_corner"
 const TreeLayoutStorageKey : String = "openseek.tree_layout"
 
 ///|
-/// Which release stream updates come from; stores "staging" for the staging
-/// server, anything else reads as production.
+/// Obsolete: the update channel derives from the server selection now. The
+/// key is kept only so startup can delete whatever old builds stored.
 const UpdateChannelStorageKey : String = "openseek.update_channel"
 
 ///|
@@ -54,6 +54,7 @@ const UpdateChannelStorageKey : String = "openseek.update_channel"
 /// replies and the `settings.changed` broadcast last reported.
 priv enum ApiProvider {
   Openseek
+  OpenseekStaging
   Deepseek
   Custom
 }
@@ -62,6 +63,7 @@ priv enum ApiProvider {
 fn ApiProvider::wire(self : ApiProvider) -> String {
   match self {
     Openseek => "openseek"
+    OpenseekStaging => "openseek-staging"
     Deepseek => "deepseek"
     Custom => "custom"
   }
@@ -73,9 +75,21 @@ fn ApiProvider::wire(self : ApiProvider) -> String {
 /// wedging the app.
 fn ApiProvider::parse(value : String) -> ApiProvider {
   match value.trim().to_owned() {
+    "openseek-staging" => OpenseekStaging
     "deepseek" => Deepseek
     "custom" => Custom
     _ => Openseek
+  }
+}
+
+///|
+/// The update channel the server selection implies: the staging server
+/// serves staging builds, everything else follows production. The channel
+/// stopped being its own setting when the server choice became one.
+fn ApiProvider::update_channel(self : ApiProvider) -> UpdateChannel {
+  match self {
+    OpenseekStaging => Staging
+    Openseek | Deepseek | Custom => Production
   }
 }
 
@@ -565,6 +579,10 @@ priv struct Model {
   // close path — from a browser tab, `window.close()` exits nothing, and the
   // update would yank the app out from under whoever is at the machine.
   is_desktop : Bool
+  // The portal page's state when this page *is* the portal (a browser at
+  // the relay root, outside any device prefix); None everywhere else. The
+  // console — sidebar, transcript, bridge — never boots while this is set.
+  portal : @portal.Model?
   wsl_enabled : Bool
   wsl_distro : String
   wsl_engine : String
@@ -678,12 +696,32 @@ priv struct Model {
   notification_corner : NotificationCorner
   // Where the editor panel's file tree docks; a Settings choice, persisted.
   tree_layout : @fileeditor.TreeLayout
-  // Which release stream `check_update` asks; a Settings choice, persisted.
-  update_channel : UpdateChannel
   // Where the self-update flow stands, from "never checked" through the
   // download to the restart. One enum, so "checking", "downloading" and
-  // "confirming" cannot overlap.
+  // "confirming" cannot overlap. (The channel it checks derives from the
+  // server selection — `ApiProvider::update_channel`.)
   update_ux : UpdateUx
+  // The host's relay sign-in mirror (`auth.status` reply / `auth.changed`
+  // broadcast), None until the first reply. Desktop-window-only UI.
+  remote_access : RemoteAccess?
+  // An `auth.connect` waiting on the user's browser round-trip.
+  remote_connecting : Bool
+  // The last connect/disconnect failure, shown inside the section.
+  remote_error : String?
+}
+
+///|
+/// One `auth.status`/`auth.changed` payload, decoded: who this host is
+/// signed in as and whether its relay registration is live. A mirror of
+/// the wire shape (docs/remote-protocol.md `auth.*`) — signed out is
+/// `user_login: None`.
+priv struct RemoteAccess {
+  server_url : String?
+  connected : Bool
+  managed_by_env : Bool
+  user_login : String?
+  device_name : String?
+  device_url : String?
 }
 
 ///|
@@ -760,6 +798,8 @@ priv enum Msg {
   Init
   BridgeReady
   BridgeUnavailable(String)
+  // The portal page's own messages, routed through `@portal.update`.
+  Portal(@portal.Msg)
   // The host's `host.meta` reply: whether the host itself can run the engine
   // inside WSL (a Windows host). The page's own platform says nothing — a
   // phone browser may drive a Windows host and a Windows browser a Mac one.
@@ -767,11 +807,7 @@ priv enum Msg {
   // UI preferences read back from localStorage at startup. Engine endpoint
   // settings are the host's (`HostSettingsLoaded`); only page-local looks
   // live here.
-  SettingsLoaded(
-    notification_corner~ : String,
-    tree_layout~ : String,
-    update_channel~ : String
-  )
+  SettingsLoaded(notification_corner~ : String, tree_layout~ : String)
   // The host's settings, from a `settings.get` reply or a peer client's
   // edit broadcast as `settings.changed`. Applied only while no local write
   // is in flight — see `Model::settings_saves`.
@@ -855,10 +891,21 @@ priv enum Msg {
   NotificationExpired(Int)
   // A toast was clicked: dismiss it now.
   DismissNotification(Int)
-  // The Settings choice of release stream (production/staging, by wire name).
-  UpdateChannelChanged(String)
   // The Settings "Check for updates" button.
   CheckForUpdates
+  // An `auth.status` reply or `auth.changed` broadcast: the host's relay
+  // sign-in state moved.
+  RemoteStatusLoaded(RemoteAccess)
+  // The Remote access Connect button; the flow blocks on a browser
+  // round-trip, so the section shows an in-progress state until a
+  // finished/failed message settles it.
+  RemoteConnectClicked
+  RemoteConnectFinished(RemoteAccess)
+  RemoteConnectFailed(String)
+  // The Remote access Disconnect button and its failure (success arrives
+  // as `RemoteStatusLoaded` via the op's reply).
+  RemoteDisconnectClicked
+  RemoteDisconnectFailed(String)
   // A `check_update` reply (or its failure, folded into `Unreachable`).
   // `explicit` says a user asked, which is what decides how loudly each
   // outcome shows.
@@ -1206,6 +1253,15 @@ fn initial_model() -> Model {
     legacy_cleanup_pending: false,
     host_wsl: false,
     is_desktop: @interop.using_proton_bridge(),
+    // A browser page outside any `/d/<device>/` prefix is the relay's
+    // portal (sign-in + the flat workspace list); the console never
+    // materializes there and the protocol WebSocket is never opened.
+    portal: if @interop.using_proton_bridge() ||
+      @interop.page_device_id() is Some(_) {
+      None
+    } else {
+      Some(@portal.Model::init())
+    },
     wsl_enabled: false,
     wsl_distro: "",
     wsl_engine: "",
@@ -1227,7 +1283,12 @@ fn initial_model() -> Model {
     archived: [],
     archive_overrides: [],
     workspaces: [],
-    active_workspace: "",
+    // A portal link into this console may preselect the project
+    // (`?workspace=`); new conversations then land in it from the start.
+    active_workspace: match @interop.page_query_param("workspace") {
+      Some(path) => path
+      None => ""
+    },
     workspace_picker: None,
     transcript_pinned: true,
     screen: Chat,
@@ -1244,8 +1305,10 @@ fn initial_model() -> Model {
     notification_seq: 0,
     notification_corner: BottomRight,
     tree_layout: RightSidebar,
-    update_channel: Production,
     update_ux: UpdateUnknown,
+    remote_access: None,
+    remote_connecting: false,
+    remote_error: None,
   }
 }
 
@@ -1317,7 +1380,7 @@ fn Model::flush_host_settings(self : Model) -> Model {
 /// themselves live on the host; a start carries none.
 fn Model::api_ready(self : Model) -> Bool {
   match self.api_provider {
-    Openseek => true
+    Openseek | OpenseekStaging => true
     Deepseek => self.deepseek_key_saved
     Custom => !self.custom_api_url.trim().is_empty()
   }

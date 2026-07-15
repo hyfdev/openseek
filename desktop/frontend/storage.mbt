@@ -11,12 +11,14 @@
 ///|
 fn load_saved_settings(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
+    // The update channel stopped being its own setting (it derives from the
+    // server selection now); drop the obsolete key wherever it lingers.
+    remove_setting(UpdateChannelStorageKey)
     scheduler.add(
       dispatch(
         SettingsLoaded(
           notification_corner=load_setting(NotificationCornerStorageKey),
           tree_layout=load_setting(TreeLayoutStorageKey),
-          update_channel=load_setting(UpdateChannelStorageKey),
         ),
       ),
     )
@@ -31,11 +33,6 @@ fn save_notification_corner(corner : NotificationCorner) -> @cmd.Cmd {
 ///|
 fn save_tree_layout(layout : @fileeditor.TreeLayout) -> @cmd.Cmd {
   @cmd.custom_cmd(_ => save_setting(TreeLayoutStorageKey, layout.wire()))
-}
-
-///|
-fn save_update_channel(channel : UpdateChannel) -> @cmd.Cmd {
-  @cmd.custom_cmd(_ => save_setting(UpdateChannelStorageKey, channel.wire()))
 }
 
 ///|

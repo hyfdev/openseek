@@ -1,0 +1,11 @@
+import {
+  "moonbit-community/rabbita/cmd",
+  "moonbit-community/rabbita/html",
+  "moonbitlang/core/json",
+  "openseek_desktop/internal/jsonx",
+  "openseek_desktop/frontend/interop",
+}
+
+warnings = "+test_unqualified_package+unnecessary_annotation+unnecessary_view_op+ambiguous_range_direction+unqualified_local_using"
+
+supported_targets = "js"

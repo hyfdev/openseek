@@ -2709,6 +2709,189 @@
         color: var(--del);
       }
 
+      /* ---------- portal (the relay root page) ---------- */
+      /* Full-screen on its own: the console frame (sidebar | content) never
+         renders here. Reuses the settings pages' column rhythm. */
+      .portal {
+        height: 100%;
+        overflow: auto;
+        background: var(--paper);
+      }
+      .portal-inner {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 28px 20px 60px;
+        display: flex;
+        flex-direction: column;
+        gap: 22px;
+      }
+      .portal-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .portal-header h1 {
+        margin: 0;
+        font-size: 20px;
+      }
+      .portal-header-right {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .portal-avatar {
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+      }
+      .portal-login {
+        font-size: 13px;
+        color: var(--ink-2);
+      }
+      .portal-card {
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        padding: 28px;
+        margin-top: 8vh;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+      }
+      .portal-card h2 {
+        margin: 0;
+        font-size: 16px;
+      }
+      .portal-card p {
+        margin: 0;
+        color: var(--ink-2);
+        font-size: 13.5px;
+      }
+      .portal-button-link {
+        display: inline-block;
+        padding: 8px 14px;
+        border-radius: var(--radius-sm);
+        background: var(--accent);
+        color: #fff;
+        text-decoration: none;
+        font-size: 13px;
+      }
+      .portal-button-link:hover {
+        background: var(--accent-ink);
+      }
+      .portal-section h2 {
+        margin: 0 0 10px;
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--ink-2);
+      }
+      .portal-list {
+        display: flex;
+        flex-direction: column;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+        overflow: hidden;
+      }
+      .portal-list > * + * {
+        border-top: 1px solid var(--line);
+      }
+      .portal-list p {
+        margin: 0;
+        padding: 12px 14px;
+      }
+      .portal-dim {
+        color: var(--ink-2);
+        font-size: 13px;
+      }
+      .portal-notice {
+        color: var(--del);
+        font-size: 13px;
+      }
+      a.portal-workspace {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        padding: 12px 14px;
+        text-decoration: none;
+        color: var(--ink);
+      }
+      a.portal-workspace:hover {
+        background: var(--surface-2);
+      }
+      .portal-workspace-name {
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .portal-workspace-path {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--ink-2);
+        font-size: 12.5px;
+      }
+      .portal-workspace-device {
+        color: var(--ink-2);
+        font-size: 12px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 1px 8px;
+        white-space: nowrap;
+      }
+      .portal-device {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        font-size: 13px;
+      }
+      .portal-device-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--line);
+        flex: none;
+      }
+      .portal-device-dot.online {
+        background: var(--add);
+      }
+      .portal-device-name {
+        font-weight: 600;
+      }
+      .portal-device .portal-open-link {
+        margin-left: auto;
+        color: var(--accent);
+        text-decoration: none;
+        font-size: 12.5px;
+      }
+      .portal-device .portal-open-link:hover {
+        text-decoration: underline;
+      }
+      .portal-rename {
+        flex: 1;
+        min-width: 0;
+        padding: 5px 8px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--paper);
+        color: var(--ink);
+        font-size: 13px;
+      }
+      button.danger {
+        border-color: var(--del);
+        color: var(--del);
+        padding: 6px 12px;
+        font-size: 12px;
+      }
+      button.danger:not(:disabled):hover {
+        background: var(--del);
+        color: #fff;
+      }
+
       @media (max-width: 760px) {
         .app {
           grid-template-columns: 1fr;

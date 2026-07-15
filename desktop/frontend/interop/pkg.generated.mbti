@@ -16,6 +16,10 @@ pub fn bridge_error_text(Error) -> String
 
 pub async fn bridge_request(String, @js.Value) -> @js.Value
 
+pub fn device_id_in_path(String) -> String?
+
+pub fn encode_query_component(String) -> String
+
 pub fn js_method_promise(@js.Value, String, @js.Value) -> @js.Promise raise @js.Error_
 
 pub fn js_prop(@js.Value, String) -> @js.Value?
@@ -23,6 +27,12 @@ pub fn js_prop(@js.Value, String) -> @js.Value?
 pub fn moonbit_bridge_root() -> @js.Value?
 
 pub fn openseek_api() -> @js.Value?
+
+pub fn page_device_id() -> String?
+
+pub fn page_query_param(String) -> String?
+
+pub fn page_ws_origin() -> String?
 
 pub fn reply_json_text(@js.Value) -> String
 

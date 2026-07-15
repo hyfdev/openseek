@@ -21,28 +21,37 @@ priv struct RpcSession {
 let active_session : Ref[RpcSession?] = Ref(None)
 
 ///|
-/// The document base path — everything up to and including the last `/` of
-/// the page's own pathname. The WebSocket URL is built relative to it so a
-/// relay that serves the app under `/d/<device>/` keeps that prefix. This
-/// is the one thing the relay's path scheme needs from the frontend.
-fn api_base() -> String {
+/// The device id in the page's own pathname — `/d/<device>/…` is the relay's
+/// device-console prefix (docs/remote-protocol.md). `None` on any other path:
+/// the portal page at `/`, which never opens the protocol WebSocket. This is
+/// the one thing the relay's path scheme needs from the frontend.
+pub fn page_device_id() -> String? {
   guard js_prop(@js.globalThis, "location") is Some(location) else {
-    return "/"
+    return None
   }
   let pathname : String? = @js.Cast::into(
     (location.get_with_string("pathname") : @js.Value),
   )
-  guard pathname is Some(pathname) && !pathname.is_empty() else { return "/" }
-  match pathname.rev_find("/") {
-    Some(index) => pathname[:index + 1].to_owned()
-    None => "/"
-  }
+  guard pathname is Some(pathname) else { return None }
+  device_id_in_path(pathname)
 }
 
 ///|
-/// The page's protocol WebSocket URL: same origin, document-relative path,
-/// `ws`/`wss` following `http`/`https`.
-fn ws_url() -> String? {
+/// `/d/<device>` or `/d/<device>/…` → the device id.
+pub fn device_id_in_path(pathname : String) -> String? {
+  guard pathname.strip_prefix("/d/") is Some(rest) else { return None }
+  let device = match rest.find("/") {
+    Some(index) => rest[:index]
+    None => rest[:]
+  }
+  guard !device.is_empty() else { return None }
+  Some(device.to_owned())
+}
+
+///|
+/// The page's own origin with the WebSocket scheme — `wss://host` for an
+/// `https:` page, `ws://host` otherwise; `None` outside a browser page.
+pub fn page_ws_origin() -> String? {
   guard js_prop(@js.globalThis, "location") is Some(location) else {
     return None
   }
@@ -56,7 +65,16 @@ fn ws_url() -> String? {
     (location.get_with_string("protocol") : @js.Value),
   )
   let scheme = if protocol is Some("https:") { "wss://" } else { "ws://" }
-  Some(scheme + host + api_base() + "api/v1/ws")
+  Some(scheme + host)
+}
+
+///|
+/// The page's protocol WebSocket URL: same origin, the relay's
+/// `/v1/devices/<device>/ws` route for the device this page is scoped to.
+fn ws_url() -> String? {
+  guard page_device_id() is Some(device) else { return None }
+  guard page_ws_origin() is Some(origin) else { return None }
+  Some("\{origin}/v1/devices/\{device}/ws")
 }
 
 ///|
@@ -82,9 +100,7 @@ pub fn ws_connect(
     open_: false,
   }
   active_session.val = Some(session)
-  socket.set_with_string("onopen", (_event : @js.Value) => {
-    session.open_ = true
-  })
+  socket.set_with_string("onopen", (_event : @js.Value) => session.open_ = true)
   socket.set_with_string("onmessage", (event : @js.Value) => {
     handle_message(session, event, on_notification)
   })

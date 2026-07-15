@@ -5,20 +5,13 @@
 // a conversation would be interrupted.
 
 ///|
-/// Which release stream `check_update` asks. A Settings choice; Staging
-/// exists to exercise a release before it goes live.
+/// Which release stream `check_update` asks. Derived from the server
+/// selection (`ApiProvider::update_channel`): the staging server serves
+/// staging builds.
 priv enum UpdateChannel {
   Production
   Staging
-}
-
-///|
-fn UpdateChannel::parse(value : String) -> UpdateChannel {
-  match value {
-    "staging" => Staging
-    _ => Production
-  }
-}
+} derive(Eq)
 
 ///|
 fn UpdateChannel::wire(self : UpdateChannel) -> String {

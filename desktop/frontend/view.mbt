@@ -1469,6 +1469,11 @@ fn provider_select(
       "OpenSeek (default, no API key)",
     ),
     @html.option(
+      value="openseek-staging",
+      selected=selected is OpenseekStaging,
+      "OpenSeek staging (testing)",
+    ),
+    @html.option(
       value="deepseek",
       selected=selected is Deepseek,
       "DeepSeek official (your API key)",
@@ -1525,18 +1530,96 @@ fn tree_layout_select(
 }
 
 ///|
-fn channel_select(
+/// The Remote access group's rows: sign-in state against the selected
+/// OpenSeek server, or why there is nothing to sign in to.
+fn remote_access_rows(
   dispatch : @cmd.Emit[Msg],
-  selected : UpdateChannel,
-) -> @html.Html {
-  @html.select(on_change=dispatch.map(value => UpdateChannelChanged(value)), [
-    @html.option(
-      value="production",
-      selected=selected is Production,
-      "Production",
-    ),
-    @html.option(value="staging", selected=selected is Staging, "Staging"),
-  ])
+  model : Model,
+) -> Array[@html.Html] {
+  let rows : Array[@html.Html] = []
+  if !(model.api_provider is (Openseek | OpenseekStaging)) &&
+    !(model.remote_access is Some({ user_login: Some(_), .. })) {
+    rows.push(
+      setting_row(
+        "Remote control",
+        [],
+        desc="Needs the OpenSeek server — select it under API endpoint.",
+      ),
+    )
+    return rows
+  }
+  match model.remote_access {
+    None =>
+      rows.push(setting_row("Remote control", [], desc="Checking sign-in…"))
+    Some(status) =>
+      if status.managed_by_env {
+        rows.push(
+          setting_row(
+            "Remote control",
+            [],
+            desc="Configured through the environment (OPENSEEK_RELAY_URL); sign-in is disabled.",
+          ),
+        )
+      } else if status.user_login is Some(login) {
+        let state = if status.connected {
+          "online — reachable from your browser"
+        } else {
+          "connecting to the relay…"
+        }
+        rows.push(
+          setting_row(
+            "Signed in as",
+            [
+              @html.button(
+                class="secondary",
+                on_click=dispatch(RemoteDisconnectClicked),
+                "Disconnect",
+              ),
+            ],
+            desc="@\{login} — \{state}",
+          ),
+        )
+        if status.device_url is Some(url) {
+          let name = status.device_name.unwrap_or("this machine")
+          rows.push(
+            setting_row(
+              "Device page",
+              [],
+              desc="\{name} — open \{url} in a signed-in browser.",
+            ),
+          )
+        }
+      } else {
+        let target = match status.server_url {
+          Some(server) =>
+            "Registers this machine at \{server} so your browser can drive it."
+          None =>
+            "Registers this machine so your browser can drive it through the relay."
+        }
+        rows.push(
+          setting_row(
+            "Sign in",
+            [
+              @html.button(
+                class="primary",
+                disabled=model.remote_connecting,
+                on_click=dispatch(RemoteConnectClicked),
+                if model.remote_connecting {
+                  "Waiting for the browser…"
+                } else {
+                  "Connect with GitHub"
+                },
+              ),
+            ],
+            desc=target,
+          ),
+        )
+      }
+  }
+  if model.remote_error is Some(message) {
+    rows.push(setting_row("Problem", [], desc=message))
+  }
+  rows
 }
 
 ///|
@@ -1612,6 +1695,8 @@ fn wsl_select(dispatch : @cmd.Emit[Msg], enabled : Bool) -> @html.Html {
 fn provider_hint(provider : ApiProvider) -> String {
   match provider {
     Openseek => "Requests go through the OpenSeek service; no key needed."
+    OpenseekStaging =>
+      "The OpenSeek staging server: pre-release service and staging updates."
     Deepseek => "Requests go straight to api.deepseek.com with your key."
     Custom => "Any DeepSeek-compatible chat-completions URL; key optional."
   }
@@ -1725,20 +1810,19 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
       ),
     ]),
   ]
-  // Self-update swaps the bundle under the desktop process; from a browser
-  // the section could only break the app for whoever is at the machine.
+  // Self-update swaps the bundle under the desktop process, and the relay
+  // sign-in registers the machine the host runs on; from a browser both
+  // sections could only break things for whoever is at the machine.
   if model.is_desktop {
+    groups.push(
+      settings_group("Remote access", remote_access_rows(dispatch, model)),
+    )
     groups.push(
       settings_group("Updates", [
         setting_row(
-          "Update channel",
-          [channel_select(dispatch, model.update_channel)],
-          desc="Staging serves pre-release builds for testing.",
-        ),
-        setting_row(
           "Check for updates",
           update_check_controls(dispatch, model),
-          desc="Current version: \{@version.AppVersion}.",
+          desc="Current version: \{@version.AppVersion}. The staging server serves staging builds.",
         ),
       ]),
     )
@@ -2214,6 +2298,11 @@ fn page_with_toggle(
 
 ///|
 fn view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
+  // The portal page replaces the whole console frame — no sidebar, no
+  // composer, no overlays; it is its own full-screen layout.
+  if model.portal is Some(portal_model) {
+    return @portal.view(dispatch.map(m => Portal(m)), portal_model)
+  }
   let content = match model.screen {
     Chat =>
       [

@@ -720,16 +720,34 @@ fn update_msg(
 ) -> (@cmd.Cmd, Model) {
   match msg {
     Init =>
-      (
-        @cmd.batch([
-          install_bridge(dispatch),
-          load_saved_settings(dispatch),
-          watch_transcript_scroll(dispatch),
-          watch_color_scheme(dispatch),
-          rotate_session(dispatch),
-        ]),
-        model,
+      // The portal page boots nothing of the console: no bridge, no
+      // session, no scroll watcher — its own init asks the relay who is
+      // signed in.
+      if model.portal is Some(_) {
+        (@portal.init_cmd(dispatch.map(m => Portal(m))), model)
+      } else {
+        (
+          @cmd.batch([
+            install_bridge(dispatch),
+            load_saved_settings(dispatch),
+            watch_transcript_scroll(dispatch),
+            watch_color_scheme(dispatch),
+            rotate_session(dispatch),
+          ]),
+          model,
+        )
+      }
+    Portal(msg) => {
+      guard model.portal is Some(portal_model) else {
+        return (@cmd.none, model)
+      }
+      let (cmd, next) = @portal.update(
+        dispatch.map(m => Portal(m)),
+        msg,
+        portal_model,
       )
+      (cmd, { ..model, portal: Some(next) })
+    }
     BridgeReady => {
       let connection_generation = model.connection_generation + 1
       let sessions_request_generation = model.sessions_request_generation + 1
@@ -765,12 +783,18 @@ fn update_msg(
           dispatch, connection_generation, workspaces_request_generation,
         ),
       ]
-      // Self-update is the desktop window's alone (see `is_desktop`); a
-      // browser never checks, so its update UI never materializes.
+      // Self-update and the relay sign-in are the desktop window's alone
+      // (see `is_desktop`); a browser never checks, so neither UI
+      // materializes there.
       if model.is_desktop {
         commands.push(
-          check_for_updates(dispatch, model.update_channel, explicit=false),
+          check_for_updates(
+            dispatch,
+            model.api_provider.update_channel(),
+            explicit=false,
+          ),
         )
+        commands.push(fetch_remote_status(dispatch))
       }
       // Delta streams are not replayable across a connection boundary; keep
       // none of the pre-gap fragment, or the first post-gap delta would splice
@@ -863,14 +887,13 @@ fn update_msg(
     HostMetaLoaded(wsl~) => (@cmd.none, { ..model, host_wsl: wsl })
     BridgeUnavailable(message) =>
       (@cmd.none, { ..model, bridge: BridgeLost(message) })
-    SettingsLoaded(notification_corner~, tree_layout~, update_channel~) =>
+    SettingsLoaded(notification_corner~, tree_layout~) =>
       (
         @cmd.none,
         {
           ..model,
           notification_corner: NotificationCorner::parse(notification_corner),
           tree_layout: @fileeditor.TreeLayout::parse(tree_layout),
-          update_channel: UpdateChannel::parse(update_channel),
         },
       )
     // The host's settings, from the bridge-time `settings.get` or a peer's
@@ -1124,6 +1147,14 @@ fn update_msg(
     SetupApiKeyChanged(value) => (@cmd.none, { ..model, setup_api_key: value })
     ProviderChanged(value) => {
       let provider = ApiProvider::parse(value)
+      // A server switch can move the update channel with it; whatever the
+      // old channel's check said no longer applies.
+      let update_ux = if provider.update_channel() ==
+        model.api_provider.update_channel() {
+        model.update_ux
+      } else {
+        UpdateUnknown
+      }
       (
         push_host_settings(
           dispatch,
@@ -1135,6 +1166,7 @@ fn update_msg(
           api_provider: provider,
           setup_api_key: "",
           settings_saves: model.settings_saves + 1,
+          update_ux,
         },
       )
     }
@@ -1182,15 +1214,38 @@ fn update_msg(
         @cmd.none,
         { ..model, notifications: model.notifications.filter(t => t.id != id) },
       )
-    UpdateChannelChanged(value) => {
-      let channel = UpdateChannel::parse(value)
-      // Whatever the old channel said no longer applies; the next check
-      // (Settings button or next launch) answers for the new one.
+    RemoteStatusLoaded(status) =>
+      (@cmd.none, { ..model, remote_access: Some(status) })
+    RemoteConnectClicked =>
+      // The flow blocks on a browser round-trip; a second click while one
+      // is pending would start a second loopback flow just to be refused.
+      if model.remote_connecting {
+        (@cmd.none, model)
+      } else {
+        (
+          connect_remote(dispatch),
+          { ..model, remote_connecting: true, remote_error: None },
+        )
+      }
+    RemoteConnectFinished(status) =>
       (
-        save_update_channel(channel),
-        { ..model, update_channel: channel, update_ux: UpdateUnknown },
+        @cmd.none,
+        {
+          ..model,
+          remote_access: Some(status),
+          remote_connecting: false,
+          remote_error: None,
+        },
       )
-    }
+    RemoteConnectFailed(message) =>
+      (
+        @cmd.none,
+        { ..model, remote_connecting: false, remote_error: Some(message) },
+      )
+    RemoteDisconnectClicked =>
+      (disconnect_remote(dispatch), { ..model, remote_error: None })
+    RemoteDisconnectFailed(message) =>
+      (@cmd.none, { ..model, remote_error: Some(message) })
     CheckForUpdates =>
       // A user-initiated check; never stacks on an in-flight one, and never
       // interrupts a download already underway.
@@ -1202,7 +1257,11 @@ fn update_msg(
         (@cmd.none, model)
       } else {
         (
-          check_for_updates(dispatch, model.update_channel, explicit=true),
+          check_for_updates(
+            dispatch,
+            model.api_provider.update_channel(),
+            explicit=true,
+          ),
           { ..model, update_ux: CheckingForUpdate },
         )
       }
@@ -1291,7 +1350,7 @@ fn update_msg(
           (@cmd.none, { ..model, update_ux: ConfirmingRestart(version~) })
         } else {
           (
-            download_update(dispatch, model.update_channel),
+            download_update(dispatch, model.api_provider.update_channel()),
             { ..model, update_ux: DownloadingUpdate(version~) },
           )
         }
@@ -1301,7 +1360,7 @@ fn update_msg(
     ConfirmUpdateRestart =>
       if model.update_ux is ConfirmingRestart(version~) {
         (
-          download_update(dispatch, model.update_channel),
+          download_update(dispatch, model.api_provider.update_channel()),
           { ..model, update_ux: DownloadingUpdate(version~) },
         )
       } else {
@@ -1374,7 +1433,8 @@ fn update_msg(
               { ..next, screen: if next.api_ready() { Chat } else { Settings } },
             )
           }
-          Openseek => (@cmd.none, { ..model, setup_api_key: "" })
+          Openseek | OpenseekStaging =>
+            (@cmd.none, { ..model, setup_api_key: "" })
         }
       }
     }
@@ -8157,23 +8217,17 @@ test "loaded UI preferences parse their wire names" {
   let dispatch = test_dispatch()
   let (_, restored) = update(
     dispatch,
-    SettingsLoaded(
-      notification_corner="top-left",
-      tree_layout="",
-      update_channel="staging",
-    ),
+    SettingsLoaded(notification_corner="top-left", tree_layout=""),
     test_model(),
   )
   assert_true(restored.notification_corner is TopLeft)
-  assert_true(restored.update_channel is Staging)
   // Unknown stored values fall back to the defaults.
   let (_, unknown) = update(
     dispatch,
-    SettingsLoaded(notification_corner="", tree_layout="", update_channel=""),
+    SettingsLoaded(notification_corner="", tree_layout=""),
     test_model(),
   )
   assert_true(unknown.notification_corner is BottomRight)
-  assert_true(unknown.update_channel is Production)
 }
 
 ///|
@@ -9751,7 +9805,7 @@ test "a stale check reply cannot clobber a download in flight" {
 }
 
 ///|
-test "switching the update channel forgets the previous answer" {
+test "switching the server to staging moves the channel and forgets the previous answer" {
   let dispatch = test_dispatch()
   let available = {
     ..test_model(),
@@ -9759,11 +9813,16 @@ test "switching the update channel forgets the previous answer" {
   }
   let (_, switched) = update(
     dispatch,
-    UpdateChannelChanged("staging"),
+    ProviderChanged("openseek-staging"),
     available,
   )
-  assert_true(switched.update_channel is Staging)
+  assert_true(switched.api_provider is OpenseekStaging)
+  assert_true(switched.api_provider.update_channel() is Staging)
   assert_true(switched.update_ux is UpdateUnknown)
+  // A switch that keeps the channel keeps the answer.
+  let (_, kept) = update(dispatch, ProviderChanged("deepseek"), available)
+  assert_true(kept.api_provider.update_channel() is Production)
+  assert_true(kept.update_ux is UpdateAvailable(..))
 }
 
 ///|
@@ -10429,4 +10488,79 @@ test "an archive tombstone blocks commits before the archived list refreshes" {
   )
   assert_true(next.find_conversation("desktop-tombstoned") is None)
   inspect(next.conversations.length(), content="1")
+}
+
+///|
+test "remote access walks connect states and dedups clicks" {
+  let dispatch = test_dispatch()
+  let signed_out : RemoteAccess = {
+    server_url: Some("https://relay.example"),
+    connected: false,
+    managed_by_env: false,
+    user_login: None,
+    device_name: None,
+    device_url: None,
+  }
+  let (_, seeded) = update(
+    dispatch,
+    RemoteStatusLoaded(signed_out),
+    test_model(),
+  )
+  assert_true(seeded.remote_access is Some({ user_login: None, .. }))
+  let (_, connecting) = update(dispatch, RemoteConnectClicked, seeded)
+  assert_true(connecting.remote_connecting)
+  // A second click while the browser round-trip is pending is a no-op.
+  let (second_cmd, second) = update(dispatch, RemoteConnectClicked, connecting)
+  assert_true(second.remote_connecting)
+  ignore(second_cmd)
+  let (_, failed) = update(dispatch, RemoteConnectFailed("nope"), connecting)
+  assert_false(failed.remote_connecting)
+  assert_true(failed.remote_error is Some("nope"))
+  let signed_in : RemoteAccess = {
+    ..signed_out,
+    user_login: Some("octocat"),
+    connected: true,
+  }
+  let (_, done) = update(dispatch, RemoteConnectFinished(signed_in), connecting)
+  assert_false(done.remote_connecting)
+  assert_true(
+    done.remote_access
+    is Some({ user_login: Some("octocat"), connected: true, .. }),
+  )
+  // A broadcast keeps the mirror fresh without touching the pending flag.
+  let (_, broadcast) = update(
+    dispatch,
+    RemoteStatusLoaded(signed_out),
+    connecting,
+  )
+  assert_true(broadcast.remote_connecting)
+}
+
+///|
+test "auth status payloads decode by shape" {
+  guard decode_remote_access({
+      "connected": Json::boolean(true),
+      "server_url": Json::string("https://relay.example"),
+      "user": {
+        "login": Json::string("octocat"),
+        "avatar_url": Json::string(""),
+      },
+      "device": {
+        "id": Json::string("d_abc"),
+        "name": Json::string("My Mac"),
+        "url": Json::string("https://relay.example/d/d_abc/"),
+      },
+    })
+    is Some(status) else {
+    fail("a full status did not decode")
+  }
+  assert_true(status.connected)
+  assert_true(status.user_login is Some("octocat"))
+  assert_true(status.device_url is Some("https://relay.example/d/d_abc/"))
+  guard decode_remote_access({ "connected": Json::boolean(false) })
+    is Some(signed_out) else {
+    fail("a signed-out status did not decode")
+  }
+  assert_true(signed_out.user_login is None)
+  assert_true(decode_remote_access({ "server_url": Json::string("x") }) is None)
 }

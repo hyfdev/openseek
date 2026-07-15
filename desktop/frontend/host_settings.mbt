@@ -148,7 +148,7 @@ fn api_key_settings_patch(provider : ApiProvider, key : String) -> @js.Value {
     Deepseek => patch["deepseek_api_key"] = key
     Custom => patch["custom_api_key"] = key
     // The proxy takes no user key; callers never build this patch for it.
-    Openseek => ()
+    Openseek | OpenseekStaging => ()
   }
   patch.to_value()
 }
