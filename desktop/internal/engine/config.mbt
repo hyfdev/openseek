@@ -40,6 +40,11 @@ priv struct RunConfig {
 const OpenseekProxyPrefix : String = "https://openseek-api.moonbitlang.cn/"
 
 ///|
+/// The staging deployment's twin of `OpenseekProxyPrefix`; must stay a
+/// prefix of `OpenseekStagingProxyUrl`.
+const OpenseekStagingProxyPrefix : String = "https://openseek-api-staging.moonbitlang.cn/"
+
+///|
 fn configured_api_key(
   stored_key : String?,
   api_url : String?,
@@ -50,9 +55,14 @@ fn configured_api_key(
     return value
   }
   if api_url is Some(url) {
-    // Only the official proxy gets the client token; any other endpoint
-    // would be handing the credential to a third-party server.
-    if url.has_prefix(OpenseekProxyPrefix) && client_token is Some(token) {
+    // Only the official proxy (and its staging twin) gets the client token;
+    // any other endpoint would be handing the credential to a third-party
+    // server.
+    if (
+        url.has_prefix(OpenseekProxyPrefix) ||
+        url.has_prefix(OpenseekStagingProxyPrefix)
+      ) &&
+      client_token is Some(token) {
       return token
     }
     return PlaceholderApiKey

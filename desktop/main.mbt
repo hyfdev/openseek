@@ -32,7 +32,10 @@ async fn main {
   log.info() <? { "message": "frontend asset dir", "path": frontend_asset_dir }
   log.info() <? { "message": "engine", "path": engine }
   let runtime_dir = @host.prepared_runtime_dir()
-  let state = @api.ApiState::new(engine~, runtime_dir?, executable~, on_finished=payload => {
+  // The relay sign-in store: a persisted session from auth.json, unless the
+  // environment override pins the connector config directly (development).
+  let auth = @auth.AuthStore::load(runtime_dir?, env_override?=relay_settings())
+  let state = @api.ApiState::new(engine~, runtime_dir?, executable~, auth~, on_finished=payload => {
     notify_run_finished(payload)
   })
   // Proton exposes the `__MoonBit__` bridge — both the ops and the event
@@ -56,15 +59,14 @@ async fn main {
     @host.spawn_host_pumps(group, state.host_state(), (method_, params) => {
       state.publish(method_, params)
     })
-    // Remote access is opt-in: point the host at a relay through the
-    // environment and it registers itself at startup.
-    if relay_settings() is Some((relay_url, device_token, device_name)) {
-      group.spawn_bg(allow_failure=true, () => {
-        @remote.run_connector(state, relay_url~, device_token~, device_name~, announce=device => {
-          log.info() <? { "message": "relay registered", "device": device }
-        })
+    // The connector supervisor runs for the app's lifetime: it registers
+    // this host whenever a sign-in (or the environment override) says so,
+    // and idles otherwise.
+    group.spawn_bg(allow_failure=true, () => {
+      @remote.run_supervisor(state, announce=device => {
+        log.info() <? { "message": "relay registered", "device": device }
       })
-    }
+    })
     match app.run() {
       Ok(_) => log.info() <? { "message": "host process exit ok" }
       Err(error) =>
@@ -94,12 +96,12 @@ async fn main {
 }
 
 ///|
-/// The relay connection settings, all-or-nothing from the environment:
-/// `OPENSEEK_RELAY_URL` (the relay's `/tunnel` WebSocket URL) and
+/// The development relay override, all-or-nothing from the environment:
+/// `OPENSEEK_RELAY_URL` (the relay's `/v1/tunnel` WebSocket URL) and
 /// `OPENSEEK_DEVICE_TOKEN` (the secret that keeps this machine's device id
 /// stable); `OPENSEEK_DEVICE_NAME` labels the device on the relay's status
-/// page and defaults to "desktop".
-fn relay_settings() -> (String, String, String)? {
+/// page and defaults to "desktop". When set it bypasses sign-in entirely.
+fn relay_settings() -> @auth.ConnectorConfig? {
   guard @envx.get("OPENSEEK_RELAY_URL") is Some(relay_url) &&
     @envx.get("OPENSEEK_DEVICE_TOKEN") is Some(device_token) else {
     return None
@@ -108,7 +110,7 @@ fn relay_settings() -> (String, String, String)? {
     Some(name) => name
     None => "desktop"
   }
-  Some((relay_url, device_token, device_name))
+  Some({ relay_url, device_token, device_name })
 }
 
 ///|

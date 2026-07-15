@@ -16,27 +16,42 @@ impl Show for ConnectorError with fn output(self, logger) {
 }
 
 ///|
+/// The relay rejected this token — terminal for the config, unlike every
+/// transient failure the retry loop absorbs.
+priv suberror RegistrationRefused {
+  RegistrationRefused(String)
+}
+
+///|
 const ReconnectDelayMs = 3_000
 
 ///|
-/// Run the connector for the host's lifetime: keep one control connection
-/// registered, reconnecting after any drop. `announce` is called with the
-/// device id each time the relay registers this machine, so the caller can
-/// surface the reachable URL.
-pub async fn run_connector(
+/// Keep one control connection registered, retrying transient failures
+/// forever. Returns only on a terminal `fail` control frame — the relay
+/// rejected this token — with the relay's message; the supervisor decides
+/// what that means. `on_registered` fires with the device id on every
+/// successful registration, `on_dropped` after every ended control
+/// session (a retry follows).
+async fn run_connector(
   state : @api.ApiState,
   relay_url~ : String,
   device_token~ : String,
   device_name~ : String,
-  announce~ : (String) -> Unit,
-) -> Unit {
+  on_registered~ : (String) -> Unit,
+  on_dropped~ : () -> Unit,
+) -> String {
   for ;; {
-    connect_once(state, relay_url, device_token, device_name, announce) catch {
+    connect_once(state, relay_url, device_token, device_name, on_registered) catch {
       error if @async.is_being_cancelled() => raise error
+      RegistrationRefused(message) => {
+        on_dropped()
+        return message
+      }
       error =>
         @xlog.warn(category="remote") <?
           { "message": "relay connection lost", "error": "\{error}" }
     }
+    on_dropped()
     @async.sleep(ReconnectDelayMs)
   }
 }
@@ -61,8 +76,7 @@ async fn connect_once(
   }
   let device = match frame {
     Registered(device~) => device
-    Fail(message~) =>
-      raise ConnectorError("relay refused registration: \{message}")
+    Fail(message~) => raise RegistrationRefused(message)
     Register(..) | Open(..) =>
       raise ConnectorError("relay broke the control protocol")
   }
@@ -87,8 +101,9 @@ async fn connect_once(
           group.spawn_bg(allow_failure=true, () => {
             serve_stream(state, data_url(relay_url, stream))
           })
-        Fail(message~) =>
-          raise ConnectorError("relay reported failure: \{message}")
+        // A mid-session fail is the relay revoking this registration —
+        // terminal like a refused one.
+        Fail(message~) => raise RegistrationRefused(message)
         Registered(..) | Register(..) =>
           raise ConnectorError("relay broke the control protocol")
       }

@@ -25,18 +25,28 @@ const EngineSettingsVersion = 1
 const EngineSettingsFileName = "engine-settings.json"
 
 ///|
-/// The official OpenSeek proxy endpoint runs use when the provider is
+/// The official OpenSeek proxy endpoint runs use when the server is
 /// `Openseek` — the zero-config default. Must stay under
 /// `OpenseekProxyPrefix`, which is what routes the client token to it.
 const OpenseekProxyUrl : String = "https://openseek-api.moonbitlang.cn/chat/completions"
 
 ///|
-/// Which chat-completions endpoint runs talk to. `Openseek` is the
-/// zero-config default (the proxy needs no user key); `Deepseek` is the
-/// official endpoint with the user's own key; `Custom` is any other
-/// DeepSeek-compatible endpoint.
+/// The staging twin of `OpenseekProxyUrl`, for testing against the next
+/// server build. Must stay under `OpenseekStagingProxyPrefix`.
+const OpenseekStagingProxyUrl : String = "https://openseek-api-staging.moonbitlang.cn/chat/completions"
+
+///|
+/// The one server selection: which OpenSeek server (or foreign endpoint)
+/// this install talks to. It decides the chat-completions endpoint, the
+/// update channel, and the remote-access relay in one move. `Openseek` is
+/// the zero-config default (the proxy needs no user key);
+/// `OpenseekStaging` is the same service's staging deployment; `Deepseek`
+/// is the official DeepSeek endpoint with the user's own key; `Custom` is
+/// any other DeepSeek-compatible endpoint. Remote access exists only on
+/// the OpenSeek servers — `Deepseek`/`Custom` have no relay to sign in to.
 priv enum ApiProvider {
   Openseek
+  OpenseekStaging
   Deepseek
   Custom
 }
@@ -45,6 +55,7 @@ priv enum ApiProvider {
 fn ApiProvider::wire(self : ApiProvider) -> String {
   match self {
     Openseek => "openseek"
+    OpenseekStaging => "openseek-staging"
     Deepseek => "deepseek"
     Custom => "custom"
   }
@@ -57,6 +68,7 @@ fn ApiProvider::wire(self : ApiProvider) -> String {
 fn ApiProvider::parse(value : String) -> ApiProvider? {
   match value {
     "openseek" => Some(Openseek)
+    "openseek-staging" => Some(OpenseekStaging)
     "deepseek" => Some(Deepseek)
     "custom" => Some(Custom)
     _ => None
@@ -338,6 +350,16 @@ fn resolved_endpoint(
       )
       { api_key: key, api_url: Some(url) }
     }
+    OpenseekStaging => {
+      let url = OpenseekStagingProxyUrl
+      let key = configured_api_key(
+        None,
+        Some(url),
+        None,
+        client_token?=openseek_client_token(),
+      )
+      { api_key: key, api_url: Some(url) }
+    }
     Deepseek => {
       let key = configured_api_key(
         settings.deepseek_api_key,
@@ -360,6 +382,25 @@ fn resolved_endpoint(
       { api_key: key, api_url: Some(url) }
     }
   }
+}
+
+///|
+/// The OpenSeek server origin the current server selection points remote
+/// access at — `None` for `Deepseek`/`Custom`, which have no relay to sign
+/// in to. Derived from the proxy URLs so the origins have one home;
+/// `OPENSEEK_SERVER_URL` overrides the selection for development against a
+/// local or ad-hoc server.
+pub async fn remote_server_base(manager : EngineManager) -> String? {
+  if @env.get("OPENSEEK_SERVER_URL") is Some(base) && !base.trim().is_empty() {
+    return Some(base.trim().to_owned())
+  }
+  let (settings, _) = manager.settings_snapshot()
+  let proxy = match settings.provider {
+    Openseek => OpenseekProxyUrl
+    OpenseekStaging => OpenseekStagingProxyUrl
+    Deepseek | Custom => return None
+  }
+  proxy.strip_suffix("/chat/completions").map(origin => origin.to_owned())
 }
 
 ///|
@@ -436,6 +477,40 @@ async test "a saved key round-trips as presence, never as text" {
     let reloaded = load_engine_settings(manager.runtime_dir)
     assert_true(reloaded.deepseek_api_key is Some("sk-secret"))
     assert_true(reloaded.provider is Deepseek)
+  })
+}
+
+///|
+async test "the staging server round-trips and resolves its own endpoints" {
+  with_settings_dir(async fn(_dir, manager) {
+    let status = update_settings(manager, {
+      provider: Some("openseek-staging"),
+      custom_api_url: None,
+      deepseek_api_key: None,
+      custom_api_key: None,
+      wsl: None,
+    })
+    json_inspect(status, content={
+      "revision": 1,
+      "provider": "openseek-staging",
+      "has_deepseek_key": false,
+      "has_custom_key": false,
+      "wsl": { "enabled": false },
+    })
+    let reloaded = load_engine_settings(manager.runtime_dir)
+    assert_true(reloaded.provider is OpenseekStaging)
+    debug_inspect(
+      remote_server_base(manager),
+      content="Some(\"https://openseek-api-staging.moonbitlang.cn\")",
+    )
+    let _ = update_settings(manager, {
+      provider: Some("deepseek"),
+      custom_api_url: None,
+      deepseek_api_key: None,
+      custom_api_key: None,
+      wsl: None,
+    })
+    debug_inspect(remote_server_base(manager), content="None")
   })
 }
 

@@ -36,6 +36,8 @@ pub fn open_target(String, String) -> String
 
 pub async fn registered_workspaces() -> Array[String]
 
+pub async fn remote_server_base(EngineManager) -> String?
+
 pub async fn remove_workspace(String, (Array[String]) -> Unit) -> Array[String]
 
 pub async fn resolve_in_workspace(String, String, workspace? : String) -> @path.Path?

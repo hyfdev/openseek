@@ -7,7 +7,7 @@ import {
 }
 
 // Values
-pub async fn run_connector(@api.ApiState, relay_url~ : String, device_token~ : String, device_name~ : String, announce~ : (String) -> Unit) -> Unit
+pub async fn run_supervisor(@api.ApiState, announce~ : (String) -> Unit) -> Unit
 
 pub async fn serve_client(@api.ApiState, @websocket.Conn) -> Unit
 

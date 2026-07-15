@@ -26,6 +26,8 @@ struct ApiState {
   manager : @engine.EngineManager
   host : @host.HostState
   hub : Hub
+  // The host's relay sign-in state, shared with the connector supervisor.
+  auth : @auth.AuthStore
   // Called for every finished run, alongside the notification fan-out — the
   // desktop posts its system notification here.
   on_finished : ((@engine.FinishedPayload) -> Unit)?
@@ -35,19 +37,33 @@ struct ApiState {
 /// `engine` is the engine executable; `executable` is the host's own
 /// binary, which self-update uses to locate the running .app bundle (absent
 /// or non-bundle layouts only lose the in-app install, never the
-/// announcement).
+/// announcement). `auth` defaults to an empty store (nothing signed in,
+/// nothing persisted) for test-constructed states; the desktop main loads
+/// the real one.
 pub fn ApiState::new(
   engine~ : String,
   runtime_dir? : @path.Path,
   executable? : String,
+  auth? : @auth.AuthStore,
   on_finished? : (@engine.FinishedPayload) -> Unit,
 ) -> ApiState {
   {
     manager: @engine.new_engine_manager(engine, runtime_dir?),
     host: @host.new_host_state(engine, runtime_dir?, executable?),
     hub: Hub::new(),
+    auth: match auth {
+      Some(store) => store
+      None => @auth.AuthStore::empty()
+    },
     on_finished,
   }
+}
+
+///|
+/// The sign-in store, for the connector supervisor running beside the
+/// dispatcher.
+pub fn ApiState::auth_store(self : ApiState) -> @auth.AuthStore {
+  self.auth
 }
 
 ///|
@@ -166,7 +182,7 @@ pub async fn dispatch(
       // shielded linearization point. `update_settings` invokes the callback
       // while its manager-owned lock is still held, preserving revision order
       // across concurrent clients even if the requester disconnects.
-      @async.protect_from_cancel(() => {
+      let status = @async.protect_from_cancel(() => {
         @engine.update_settings(state.manager, payload.to_patch(), on_committed=fn(
           status,
         ) {
@@ -175,6 +191,11 @@ pub async fn dispatch(
           state.hub.publish("settings.changed", status)
         })
       })
+      // A committed server switch orphans any sign-in bound to the old
+      // server; drop it (and its connector) rather than keep dialing a
+      // relay the settings no longer point at.
+      sign_out_after_server_switch(state)
+      status
     }
     "workspace.list" => @engine.list_workspaces().to_json()
     "workspace.add" => {
@@ -202,6 +223,9 @@ pub async fn dispatch(
         "name": "openseek-host",
         "wsl": Json::boolean(HostWslCapable),
       }
+    "auth.status" => auth_status(state)
+    "auth.connect" => auth_connect(state)
+    "auth.disconnect" => auth_disconnect(state)
     _ =>
       match @host.host_op(state.host, method_, params) {
         Some(reply) => reply
@@ -242,7 +266,7 @@ pub fn method_names() -> Array[String] {
     "agent.start", "agent.cancel", "agent.steer", "agent.compact", "agent.runs",
     "session.list", "session.load", "session.list_archived", "session.archive", "session.unarchive",
     "settings.get", "settings.set", "workspace.list", "workspace.add", "workspace.remove",
-    "host.meta",
+    "host.meta", "auth.status", "auth.connect", "auth.disconnect",
   ] +
   @host.host_method_names()
 }
