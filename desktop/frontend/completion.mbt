@@ -402,7 +402,7 @@ test "compose_prompt folds the chips into a parseable envelope after the text" {
 ///|
 test "a draft of chips alone is not sendable" {
   let conv = {
-    ..empty_conversation("s"),
+    ..empty_conversation(@interop.ChannelId::Local, "s"),
     mentions: [{ ref_: Skill(name="review-pr"), range: None }],
   }
   // Chips are context for an instruction; without typed text the draft is

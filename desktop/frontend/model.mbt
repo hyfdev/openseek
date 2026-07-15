@@ -233,6 +233,10 @@ priv enum SettlementFrontierMatch {
 /// process in the host — several conversations can run turns concurrently,
 /// so everything a run touches lives here rather than on the model.
 priv struct Conversation {
+  // The device channel this conversation lives on. Its transcript, runs,
+  // and every op it issues belong to that channel; two devices may hold
+  // the same session id without aliasing.
+  device : @interop.ChannelId
   // Durable engine session backing this conversation; consecutive runs share
   // it so the agent keeps context between prompts.
   session_id : String
@@ -1274,10 +1278,12 @@ fn workspace_token(root : @pathx.Absolute?) -> String {
 
 ///|
 fn empty_conversation(
+  channel : @interop.ChannelId,
   session_id : String,
   workspace? : String = "",
 ) -> Conversation {
   {
+    device: channel,
     session_id,
     workspace: workspace_root(workspace),
     task: "",
@@ -1578,9 +1584,13 @@ fn Model::display_status(self : Model) -> Status {
 }
 
 ///|
-fn Model::find_conversation(self : Model, session_id : String) -> Conversation? {
+fn Model::find_conversation(
+  self : Model,
+  channel : @interop.ChannelId,
+  session_id : String,
+) -> Conversation? {
   for conv in self.conversations {
-    if conv.session_id == session_id {
+    if conv.device == channel && conv.session_id == session_id {
       return Some(conv)
     }
   }
@@ -1591,8 +1601,13 @@ fn Model::find_conversation(self : Model, session_id : String) -> Conversation? 
 /// Capture the exact lifecycle identity of every session currently known to
 /// this page. Absence is meaningful too: a snapshot may introduce an unknown
 /// session only if no live notification materialized it before the reply.
-fn Model::run_snapshot_frontier(self : Model) -> Array[RunSnapshotFrontier] {
-  self.conversations.map(conv => {
+fn Model::run_snapshot_frontier(
+  self : Model,
+  channel : @interop.ChannelId,
+) -> Array[RunSnapshotFrontier] {
+  self.conversations
+  .filter(conv => conv.device == channel)
+  .map(conv => {
     let state = match conv.run {
       NoRun(..) => SnapshotIdle(last_run_id=conv.last_run_id)
       Starting(submission_id~) => SnapshotStarting(submission_id~)
@@ -1629,12 +1644,15 @@ fn Model::run_snapshot_frontier(self : Model) -> Array[RunSnapshotFrontier] {
 /// If the session was absent from the frontier, it must still be absent now.
 fn Model::matches_run_snapshot_frontier(
   self : Model,
+  channel : @interop.ChannelId,
   frontier : Array[RunSnapshotFrontier],
   session : String,
 ) -> Bool {
   for captured in frontier {
     if captured.session == session {
-      guard self.find_conversation(session) is Some(conv) else { return false }
+      guard self.find_conversation(channel, session) is Some(conv) else {
+        return false
+      }
       return match captured.state {
         SnapshotIdle(last_run_id~) =>
           conv.run is NoRun(..) && conv.last_run_id == last_run_id
@@ -1646,7 +1664,7 @@ fn Model::matches_run_snapshot_frontier(
       }
     }
   }
-  self.find_conversation(session) is None
+  self.find_conversation(channel, session) is None
 }
 
 ///|
@@ -1656,10 +1674,11 @@ fn Model::matches_run_snapshot_frontier(
 /// every case, and current state must still equal the captured cut.
 fn Model::matched_settlement_frontier(
   self : Model,
+  channel : @interop.ChannelId,
   frontier : Array[RunSnapshotFrontier],
   settlement : RecoveredSettlement,
 ) -> SettlementFrontierMatch? {
-  guard self.find_conversation(settlement.session) is Some(conv) else {
+  guard self.find_conversation(channel, settlement.session) is Some(conv) else {
     return None
   }
   for captured in frontier {
@@ -1713,7 +1732,7 @@ fn Model::session_workspace(self : Model, session_id : String) -> String {
       return item.workspace
     }
   }
-  match self.find_conversation(session_id) {
+  match self.find_conversation(self.focused, session_id) {
     Some(conv) => workspace_token(conv.workspace)
     None => ""
   }
@@ -1778,10 +1797,10 @@ fn Model::can_reload_transcript(self : Model, conv : Conversation) -> Bool {
 /// model has no conversations yet; an empty placeholder keeps the view (and
 /// every handler reading the active conversation) total.
 fn Model::active(self : Model) -> Conversation {
-  if self.find_conversation(self.active_session) is Some(conv) {
+  if self.find_conversation(self.focused, self.active_session) is Some(conv) {
     conv
   } else {
-    empty_conversation(self.active_session)
+    empty_conversation(self.focused, self.active_session)
   }
 }
 
@@ -1810,7 +1829,7 @@ fn Model::composing_new_chat(self : Model) -> Bool {
 fn Model::replace_conversation(self : Model, conv : Conversation) -> Model {
   let conversations = self.conversations.copy()
   for index, existing in conversations {
-    if existing.session_id == conv.session_id {
+    if existing.device == conv.device && existing.session_id == conv.session_id {
       conversations[index] = conv
       return { ..self, conversations, }
     }
@@ -1822,8 +1841,12 @@ fn Model::replace_conversation(self : Model, conv : Conversation) -> Model {
 ///|
 /// The conversation that owns run `run_id`. Engine events route by run id,
 /// so a backgrounded conversation keeps receiving its own stream.
-fn Model::conversation_by_run(self : Model, run_id : String) -> Conversation? {
-  for conv in self.conversations {
+fn Model::conversation_by_run(
+  self : Model,
+  channel : @interop.ChannelId,
+  run_id : String,
+) -> Conversation? {
+  for conv in self.conversations.filter(conv => conv.device == channel) {
     if conv.run is Open(run_id=active, ..) && active == run_id {
       return Some(conv)
     }
@@ -1837,9 +1860,10 @@ fn Model::conversation_by_run(self : Model, run_id : String) -> Conversation? {
 /// with its last run id while sitting idle between turns.
 fn Model::conversation_by_last_run(
   self : Model,
+  channel : @interop.ChannelId,
   run_id : String,
 ) -> Conversation? {
-  for conv in self.conversations {
+  for conv in self.conversations.filter(conv => conv.device == channel) {
     if conv.last_run_id is Some(last) && last == run_id {
       return Some(conv)
     }
@@ -1853,10 +1877,11 @@ fn Model::conversation_by_last_run(
 /// current/last run ownership alone is not enough to route it.
 fn Model::conversation_by_pending_steer(
   self : Model,
+  channel : @interop.ChannelId,
   submission_id : String,
   run_id : String,
 ) -> Conversation? {
-  for conv in self.conversations {
+  for conv in self.conversations.filter(conv => conv.device == channel) {
     for input in conv.input_ledger {
       if input.kind is SteerInput &&
         input.submission_id == submission_id &&
@@ -1875,11 +1900,15 @@ fn Model::conversation_by_pending_steer(
 /// ownership is retained even after lifecycle recovery closes a run: a late
 /// id-bearing receipt or rejection may still retract a warning or restore its
 /// draft. Abandoned "New chat" husks die here instead of accumulating.
-fn Model::activate(self : Model, session_id : String) -> Model {
+fn Model::activate(
+  self : Model,
+  channel : @interop.ChannelId,
+  session_id : String,
+) -> Model {
   let conversations : Array[Conversation] = []
   let mut found = false
   for conv in self.conversations {
-    if conv.session_id == session_id {
+    if conv.device == channel && conv.session_id == session_id {
       found = true
       // Opening the conversation is what "seen" means.
       conversations.push({ ..conv, unseen_finish: false })
@@ -1888,9 +1917,11 @@ fn Model::activate(self : Model, session_id : String) -> Model {
     }
   }
   if !found {
-    conversations.push(empty_conversation(session_id))
+    conversations.push(empty_conversation(channel, session_id))
   }
-  { ..self, active_session: session_id, conversations }
+  // Activating a conversation is also what moves the UI's focus to its
+  // device — a no-op while the app runs a single channel.
+  { ..self, focused: channel, active_session: session_id, conversations }
 }
 
 ///|

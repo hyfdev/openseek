@@ -122,7 +122,7 @@ fn session_row(
   nested? : Bool = false,
 ) -> @html.Html {
   let active = session_id == model.active_session
-  let conv = model.find_conversation(session_id)
+  let conv = model.find_conversation(model.focused, session_id)
   let running = conv is Some(conv) && conv.is_running()
   // The row's status dot: pulsing while a run is in flight, then — when the
   // run finished off screen — settling into a solid dot (accent for success,
@@ -327,7 +327,7 @@ fn push_group_rows(
     if item.workspace != workspace || archived(item.id) {
       continue
     }
-    let label = if model.find_conversation(item.id) is Some(conv) &&
+    let label = if model.find_conversation(model.focused, item.id) is Some(conv) &&
       item.id == model.active_session {
       conversation_title(conv)
     } else {
