@@ -85,8 +85,35 @@ pub async fn AuthStore::sign_in(self : AuthStore, server_url~ : String) -> Unit 
     CancelledByUser => raise AuthError("the sign-in was cancelled")
   }
 
-  // Exchange = device registration.
-  let session = exchange_code(server_url~, code=one_time_code, verifier~, name~)
+  // Exchange = device registration. The cancel channel stays armed through
+  // it: the swap can take up to 30 seconds, and a Cancel clicked then must
+  // abort the flow, not queue behind a session commit.
+  let exchanged : ExchangeWait = @async.any([
+    () => {
+      Exchanged(
+        exchange_code(server_url~, code=one_time_code, verifier~, name~),
+      )
+    },
+    () => {
+      self.sign_in_abort.get()
+      ExchangeCancelled
+    },
+  ])
+  guard exchanged is Exchanged(session) else {
+    raise AuthError("the sign-in was cancelled")
+  }
+  // A cancel that landed a hair after the exchange won still counts — but
+  // the exchange already minted a device row, so revoke it best-effort
+  // before failing the flow.
+  if (self.sign_in_abort.try_get() catch { _ => None }) is Some(_) {
+    revoke_device(session) catch {
+      error if @async.is_being_cancelled() => raise error
+      error =>
+        @xlog.warn(category="auth") <?
+          { "message": "device revoke failed", "error": "\{error}" }
+    }
+    raise AuthError("the sign-in was cancelled")
+  }
 
   // Commit: memory + disk, shielded — a persisted token is never half
   // committed by a disconnecting requester.
@@ -105,6 +132,13 @@ priv enum SignInWait {
   GotCode(String)
   TimedOut
   CancelledByUser
+}
+
+///|
+/// How the code-for-token exchange ended.
+priv enum ExchangeWait {
+  Exchanged(AuthSession)
+  ExchangeCancelled
 }
 
 ///|

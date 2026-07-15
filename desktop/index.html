@@ -2,7 +2,14 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- interactive-widget makes Chrome shrink the layout viewport when the
+         on-screen keyboard opens, so the flex shell compresses (topbar stays,
+         composer sits above the keyboard) instead of the whole page panning
+         up. Safari ignores the key. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content"
+    />
     <title>OpenSeek Desktop</title>
     <!-- The embedded code viewer's styles, assembled from the editor submodule
          by the packager (see build_viewer_stylesheet). -->
@@ -2569,11 +2576,13 @@
 
       /* ---------- notifications ---------- */
       /* Transient error toasts, stacked in whichever window corner Settings
-         picked. The stack floats over everything and is only rendered while
-         something is up, so it never eats clicks meant for the app. */
+         picked. Only rendered while something is up, so it never eats clicks
+         meant for the app. Above the narrow editor overlay (45) and the
+         drawer (52) — a toast must survive a full-screen panel — but below
+         the modal (60), which demands the answer first. */
       .notifications {
         position: fixed;
-        z-index: 40;
+        z-index: 55;
         display: flex;
         flex-direction: column;
         gap: 8px;
@@ -3078,6 +3087,11 @@
         select,
         .composer textarea,
         .portal-rename {
+          font-size: 16px;
+        }
+        /* The conversation reads at the same size the composer types at —
+           the 16px fields would otherwise dwarf the 13.5px transcript. */
+        .msg-content {
           font-size: 16px;
         }
         .topbar,

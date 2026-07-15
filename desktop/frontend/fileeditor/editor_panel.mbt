@@ -179,8 +179,10 @@ pub fn remove_editor_feedback(
 
 ///|
 /// Re-measure the viewport after the panel's width changes (it is laid out by
-/// CSS, so the viewer cannot see the change on its own).
-fn request_viewer_remeasure() -> @cmd.Cmd {
+/// CSS, so the viewer cannot see the change on its own). Public for the main
+/// package's viewport-resize handler — a window resize or phone rotation
+/// changes the panel's host size without any panel message.
+pub fn request_viewer_remeasure() -> @cmd.Cmd {
   @cmd.custom_cmd(
     _after => if viewer_state.viewer is Some(viewer) { viewer.layout() },
     kind=@cmd.after_render,

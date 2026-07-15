@@ -21,6 +21,8 @@ pub fn read_file(@cmd.Emit[Msg], String, @pathx.Relative, String, range~ : @comm
 
 pub fn remove_editor_feedback(ModelUri, String) -> @cmd.Cmd
 
+pub fn request_viewer_remeasure() -> @cmd.Cmd
+
 pub fn sync(@cmd.Emit[Msg], State, Ctx) -> (State, @cmd.Cmd)
 
 pub fn update(@cmd.Emit[Msg], Msg, State, Ctx) -> (@cmd.Cmd, State)

@@ -1550,8 +1550,12 @@ fn remote_access_rows(
   model : Model,
 ) -> Array[@html.Html] {
   let rows : Array[@html.Html] = []
+  // A pending connect bypasses the guard: switching the endpoint mid-flow
+  // must not hide the Cancel button while the sign-in still runs against
+  // the server it started with.
   if !(model.api_provider is (Openseek | OpenseekStaging)) &&
-    !(model.remote_access is Some({ user_login: Some(_), .. })) {
+    !(model.remote_access is Some({ user_login: Some(_), .. })) &&
+    !model.remote_connecting {
     rows.push(
       setting_row(
         "Remote control",

@@ -1420,12 +1420,21 @@ fn update_msg(
     ToggleSidebar => (@cmd.none, { ..model, sidebar_open: !model.sidebar_open })
     ViewportResized(width~) => {
       let narrow = width <= NarrowBreakpoint
+      // The embedded viewer only learns its host's size through layout(),
+      // so any resize while a document is up remeasures it — same-side
+      // resizes included (a rotation changes the host without crossing the
+      // breakpoint).
+      let cmd = if model.file_panel.open && model.file_panel.active is Some(_) {
+        @fileeditor.request_viewer_remeasure()
+      } else {
+        @cmd.none
+      }
       if narrow == model.narrow {
-        (@cmd.none, model)
+        (cmd, model)
       } else {
         // Crossing the breakpoint resets the sidebar to the new layout's
         // default: an open column on wide, a closed drawer on narrow.
-        (@cmd.none, { ..model, narrow, sidebar_open: !narrow })
+        (cmd, { ..model, narrow, sidebar_open: !narrow })
       }
     }
     ToggleChatsSection =>

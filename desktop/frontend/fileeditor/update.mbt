@@ -106,7 +106,10 @@ fn open_or_activate(
     tab_index(state, path) is Some(index) &&
     !(state.tabs[index].state is (TabBinary | TabOversized | TabDeleted)) {
     let show = show_tab(dispatch, ctx, state.tabs[index])
-    let cmd = if state.active is None {
+    // Gaining the first active tab reveals the breadcrumb row, and the
+    // narrow drill-down closing the tree reveals a viewer that was last
+    // measured while hidden — both need a remeasure alongside the show.
+    let cmd = if state.active is None || (state.tree_open && ctx.narrow) {
       @cmd.batch([show, request_viewer_remeasure()])
     } else {
       show
@@ -137,9 +140,10 @@ fn open_or_activate(
     annotation?,
     workspace=ctx.workspace,
   )
-  // Gaining the first active tab reveals the breadcrumb row, so the viewer
-  // must remeasure before the reply's document lands.
-  let cmd = if state.active is None {
+  // Gaining the first active tab reveals the breadcrumb row, and the narrow
+  // drill-down closing the tree reveals a hidden-measured viewer — either
+  // way the viewer must remeasure before the reply's document lands.
+  let cmd = if state.active is None || (state.tree_open && ctx.narrow) {
     @cmd.batch([read, request_viewer_remeasure()])
   } else {
     read
@@ -348,8 +352,16 @@ pub fn update(
       if state.active == Some(path) {
         (@cmd.none, state)
       } else if tab_index(state, path) is Some(index) {
+        let show = show_tab(dispatch, ctx, state.tabs[index])
+        // The narrow drill-down closing the tree reveals a viewer that was
+        // last measured while hidden; it must remeasure with the show.
+        let cmd = if state.tree_open && ctx.narrow {
+          @cmd.batch([show, request_viewer_remeasure()])
+        } else {
+          show
+        }
         (
-          show_tab(dispatch, ctx, state.tabs[index]),
+          cmd,
           {
             ..state,
             active: Some(path),
