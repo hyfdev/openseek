@@ -1925,6 +1925,7 @@ fn update_device_msg(
       let model = model.replace_device({
         ..dev,
         bridge: Connected,
+        reconnect_failures: 0,
         connection_generation,
         sessions_request_generation,
         archived_request_generation,
@@ -2007,6 +2008,30 @@ fn update_device_msg(
     HostMetaLoaded(wsl~) => (@cmd.none, { ..model, host_wsl: wsl })
     BridgeUnavailable(message) =>
       (@cmd.none, model.replace_device({ ..dev, bridge: BridgeLost(message) }))
+    ChannelDown => {
+      // Count the loss and schedule the next attempt. Because the attempt
+      // comes back through this function, a device removed meanwhile fails
+      // the `device_state` guard above and its loop simply ends.
+      let failures = dev.reconnect_failures + 1
+      let bridge = if failures == WsLostAfter {
+        BridgeLost(
+          "Can't reach OpenSeek. Make sure OpenSeek is running, then reopen this page.",
+        )
+      } else {
+        dev.bridge
+      }
+      (
+        @cmd.delay(
+          dispatch(FromDevice(channel, ReconnectDue)),
+          reconnect_delay(failures),
+        ),
+        model.replace_device({ ..dev, bridge, reconnect_failures: failures }),
+      )
+    }
+    ReconnectDue => {
+      guard channel is Device(device) else { return (@cmd.none, model) }
+      (connect_ws(dispatch, device), model)
+    }
     HostSettingsLoaded(settings, connection_generation~) => {
       guard connection_generation is None ||
         connection_generation == Some(dev.connection_generation) else {
@@ -4455,6 +4480,53 @@ test "BridgeReady clears every non-replayable stream and compaction phase" {
     inspect(conv.streaming_reasoning, content="")
     assert_true(conv.compaction is NotCompacting)
   }
+}
+
+///|
+test "socket losses mark the bridge lost at the third consecutive drop" {
+  let dispatch = test_dispatch()
+  let channel : @interop.ChannelId = Device("d1")
+  let model = {
+    ..initial_model(),
+    devices: [{ ..empty_device_state(channel), bridge: Connected }],
+    focused: channel,
+  }
+  let (_, one) = update(dispatch, FromDevice(channel, ChannelDown), model)
+  let (_, two) = update(dispatch, FromDevice(channel, ChannelDown), one)
+  inspect(two.dev().reconnect_failures, content="2")
+  assert_true(two.bridge_state() is Connected)
+  let (_, three) = update(dispatch, FromDevice(channel, ChannelDown), two)
+  assert_true(three.bridge_state() is BridgeLost(_))
+}
+
+///|
+test "BridgeReady resets the reconnect failure count" {
+  let dispatch = test_dispatch()
+  let channel : @interop.ChannelId = Device("d1")
+  let model = {
+    ..initial_model(),
+    devices: [
+      {
+        ..empty_device_state(channel),
+        reconnect_failures: 2,
+        bridge: BridgeLost("gone"),
+      },
+    ],
+    focused: channel,
+  }
+  let (_, next) = update(dispatch, FromDevice(channel, BridgeReady), model)
+  inspect(next.dev().reconnect_failures, content="0")
+  assert_true(next.bridge_state() is Connected)
+}
+
+///|
+test "a late reconnect tick for a removed device changes nothing" {
+  let dispatch = test_dispatch()
+  let channel : @interop.ChannelId = Device("gone")
+  let model = test_model()
+  let (_, next) = update(dispatch, FromDevice(channel, ReconnectDue), model)
+  inspect(next.devices.length(), content="1")
+  assert_true(next.device_state(channel) is None)
 }
 
 ///|

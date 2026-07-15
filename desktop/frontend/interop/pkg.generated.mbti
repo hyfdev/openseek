@@ -46,6 +46,8 @@ pub fn using_proton_bridge() -> Bool
 
 pub fn viewport_width() -> Int?
 
+pub fn ws_close(ChannelId) -> Unit
+
 pub fn ws_connect(String, on_notification~ : (String, Map[String, Json]) -> Unit, on_down~ : () -> Unit) -> Unit
 
 // Errors

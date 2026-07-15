@@ -119,6 +119,23 @@ pub fn ws_connect(
 }
 
 ///|
+/// Close a channel's connection and forget it, failing its in-flight
+/// requests. Removing the registry entry before closing makes the socket's
+/// own `onclose` a no-op (its identity check fails), so `on_down` never
+/// fires and nothing schedules a reconnect — this is how a retired device's
+/// channel is stopped for good.
+pub fn ws_close(channel : ChannelId) -> Unit {
+  guard channels.get(channel) is Some(session) else { return }
+  channels.remove(channel)
+  session.open_ = false
+  reject_all(session, "OpenSeek connection closed")
+  let _ : @js.Value = session.socket.apply_with_string(
+    "close",
+    ([] : Array[@js.Value]),
+  )
+}
+
+///|
 /// Send one request over a channel's connection and wait for its reply.
 async fn ws_request(
   channel : ChannelId,

@@ -14,7 +14,7 @@ fn install_bridge(
 ) -> @cmd.Cmd {
   match channel {
     Local => install_proton_bridge(dispatch, 0)
-    Device(device) => connect_ws(dispatch, device, failures=0)
+    Device(device) => connect_ws(dispatch, device)
   }
 }
 
@@ -233,48 +233,22 @@ fn event_payload(event : @js.Value) -> Map[String, Json]? {
 const WsLostAfter = 3
 
 ///|
-/// Open a device's WebSocket and keep it alive: every close schedules a
-/// reconnect with backoff, and a successful connection (the host's
-/// `agent.connected`) resets the failure count.
-fn connect_ws(
-  dispatch : @cmd.Emit[Msg],
-  device : String,
-  failures~ : Int,
-) -> @cmd.Cmd {
+/// Open a device's WebSocket once. Reconnection is model-driven: the socket
+/// closing dispatches `ChannelDown`, whose handler counts the loss and
+/// schedules `ReconnectDue` with backoff — so a device dropped from the
+/// model (revoked, signed out) stops reconnecting by itself, and a
+/// successful connection (the host's `agent.connected`) resets the count.
+fn connect_ws(dispatch : @cmd.Emit[Msg], device : String) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
-    let counter : Ref[Int] = Ref(failures)
     let channel : @interop.ChannelId = Device(device)
     @interop.ws_connect(
       device,
       on_notification=(method_, params) => {
-        if method_ == "agent.connected" {
-          counter.val = 0
-        }
         if bridge_msg(channel, method_, params) is Some(msg) {
           scheduler.add(dispatch(msg))
         }
       },
-      on_down=() => {
-        let next = counter.val + 1
-        if next == WsLostAfter {
-          scheduler.add(
-            dispatch(
-              FromDevice(
-                channel,
-                BridgeUnavailable(
-                  "Can't reach OpenSeek. Make sure OpenSeek is running, then reopen this page.",
-                ),
-              ),
-            ),
-          )
-        }
-        scheduler.add(
-          @cmd.delay(
-            connect_ws(dispatch, device, failures=next),
-            reconnect_delay(next),
-          ),
-        )
-      },
+      on_down=() => scheduler.add(dispatch(FromDevice(channel, ChannelDown))),
     )
   })
 }

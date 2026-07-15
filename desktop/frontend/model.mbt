@@ -553,6 +553,10 @@ priv struct DeviceState {
   channel : @interop.ChannelId
   // Whether the channel's host bridge is up; see `BridgeState`.
   bridge : BridgeState
+  // Consecutive WebSocket losses since the last successful connection.
+  // Drives the reconnect backoff and the BridgeLost threshold; always 0 for
+  // the proton channel, whose bridge never reconnects.
+  reconnect_failures : Int
   // Incremented at every BridgeReady. Session-list replies carry the value
   // captured when their request was issued, so a reply from a dead connection
   // cannot overwrite the lists rebuilt after reconnect.
@@ -589,6 +593,7 @@ fn empty_device_state(channel : @interop.ChannelId) -> DeviceState {
   {
     channel,
     bridge: Connecting,
+    reconnect_failures: 0,
     connection_generation: 0,
     sessions_request_generation: 0,
     archived_request_generation: 0,
@@ -1065,6 +1070,13 @@ priv enum Msg {
 priv enum DeviceMsg {
   BridgeReady
   BridgeUnavailable(String)
+  // The channel's WebSocket closed (or failed to open). The handler counts
+  // the loss and schedules `ReconnectDue`, making the model's device list
+  // the single authority over which reconnect loops keep running.
+  ChannelDown
+  // A scheduled reconnect attempt came due. Dropped harmlessly when the
+  // device was removed in the meantime — no `DeviceState`, no handler.
+  ReconnectDue
   // The host's `host.meta` reply: whether the host itself can run the engine
   // inside WSL (a Windows host). The page's own platform says nothing — a
   // phone browser may drive a Windows host and a Windows browser a Mac one.
