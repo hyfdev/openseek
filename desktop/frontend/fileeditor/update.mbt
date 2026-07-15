@@ -45,6 +45,7 @@ fn show_tab(dispatch : @cmd.Emit[Msg], ctx : Ctx, tab : Tab) -> @cmd.Cmd {
       )
     TabLoaded(content~, absolute~, ..) => {
       let show = show_file_in_viewer(
+        ctx.channel,
         tab.name,
         content,
         absolute~,
@@ -650,6 +651,7 @@ pub fn update(
             // — so only the viewer shows.
             Content(content~, absolute~, ..) => {
               let show = show_file_in_viewer(
+                ctx.channel,
                 name,
                 content,
                 absolute~,
@@ -795,7 +797,7 @@ pub fn update(
         (@cmd.batch(cmds), { ..state, tabs, })
       }
     DiagnosticsPublished(absolute~, diagnostics~) =>
-      (apply_diagnostics(absolute, diagnostics), state)
+      (apply_diagnostics(ctx.channel, absolute, diagnostics), state)
     FileFailed(session~, message~) =>
       if state.session != session {
         (@cmd.none, state)

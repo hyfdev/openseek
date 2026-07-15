@@ -64,7 +64,7 @@ pub(all) struct FileStat {
 }
 
 pub struct ModelUri(String)
-pub fn ModelUri::of(@pathx.Absolute) -> Self
+pub fn ModelUri::of(@interop.ChannelId, @pathx.Absolute) -> Self
 
 pub(all) enum Msg {
   ToggleFilePanel

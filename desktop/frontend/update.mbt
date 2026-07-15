@@ -10,16 +10,17 @@ const ArchivedPendingInputNotice : String = "This conversation was archived whil
 /// the conversation already in the model.
 fn session_snapshot_command(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   model : Model,
   session : String,
   generation : Int,
   activate_on_success : Bool,
 ) -> @cmd.Cmd {
-  let workspace = model.session_workspace(session)
+  let workspace = model.session_workspace(channel, session)
   if activate_on_success {
-    open_session(dispatch, model.focused, session, workspace~, generation~)
+    open_session(dispatch, channel, session, workspace~, generation~)
   } else {
-    refresh_session(dispatch, model.focused, session, workspace~, generation~)
+    refresh_session(dispatch, channel, session, workspace~, generation~)
   }
 }
 
@@ -110,13 +111,14 @@ fn adopt_workspaces(
 /// starts a fresh generation.
 fn retry_session_snapshot(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   model : Model,
   session : String,
   generation : Int,
   activate_on_success : Bool,
   message : String,
 ) -> (@cmd.Cmd, Model) {
-  guard model.find_conversation(model.focused, session) is Some(conv) &&
+  guard model.find_conversation(channel, session) is Some(conv) &&
     conv.sync
     is Reloading(generation=current, attempt~, buffered~, reload_after_current~) &&
     current == generation else {
@@ -140,7 +142,7 @@ fn retry_session_snapshot(
     (
       @cmd.delay(
         session_snapshot_command(
-          dispatch, next, session, generation, activate_on_success,
+          dispatch, channel, next, session, generation, activate_on_success,
         ),
         delay_ms,
       ),
@@ -159,11 +161,7 @@ fn retry_session_snapshot(
     }
     if activate_on_success && model.loading_session == session {
       let (toast, next) = next.notify_error(dispatch, message)
-      let (sessions, next) = request_sessions_refresh(
-        dispatch,
-        model.focused,
-        next,
-      )
+      let (sessions, next) = request_sessions_refresh(dispatch, channel, next)
       (@cmd.batch([toast, sessions, scroll]), { ..next, loading_session: "" })
     } else {
       (scroll, next)
@@ -178,6 +176,7 @@ fn retry_session_snapshot(
 /// foreground result activates only if it still owns `loading_session`.
 fn apply_session_snapshot(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   model : Model,
   session : String,
   items : Array[@transcript.TranscriptItem],
@@ -186,7 +185,7 @@ fn apply_session_snapshot(
   generation : Int,
   activate_on_success : Bool,
 ) -> (@cmd.Cmd, Model) {
-  guard model.find_conversation(model.focused, session) is Some(conv) &&
+  guard model.find_conversation(channel, session) is Some(conv) &&
     conv.sync is Reloading(generation=current, reload_after_current~, ..) &&
     current == generation else {
     return (@cmd.none, model)
@@ -194,6 +193,7 @@ fn apply_session_snapshot(
   if watermark < conv.watermark {
     return retry_session_snapshot(
       dispatch,
+      channel,
       model,
       session,
       generation,
@@ -206,7 +206,7 @@ fn apply_session_snapshot(
   let commands : Array[@cmd.Cmd] = []
   if activate_on_success && model.loading_session == session {
     next = {
-      ..next.activate(model.focused, session),
+      ..next.activate(channel, session),
       transcript_pinned: true,
       loading_session: "",
       completion: None,
@@ -214,12 +214,12 @@ fn apply_session_snapshot(
     commands.push(scroll_transcript_after_render())
     // The host derives the resumed workspace from the session id, so the
     // branch probe sends no cwd.
-    commands.push(fetch_branch(dispatch, model.focused, session, None))
+    commands.push(fetch_branch(dispatch, channel, session, None))
   } else {
     commands.push(scroll_if_active(next, session))
   }
   if gapped || reload_after_current {
-    guard next.find_conversation(model.focused, session) is Some(conv) else {
+    guard next.find_conversation(channel, session) is Some(conv) else {
       return (@cmd.batch(commands), next)
     }
     let (reloading, next_generation) = next.begin_transcript_reload(conv)
@@ -227,7 +227,7 @@ fn apply_session_snapshot(
     if next_generation is Some(next_generation) {
       commands.push(
         session_snapshot_command(
-          dispatch, next, session, next_generation, false,
+          dispatch, channel, next, session, next_generation, false,
         ),
       )
     }
@@ -428,7 +428,7 @@ fn symbol_fetch_cmd(
     model.focused,
     session,
     query,
-    workspace=workspace_root(model.session_workspace(session)),
+    workspace=workspace_root(model.session_workspace(model.focused, session)),
   )
 }
 
@@ -1700,7 +1700,12 @@ fn update_msg(
             if generation is Some(generation) {
               (
                 session_snapshot_command(
-                  dispatch, next, session_id, generation, true,
+                  dispatch,
+                  model.focused,
+                  next,
+                  session_id,
+                  generation,
+                  true,
                 ),
                 next,
               )
@@ -1749,7 +1754,12 @@ fn update_msg(
         if generation is Some(generation) {
           commands.push(
             session_snapshot_command(
-              dispatch, next, session_id, generation, true,
+              dispatch,
+              model.focused,
+              next,
+              session_id,
+              generation,
+              true,
             ),
           )
         }
@@ -1757,7 +1767,7 @@ fn update_msg(
       } else {
         // The sidebar item says which store holds the session; opening it
         // also makes its workspace the active one, so "New chat" follows.
-        let workspace = model.session_workspace(session_id)
+        let workspace = model.session_workspace(model.focused, session_id)
         let (model, generation) = model.begin_transcript_reload(
           empty_conversation(model.focused, session_id, workspace~),
         )
@@ -1767,7 +1777,12 @@ fn update_msg(
         if generation is Some(generation) {
           (
             session_snapshot_command(
-              dispatch, next, session_id, generation, true,
+              dispatch,
+              model.focused,
+              next,
+              session_id,
+              generation,
+              true,
             ),
             next,
           )
@@ -1971,6 +1986,7 @@ fn update_device_msg(
             commands.push(
               session_snapshot_command(
                 dispatch,
+                channel,
                 model,
                 conv.session_id,
                 generation,
@@ -2005,7 +2021,12 @@ fn update_device_msg(
         },
       )
     }
-    HostMetaLoaded(wsl~) => (@cmd.none, { ..model, host_wsl: wsl })
+    HostMetaLoaded(wsl~) => {
+      // `host_wsl` mirrors the focused host; a reply that outlived a focus
+      // switch (or arrived for a background device) must not clobber it.
+      guard channel == model.focused else { return (@cmd.none, model) }
+      (@cmd.none, { ..model, host_wsl: wsl })
+    }
     BridgeUnavailable(message) =>
       (@cmd.none, model.replace_device({ ..dev, bridge: BridgeLost(message) }))
     ChannelDown => {
@@ -2032,11 +2053,23 @@ fn update_device_msg(
       guard channel is Remote(device) else { return (@cmd.none, model) }
       (connect_ws(dispatch, device), model)
     }
+    FilePanel(msg) => {
+      // The file panel serves the focused conversation; a background
+      // device's fs/diagnostics noise must not re-stat or redraw it.
+      guard channel == model.focused else { return (@cmd.none, model) }
+      update_msg(dispatch, FileEditor(msg), model)
+    }
     HostSettingsLoaded(settings, connection_generation~) => {
       guard connection_generation is None ||
         connection_generation == Some(dev.connection_generation) else {
         return (@cmd.none, model)
       }
+      // The settings mirror is the focused host's. A generation-carrying
+      // reply is only ever requested for the focused channel, but the
+      // `settings.changed` broadcast (generation None) arrives from every
+      // connected device — a background device's edit must not clobber the
+      // form. A focus switch refetches, so nothing is lost.
+      guard channel == model.focused else { return (@cmd.none, model) }
       if settings.revision < model.host_settings_revision {
         (@cmd.none, model)
       } else if model.settings_saves > 0 {
@@ -2226,6 +2259,7 @@ fn update_device_msg(
             commands.push(
               session_snapshot_command(
                 dispatch,
+                channel,
                 next,
                 conv.session_id,
                 generation,
@@ -2290,15 +2324,18 @@ fn update_device_msg(
       // so a stale live-list reply cannot reopen it in that delivery gap.
       let mut next = model
       for item in items {
-        if next.archive_override(item.id) is None {
-          next = next.with_archive_override(item.id, true)
+        if next.archive_override(channel, item.id) is None {
+          next = next.with_archive_override(channel, item.id, true)
         }
       }
       let archived_now = (id : String) => {
         items.iter().any(item => item.id == id)
       }
-      if archived_now(next.active_session) {
-        let mut workspace = next.session_workspace(next.active_session)
+      // The active conversation lives on the focused channel; another
+      // device's archived list must not displace it even when a session id
+      // collides across devices.
+      if channel == next.focused && archived_now(next.active_session) {
+        let mut workspace = next.session_workspace(channel, next.active_session)
         for item in items {
           if item.id == next.active_session {
             workspace = item.workspace
@@ -2357,7 +2394,7 @@ fn update_device_msg(
           commands,
           model
           .replace_device({ ..dev, sessions, archived })
-          .with_archive_override(session, false),
+          .with_archive_override(channel, session, false),
         )
       }
       if change != "archived" {
@@ -2366,7 +2403,7 @@ fn update_device_msg(
       // Invalidate the live target before either async list reply. Keeping a
       // placeholder archived entry also blocks a late session.event from
       // rematerializing it during this window.
-      let workspace = model.session_workspace(session)
+      let workspace = model.session_workspace(channel, session)
       let sessions = dev.sessions.filter(item => item.id != session)
       let conversations = model.conversations.filter(conv => {
         conv.session_id != session
@@ -2386,7 +2423,7 @@ fn update_device_msg(
         }
         archived.push(item)
       }
-      let overridden = model.with_archive_override(session, true)
+      let overridden = model.with_archive_override(channel, session, true)
       let overridden = match overridden.device_state(channel) {
         Some(ndev) => overridden.replace_device({ ..ndev, sessions, archived })
         None => overridden
@@ -2407,7 +2444,7 @@ fn update_device_msg(
     }
     SessionLoaded(session~, items~, watermark~, event_boundaries~, generation~) =>
       apply_session_snapshot(
-        dispatch, model, session, items, watermark, event_boundaries, generation,
+        dispatch, channel, model, session, items, watermark, event_boundaries, generation,
         true,
       )
     SessionRefreshed(
@@ -2418,16 +2455,17 @@ fn update_device_msg(
       generation~
     ) =>
       apply_session_snapshot(
-        dispatch, model, session, items, watermark, event_boundaries, generation,
+        dispatch, channel, model, session, items, watermark, event_boundaries, generation,
         false,
       )
     SessionLoadFailed(session~, message~, generation~) =>
       retry_session_snapshot(
-        dispatch, model, session, generation, true, message,
+        dispatch, channel, model, session, generation, true, message,
       )
     SessionRefreshFailed(session~, generation~) =>
       retry_session_snapshot(
         dispatch,
+        channel,
         model,
         session,
         generation,
@@ -2454,7 +2492,7 @@ fn update_device_msg(
           empty_conversation(
             channel,
             session,
-            workspace=model.session_workspace(session),
+            workspace=model.session_workspace(channel, session),
           ),
         )
       } else {
@@ -2475,7 +2513,7 @@ fn update_device_msg(
             if generation is Some(generation) {
               (
                 session_snapshot_command(
-                  dispatch, model, session, generation, false,
+                  dispatch, channel, model, session, generation, false,
                 ),
                 model,
               )
@@ -2512,7 +2550,7 @@ fn update_device_msg(
               if generation is Some(generation) {
                 (
                   session_snapshot_command(
-                    dispatch, model, session, generation, false,
+                    dispatch, channel, model, session, generation, false,
                   ),
                   model,
                 )
@@ -2555,7 +2593,7 @@ fn update_device_msg(
           empty_conversation(
             channel,
             session,
-            workspace=model.session_workspace(session),
+            workspace=model.session_workspace(channel, session),
           )
       }
       let owned = submission_id is Some(id) &&
@@ -2703,7 +2741,7 @@ fn update_device_msg(
       if generation is Some(generation) {
         commands.push(
           session_snapshot_command(
-            dispatch, updated, session, generation, false,
+            dispatch, channel, updated, session, generation, false,
           ),
         )
       }
@@ -2972,7 +3010,7 @@ fn update_device_msg(
           if generation is Some(generation) {
             commands.push(
               session_snapshot_command(
-                dispatch, next, session, generation, false,
+                dispatch, channel, next, session, generation, false,
               ),
             )
           }
@@ -3118,7 +3156,7 @@ fn update_device_msg(
         if generation is Some(generation) {
           commands.push(
             session_snapshot_command(
-              dispatch, updated, session, generation, false,
+              dispatch, channel, updated, session, generation, false,
             ),
           )
         }
@@ -3189,7 +3227,7 @@ fn update_device_msg(
         if generation is Some(generation) {
           commands.push(
             session_snapshot_command(
-              dispatch, model, session, generation, false,
+              dispatch, channel, model, session, generation, false,
             ),
           )
         }
@@ -3453,6 +3491,7 @@ fn update_device_msg(
                 commands.push(
                   session_snapshot_command(
                     dispatch,
+                    channel,
                     next,
                     base.session_id,
                     generation,
@@ -3503,7 +3542,7 @@ fn update_device_msg(
           if generation is Some(generation) {
             (
               session_snapshot_command(
-                dispatch, next, session, generation, false,
+                dispatch, channel, next, session, generation, false,
               ),
               next,
             )
@@ -8720,6 +8759,44 @@ test "host settings open the settings page only when incomplete" {
 }
 
 ///|
+test "a background device's pushes leave the focused mirrors alone" {
+  let dispatch = test_dispatch()
+  let background : @interop.ChannelId = Remote("d_bg")
+  let model = {
+    ..test_model(),
+    devices: [
+      { ..empty_device_state(@interop.ChannelId::Local), bridge: Connected },
+      { ..empty_device_state(background), bridge: Connected },
+    ],
+  }
+  // A settings.changed broadcast from the background device: the form (and
+  // the incomplete-settings redirect) keeps the focused host's state.
+  let (_, settled) = update(
+    dispatch,
+    FromDevice(
+      background,
+      HostSettingsLoaded(
+        host_settings(provider="deepseek"),
+        connection_generation=None,
+      ),
+    ),
+    model,
+  )
+  assert_true(settled.api_provider is Openseek)
+  assert_true(settled.screen is Chat)
+  // host.meta from the background device: host_wsl stays the focused host's.
+  let (_, meta) = update(
+    dispatch,
+    FromDevice(background, HostMetaLoaded(wsl=true)),
+    model,
+  )
+  inspect(meta.host_wsl, content="false")
+  // The same push on the focused channel still applies.
+  let (_, focused_meta) = update_dev(dispatch, HostMetaLoaded(wsl=true), model)
+  inspect(focused_meta.host_wsl, content="true")
+}
+
+///|
 test "host settings are deferred while this client's writes are in flight" {
   let dispatch = test_dispatch()
   let model = { ..test_model(), settings_saves: 1 }
@@ -9226,7 +9303,7 @@ test "BridgeReady replaces archive overrides with fresh-list truth" {
   let dispatch = test_dispatch()
   let item = archived_item("desktop-old")
   let model = test_model()
-    .with_archive_override("desktop-old", true)
+    .with_archive_override(@interop.ChannelId::Local, "desktop-old", true)
     .with_dev(dev => { ..dev, archived: [item] })
   let (_, ready) = update_dev(dispatch, BridgeReady, model)
   inspect(ready.dev().connection_generation, content="1")
@@ -9684,7 +9761,10 @@ test "EditorCommentAdded attaches a deduplicated annotation chip" {
   // the file was shown); the resource URI only routes the bubble removal.
   let msg : Msg = FileEditor(
     EditorCommentAdded(
-      resource=@fileeditor.ModelUri::of(Absolute("/work/project/src/main.mbt")),
+      resource=@fileeditor.ModelUri::of(
+        @interop.ChannelId::Local,
+        Absolute("/work/project/src/main.mbt"),
+      ),
       file=Relative("src/main.mbt"),
       range=@common.Range::Range(5, 1, 6, 3),
       quote="fn parse_hover() {",
@@ -10936,7 +11016,11 @@ test "a late commit cannot resurrect a locally known archived session" {
 ///|
 test "an archive tombstone blocks commits before the archived list refreshes" {
   let dispatch = test_dispatch()
-  let model = test_model().with_archive_override("desktop-tombstoned", true)
+  let model = test_model().with_archive_override(
+    @interop.ChannelId::Local,
+    "desktop-tombstoned",
+    true,
+  )
   let (_, next) = update_dev(
     dispatch,
     SessionCommitted(session="desktop-tombstoned", sequence=1, kind="user", payload={

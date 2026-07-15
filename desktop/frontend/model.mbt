@@ -1079,6 +1079,10 @@ priv enum DeviceMsg {
   // A scheduled reconnect attempt came due. Dropped harmlessly when the
   // device was removed in the meantime — no `DeviceState`, no handler.
   ReconnectDue
+  // A file-panel-scoped host push (`fs.changed`, `lsp.diagnostics`),
+  // stamped with its channel: the panel serves the focused conversation,
+  // so a background device's filesystem noise is dropped at the arm.
+  FilePanel(@fileeditor.Msg)
   // The host's `host.meta` reply: whether the host itself can run the engine
   // inside WSL (a Windows host). The page's own platform says nothing — a
   // phone browser may drive a Windows host and a Windows browser a Mac one.
@@ -1735,11 +1739,16 @@ fn Model::matched_settlement_frontier(
 }
 
 ///|
-/// The workspace a session belongs to: the sidebar list's grouping when the
-/// store knows the session, the live conversation's own placement otherwise
-/// (a fresh chat that has not reached the store yet). "" = the default store.
-fn Model::session_workspace(self : Model, session_id : String) -> String {
-  let sessions = match self.focused_device() {
+/// The workspace a session belongs to on `channel`: the sidebar list's
+/// grouping when the store knows the session, the live conversation's own
+/// placement otherwise (a fresh chat that has not reached the store yet).
+/// "" = the default store.
+fn Model::session_workspace(
+  self : Model,
+  channel : @interop.ChannelId,
+  session_id : String,
+) -> String {
+  let sessions = match self.device_state(channel) {
     Some(dev) => dev.sessions
     None => []
   }
@@ -1748,7 +1757,7 @@ fn Model::session_workspace(self : Model, session_id : String) -> String {
       return item.workspace
     }
   }
-  match self.find_conversation(self.focused, session_id) {
+  match self.find_conversation(channel, session_id) {
     Some(conv) => workspace_token(conv.workspace)
     None => ""
   }
@@ -1767,23 +1776,28 @@ fn DeviceState::archive_override(self : DeviceState, session : String) -> Bool? 
 }
 
 ///|
-/// The focused device's archive disposition for `session` — the root-arm
-/// view of `DeviceState::archive_override`.
-fn Model::archive_override(self : Model, session : String) -> Bool? {
-  guard self.focused_device() is Some(dev) else { return None }
+/// One channel's archive disposition for `session` — the Model-level view
+/// of `DeviceState::archive_override`.
+fn Model::archive_override(
+  self : Model,
+  channel : @interop.ChannelId,
+  session : String,
+) -> Bool? {
+  guard self.device_state(channel) is Some(dev) else { return None }
   dev.archive_override(session)
 }
 
 ///|
 /// Record one archive notification as the sole current override for its
-/// session. This copy-on-write replacement is what lets every later list or
-/// commit handler consult the same monotonic fact.
+/// session on `channel`. This copy-on-write replacement is what lets every
+/// later list or commit handler consult the same monotonic fact.
 fn Model::with_archive_override(
   self : Model,
+  channel : @interop.ChannelId,
   session : String,
   archived : Bool,
 ) -> Model {
-  guard self.focused_device() is Some(dev) else { return self }
+  guard self.device_state(channel) is Some(dev) else { return self }
   let overrides = dev.archive_overrides.filter(item => item.session != session)
   overrides.push({ session, archived })
   self.replace_device({ ..dev, archive_overrides: overrides })
@@ -1802,7 +1816,7 @@ fn Model::can_reload_transcript(self : Model, conv : Conversation) -> Bool {
     conv.overlay.iter().any(notice => notice.anchor is SnapshotCut(..)) {
     return true
   }
-  match self.focused_device() {
+  match self.device_state(conv.device) {
     Some(dev) => dev.sessions.iter().any(item => item.id == conv.session_id)
     None => false
   }

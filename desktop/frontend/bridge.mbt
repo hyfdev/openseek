@@ -29,9 +29,17 @@ fn bridge_msg(
 ) -> Msg? {
   match method_ {
     "auth.changed" =>
-      decode_remote_access(payload).map(status => RemoteStatusLoaded(status))
-    "lsp.diagnostics" => diagnostics_msg(payload)
-    "fs.changed" => fs_changed_msg(payload)
+      // The desktop window's own relay registration (Settings → Remote
+      // access). A remote device's auth changes are its host's business,
+      // never this page's UI.
+      if channel is Local {
+        decode_remote_access(payload).map(status => RemoteStatusLoaded(status))
+      } else {
+        None
+      }
+    "lsp.diagnostics" =>
+      diagnostics_msg(payload).map(msg => FromDevice(channel, FilePanel(msg)))
+    "fs.changed" => Some(FromDevice(channel, FilePanel(FsChanged)))
     _ => device_msg(method_, payload).map(msg => FromDevice(channel, msg))
   }
 }
@@ -179,6 +187,17 @@ test "proton subscribes to remote-access status changes" {
   assert_true(
     proton_event_methods().iter().any(method_ => method_ == "auth.changed"),
   )
+}
+
+///|
+test "file-panel pushes carry their channel; auth.changed is Local-only" {
+  let channel : @interop.ChannelId = Remote("d1")
+  assert_true(
+    bridge_msg(channel, "fs.changed", Map([]))
+    is Some(FromDevice(Remote("d1"), FilePanel(_))),
+  )
+  // A remote device's relay registration is its host's business.
+  assert_true(bridge_msg(channel, "auth.changed", Map([])) is None)
 }
 
 ///|
@@ -559,27 +578,16 @@ fn durable_boundary_msg(payload : Map[String, Json]) -> DeviceMsg? {
 /// A `diagnostics` push: the language server re-analyzed a file. The payload
 /// carries the absolute `path` and the raw LSP `diagnostics` array; the update
 /// filters it to the file on screen.
-fn diagnostics_msg(payload : Map[String, Json]) -> Msg? {
+fn diagnostics_msg(payload : Map[String, Json]) -> @fileeditor.Msg? {
   guard @jsonx.json_text(payload, "path") is Some(path) && !path.is_empty() else {
     return None
   }
   Some(
-    FileEditor(
-      DiagnosticsPublished(
-        absolute=Absolute(path),
-        diagnostics=payload.get("diagnostics").unwrap_or([]),
-      ),
+    DiagnosticsPublished(
+      absolute=Absolute(path),
+      diagnostics=payload.get("diagnostics").unwrap_or([]),
     ),
   )
-}
-
-///|
-/// An `fs_changed` push: something under the watched workspace changed. The
-/// payload's `root` is not carried — the panel re-checks against whatever
-/// conversation is current, so a push that raced a switch stats the right
-/// files anyway.
-fn fs_changed_msg(_payload : Map[String, Json]) -> Msg? {
-  Some(FileEditor(FsChanged))
 }
 
 ///|
