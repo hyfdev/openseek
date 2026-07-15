@@ -60,6 +60,8 @@ struct AuthStore {
   // nothing can mint a new one at runtime, so the supervisor parks.
   mut rejected : Bool
   mut sign_in_active : Bool
+  // Poked by auth.cancel; the in-flight sign-in races against it.
+  sign_in_abort : @async.Queue[Unit]
 }
 
 ///|
@@ -83,6 +85,7 @@ pub async fn AuthStore::load(
     override_device: None,
     rejected: false,
     sign_in_active: false,
+    sign_in_abort: Queue(kind=DiscardOldest(1)),
   }
 }
 
@@ -99,6 +102,7 @@ pub fn AuthStore::empty() -> AuthStore {
     override_device: None,
     rejected: false,
     sign_in_active: false,
+    sign_in_abort: Queue(kind=DiscardOldest(1)),
   }
 }
 
@@ -171,6 +175,15 @@ pub async fn AuthStore::handle_refusal(self : AuthStore) -> Unit {
       delete_session_file(dir)
     }
   })
+}
+
+///|
+/// Abort an in-flight sign-in: the pending `auth.connect` fails with "the
+/// sign-in was cancelled". True when one was actually running.
+pub fn AuthStore::cancel_sign_in(self : AuthStore) -> Bool {
+  guard self.sign_in_active else { return false }
+  ignore(self.sign_in_abort.try_put(()) catch { _ => false })
+  true
 }
 
 ///|

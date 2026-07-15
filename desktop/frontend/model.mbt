@@ -902,6 +902,9 @@ priv enum Msg {
   RemoteConnectClicked
   RemoteConnectFinished(RemoteAccess)
   RemoteConnectFailed(String)
+  // The Cancel beside a waiting Connect: fires `auth.cancel`; the pending
+  // connect settles the section through its own failure reply.
+  RemoteCancelClicked
   // The Remote access Disconnect button and its failure (success arrives
   // as `RemoteStatusLoaded` via the op's reply).
   RemoteDisconnectClicked

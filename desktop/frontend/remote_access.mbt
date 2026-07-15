@@ -93,6 +93,27 @@ fn connect_remote(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
 }
 
 ///|
+/// Abort a waiting sign-in. The connect's own failure reply settles the
+/// section, so this only surfaces its *own* failure (a dead bridge).
+fn cancel_remote(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+  @cmd.custom_cmd(scheduler => {
+    @js.async_run(() => {
+      let _ = @interop.bridge_request(
+        "auth.cancel",
+        @js.Object::new().to_value(),
+      ) catch {
+        error => {
+          scheduler.add(
+            dispatch(RemoteDisconnectFailed(@interop.bridge_error_text(error))),
+          )
+          return
+        }
+      }
+    })
+  })
+}
+
+///|
 /// Sign out. Success comes back as the post-sign-out status.
 fn disconnect_remote(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {

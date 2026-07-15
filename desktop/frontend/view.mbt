@@ -1596,24 +1596,30 @@ fn remote_access_rows(
           None =>
             "Registers this machine so your browser can drive it through the relay."
         }
-        rows.push(
-          setting_row(
-            "Sign in",
-            [
-              @html.button(
-                class="primary",
-                disabled=model.remote_connecting,
-                on_click=dispatch(RemoteConnectClicked),
-                if model.remote_connecting {
-                  "Waiting for the browser…"
-                } else {
-                  "Connect with GitHub"
-                },
-              ),
-            ],
-            desc=target,
+        let controls : Array[@html.Html] = [
+          @html.button(
+            class="primary",
+            disabled=model.remote_connecting,
+            on_click=dispatch(RemoteConnectClicked),
+            if model.remote_connecting {
+              "Waiting for the browser…"
+            } else {
+              "Connect with GitHub"
+            },
           ),
-        )
+        ]
+        // Appended after the stable Connect button, so its appearance
+        // never re-seats that node.
+        if model.remote_connecting {
+          controls.push(
+            @html.button(
+              class="secondary",
+              on_click=dispatch(RemoteCancelClicked),
+              "Cancel",
+            ),
+          )
+        }
+        rows.push(setting_row("Sign in", controls, desc=target))
       }
   }
   if model.remote_error is Some(message) {

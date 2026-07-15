@@ -4,11 +4,24 @@
 // signin.mbt wires them to the listener and the exchange.
 
 ///|
-/// The relay's PKCE challenge shape: lowercase hex of `sha256(verifier)`
-/// over the verifier's UTF-8 bytes (not base64url — the server hashes and
-/// compares hex).
+/// The standard S256 challenge (RFC 7636): the unpadded base64url of the
+/// verifier's SHA-256, exactly what the relay's `challenge_s256` computes
+/// on its side of the comparison. Core's encoder speaks only the standard
+/// alphabet, so its two URL-unsafe characters are swapped after the fact.
 fn pkce_challenge(verifier : String) -> String {
-  @crypto.bytes_to_hex_string(@crypto.sha256(@utf8.encode(verifier))).to_lower()
+  let digest = Bytes::from_array(@crypto.sha256(@utf8.encode(verifier)))
+  let standard = @base64.encode(digest, padding=false)
+  let builder = StringBuilder::new()
+  for c in standard {
+    builder.write_char(
+      match c {
+        '+' => '-'
+        '/' => '_'
+        c => c
+      },
+    )
+  }
+  builder.to_string()
 }
 
 ///|

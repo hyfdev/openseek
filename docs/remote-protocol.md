@@ -82,7 +82,8 @@ not secrets — the barrier is ownership:
   system browser at `<server>/v1/auth/desktop/start?state&code_challenge&
   port&name`, the signed-in user clicks **Allow** once, the browser
   bounces a one-time code to the listener, and the host swaps it (plus
-  its PKCE verifier, `challenge = hex(sha256(verifier))`) at
+  its PKCE verifier; the challenge is standard S256 — the unpadded
+  base64url of `sha256(verifier)`, RFC 7636) at
   `POST /v1/auth/desktop/exchange` for `{device_token, device, user}` —
   the exchange **is** device registration. The host persists the token
   (`auth.json` in its runtime dir, 0600). Development overrides:
@@ -434,6 +435,7 @@ no business operating. A browser signs in with the relay directly
 | `auth.status` | `{}` | the status shape below |
 | `auth.connect` | `{}` | the status shape — resolves only when the loopback flow finishes (browser round-trip included), so it can take minutes; errors are the JSON-RPC error response. While signed in it runs no browser flow (an exchange mints a new device row) and only makes sure the connector runs. Refused when the selected server has no relay (`deepseek`/`custom`) or when the environment override manages the connector |
 | `auth.disconnect` | `{}` | the status shape — deletes the local token, best-effort revokes the device at the relay, and stops the connector. Refused in override mode |
+| `auth.cancel` | `{}` | the status shape — aborts an in-flight `auth.connect` (whose own call then fails with "the sign-in was cancelled"); a no-op when nothing is in flight |
 
 The status shape, also the params of every `auth.changed` notification:
 

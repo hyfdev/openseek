@@ -67,6 +67,14 @@ async fn auth_disconnect(state : ApiState) -> Json {
 }
 
 ///|
+/// Abort an in-flight sign-in; the pending `auth.connect` settles with
+/// its own error. A no-op (current status) when nothing is in flight.
+async fn auth_cancel(state : ApiState) -> Json {
+  ignore(state.auth.cancel_sign_in())
+  auth_status(state)
+}
+
+///|
 /// A server switch orphans a sign-in — the device token belongs to the
 /// server that issued it. Called after every settings commit; a no-op
 /// unless the signed-in issuer no longer matches the selection.

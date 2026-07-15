@@ -1242,6 +1242,10 @@ fn update_msg(
         @cmd.none,
         { ..model, remote_connecting: false, remote_error: Some(message) },
       )
+    RemoteCancelClicked =>
+      // Fire-and-forget: the connect that is being cancelled reports back
+      // through its own reply, which is what clears the pending state.
+      (cancel_remote(dispatch), model)
     RemoteDisconnectClicked =>
       (disconnect_remote(dispatch), { ..model, remote_error: None })
     RemoteDisconnectFailed(message) =>

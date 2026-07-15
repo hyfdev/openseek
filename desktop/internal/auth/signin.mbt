@@ -23,6 +23,12 @@ pub async fn AuthStore::sign_in(self : AuthStore, server_url~ : String) -> Unit 
   defer {
     self.sign_in_active = false
   }
+  // A cancel poked after the previous flow ended must not kill this one.
+  for ;; {
+    guard (self.sign_in_abort.try_get() catch { _ => None }) is Some(_) else {
+      break
+    }
+  }
 
   // Secrets first: no OS entropy is a hard failure, never weak randomness.
   guard @entropy.random_hex(32) is Some(verifier) else {
@@ -55,12 +61,28 @@ pub async fn AuthStore::sign_in(self : AuthStore, server_url~ : String) -> Unit 
     raise AuthError("could not open the system browser (exit \{code})")
   }
 
-  // Wait for the redirect, bounded by the human-round-trip timeout.
-  guard @async.with_timeout_opt(SignInTimeoutMs, () => {
-      wait_for_code(server, oauth_state~)
-    })
-    is Some(one_time_code) else {
-    raise AuthError("sign-in timed out waiting for the browser")
+  // Wait for the redirect, bounded by the human-round-trip timeout and
+  // racing the cancel channel (`auth.cancel` — the Settings page's Cancel
+  // button); `any` cancels the losing arms, tearing the wait down.
+  let outcome : SignInWait = @async.any([
+    () => {
+      match
+        @async.with_timeout_opt(SignInTimeoutMs, () => {
+          wait_for_code(server, oauth_state~)
+        }) {
+        Some(code) => GotCode(code)
+        None => TimedOut
+      }
+    },
+    () => {
+      self.sign_in_abort.get()
+      CancelledByUser
+    },
+  ])
+  let one_time_code = match outcome {
+    GotCode(code) => code
+    TimedOut => raise AuthError("sign-in timed out waiting for the browser")
+    CancelledByUser => raise AuthError("the sign-in was cancelled")
   }
 
   // Exchange = device registration.
@@ -75,6 +97,14 @@ pub async fn AuthStore::sign_in(self : AuthStore, server_url~ : String) -> Unit 
       save_session_file(dir, session)
     }
   })
+}
+
+///|
+/// How the wait for the consent redirect ended.
+priv enum SignInWait {
+  GotCode(String)
+  TimedOut
+  CancelledByUser
 }
 
 ///|

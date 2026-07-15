@@ -21,6 +21,7 @@ pub impl Show for AuthError
 
 // Types and methods
 type AuthStore
+pub fn AuthStore::cancel_sign_in(Self) -> Bool
 pub fn AuthStore::desired_connector(Self) -> ConnectorConfig?
 pub fn AuthStore::empty() -> Self
 pub async fn AuthStore::handle_refusal(Self) -> Unit

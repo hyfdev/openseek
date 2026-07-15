@@ -3,13 +3,15 @@
 // signin.mbt is built from.
 
 ///|
-test "pkce challenge is lowercase hex of the verifier's sha256" {
+test "pkce challenge is the verifier's unpadded base64url sha256" {
+  // Cross-checked against RFC 7636 S256 (python:
+  // urlsafe_b64encode(sha256(b"test-verifier")).rstrip("=")) — and against
+  // the relay's own challenge_s256, which must accept what start_url sends.
   inspect(
     pkce_challenge("test-verifier"),
-    content=(
-      #|2416e2a8e34658f6809b05e4ffc6d3e949e53dfae7eb90f7d9e665252fb3186d
-    ),
+    content="JBbiqONGWPaAmwXk_8bT6UnlPfrn65D32eZlJS-zGG0",
   )
+  inspect(pkce_challenge("test-verifier").length(), content="43")
   // Stable across calls — the exchange must send what start_url promised.
   assert_true(pkce_challenge("v") == pkce_challenge("v"))
 }
@@ -184,6 +186,7 @@ async test "a terminal refusal clears a session but only parks an override" {
     override_device: None,
     rejected: false,
     sign_in_active: false,
+    sign_in_abort: Queue(kind=DiscardOldest(1)),
   }
   assert_true(override_store.desired_connector() is Some(_))
   override_store.handle_refusal()
@@ -242,4 +245,12 @@ async test "the loopback listener takes the matching redirect and ignores strays
     assert_true(waiter.wait() == "one-time")
     group.return_immediately(())
   })
+}
+
+///|
+test "cancel only lands on a live sign-in" {
+  let store = AuthStore::empty()
+  assert_false(store.cancel_sign_in())
+  store.sign_in_active = true
+  assert_true(store.cancel_sign_in())
 }

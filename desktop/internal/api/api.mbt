@@ -226,6 +226,7 @@ pub async fn dispatch(
     "auth.status" => auth_status(state)
     "auth.connect" => auth_connect(state)
     "auth.disconnect" => auth_disconnect(state)
+    "auth.cancel" => auth_cancel(state)
     _ =>
       match @host.host_op(state.host, method_, params) {
         Some(reply) => reply
@@ -266,7 +267,7 @@ pub fn method_names() -> Array[String] {
     "agent.start", "agent.cancel", "agent.steer", "agent.compact", "agent.runs",
     "session.list", "session.load", "session.list_archived", "session.archive", "session.unarchive",
     "settings.get", "settings.set", "workspace.list", "workspace.add", "workspace.remove",
-    "host.meta", "auth.status", "auth.connect", "auth.disconnect",
+    "host.meta", "auth.status", "auth.connect", "auth.disconnect", "auth.cancel",
   ] +
   @host.host_method_names()
 }
