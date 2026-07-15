@@ -1,7 +1,7 @@
-// openseek-relay: the reference relay (docs/remote-protocol.md). Hosts
-// behind NAT dial in over the `/tunnel` control WebSocket and register as
+// openseek-relay: the development relay (docs/remote-protocol.md). Hosts
+// behind NAT dial in over the `/v1/tunnel` control WebSocket and register as
 // devices; a browser reaches a device's protocol WebSocket at
-// `/d/<device>/api/v1/ws`, which the relay pairs with a data WebSocket the
+// `/v1/devices/<device>/ws`, which the relay pairs with a data WebSocket the
 // host dials back and then splices frame-for-frame. The relay serves the
 // frontend bundle itself and never parses the client protocol — a protocol
 // change touches only the frontend and the host, never this service.
@@ -33,7 +33,7 @@ async fn main {
     _ => fail("invalid --host/--port: \{host}:\{port}")
   }
   println("openseek relay: listening on http://\{host}:\{port}")
-  println("openseek relay: hosts dial ws://\{host}:\{port}/tunnel")
+  println("openseek relay: hosts dial ws://\{host}:\{port}/v1/tunnel")
   let app = @moonback.App(
     Module(ctx => {
       ctx.get("/healthz", (_req, res) => res.send_text("ok"))
@@ -48,12 +48,13 @@ async fn main {
       })
       // The control endpoint: a host upgrades here and stays registered for
       // its session.
-      ctx.get("/tunnel", (req, res) => serve_control(relay, req, res))
+      ctx.get("/v1/tunnel", (req, res) => serve_control(relay, req, res))
       // A data connection the host dials back for one announced stream.
-      ctx.get("/tunnel/:stream", (req, res) => serve_data(relay, req, res))
+      ctx.get("/v1/tunnel/:stream", (req, res) => serve_data(relay, req, res))
       // The client protocol's single entry point, spliced through to the
-      // device.
-      ctx.get("/d/:device/api/v1/ws", (req, res) => {
+      // device. The deployed relay authenticates this upgrade; here the
+      // device id itself is the capability.
+      ctx.get("/v1/devices/:device/ws", (req, res) => {
         serve_browser(relay, req, res)
       })
       // `/d/<id>` and `/d/<id>/` both land here (the trie folds the empty
@@ -79,6 +80,17 @@ async fn main {
       // Everything else under a device prefix is a frontend asset, served
       // from the relay's own copy — the bundle never crosses the tunnel.
       ctx.get("/d/:device/*rest", (req, res) => {
+        let file = match req.params.get("rest") {
+          Some(rest) if !rest.is_empty() => rest.to_owned()
+          _ => "index.html"
+        }
+        serve_static(relay, file, res)
+      })
+      // The portal page and its bare asset paths — same bundle, served at
+      // the root like the deployed relay does. Registered last so every
+      // explicit route above wins.
+      ctx.get("/", (_req, res) => serve_static(relay, "index.html", res))
+      ctx.get("/*rest", (req, res) => {
         let file = match req.params.get("rest") {
           Some(rest) if !rest.is_empty() => rest.to_owned()
           _ => "index.html"

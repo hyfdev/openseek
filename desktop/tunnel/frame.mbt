@@ -3,7 +3,7 @@
 // client protocol itself crosses the relay opaquely, spliced frame-for-frame
 // between a browser's WebSocket and a data WebSocket the host dials back.
 //
-// Control frames are JSON text messages on the long-lived `/tunnel`
+// Control frames are JSON text messages on the long-lived `/v1/tunnel`
 // WebSocket the host keeps open to the relay.
 
 ///|
@@ -14,8 +14,8 @@ pub(all) enum Frame {
   Register(token~ : String, name~ : String)
   // Relay → host: the slot is held; `device` is the id in the browser URL.
   Registered(device~ : String)
-  // Relay → host: a browser connected to `/d/<device>/api/v1/ws`; dial
-  // `GET /tunnel/<stream>` back to serve it.
+  // Relay → host: a browser connected to `/v1/devices/<device>/ws`; dial
+  // `GET /v1/tunnel/<stream>` back to serve it.
   Open(stream~ : String)
   // Relay → host: registration rejected (bad token, malformed frame). The
   // host logs it, closes, and retries with backoff.
