@@ -6,6 +6,7 @@ import {
   "moonbit-community/rabbita/dom",
   "moonbit-community/rabbita/html",
   "moonbit-community/rabbita/js",
+  "moonbit-community/rabbita/sub",
   "moonbit-community/editor/base/common",
   "openseek_desktop/internal/jsonx",
   "openseek_desktop/internal/pathx",

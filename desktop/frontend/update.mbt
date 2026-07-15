@@ -358,7 +358,7 @@ fn open_editor_at(
         file_panel: {
           ..panel,
           open: true,
-          error: "\{path} is outside the conversation workspace",
+          error: Some("\{path} is outside the conversation workspace"),
         },
       },
     )
@@ -614,6 +614,7 @@ fn file_ctx(model : Model) -> @fileeditor.Ctx {
     workspace: conv.workspace,
     dark_mode: model.dark_mode,
     tree_layout: model.tree_layout,
+    narrow: model.narrow,
   }
 }
 
@@ -686,7 +687,22 @@ fn update(
   msg : Msg,
   model : Model,
 ) -> (@cmd.Cmd, Model) {
+  let previous = model
   let (cmd, model) = update_msg(dispatch, msg, model)
+  // On the narrow layout the sidebar is a full-screen drawer, so any
+  // navigation that lands somewhere else — switching or creating a
+  // conversation, opening Skills or Settings — closes it; centralizing the
+  // rule here keeps every navigation handler drawer-agnostic.
+  let model = if model.narrow &&
+    model.sidebar_open &&
+    (
+      model.active_session != previous.active_session ||
+      model.screen != previous.screen
+    ) {
+    { ..model, sidebar_open: false }
+  } else {
+    model
+  }
   let (model, panel_cmd) = sync_file_panel(dispatch, model)
   (@cmd.batch([cmd, panel_cmd]), model)
 }
@@ -1402,6 +1418,16 @@ fn update_msg(
     UpdateApplied => (close_window(), model)
     OpenSetup => (@cmd.none, { ..model, screen: Settings, setup_api_key: "" })
     ToggleSidebar => (@cmd.none, { ..model, sidebar_open: !model.sidebar_open })
+    ViewportResized(width~) => {
+      let narrow = width <= NarrowBreakpoint
+      if narrow == model.narrow {
+        (@cmd.none, model)
+      } else {
+        // Crossing the breakpoint resets the sidebar to the new layout's
+        // default: an open column on wide, a closed drawer on narrow.
+        (@cmd.none, { ..model, narrow, sidebar_open: !narrow })
+      }
+    }
     ToggleChatsSection =>
       (@cmd.none, { ..model, chats_collapsed: !model.chats_collapsed })
     ToggleWorkspacesSection =>
@@ -3380,6 +3406,36 @@ fn sessions_loaded(
   request_generation? : Int = 0,
 ) -> Msg {
   SessionsLoaded(items, connection_generation=0, request_generation~)
+}
+
+///|
+test "viewport resize flips the narrow flag and resets the sidebar" {
+  let dispatch = test_dispatch()
+  let (_, narrow) = update(dispatch, ViewportResized(width=390), test_model())
+  assert_true(narrow.narrow)
+  assert_false(narrow.sidebar_open)
+  // Same side of the breakpoint: nothing moves (idempotent).
+  let (_, same) = update(dispatch, ViewportResized(width=390), narrow)
+  assert_true(same.narrow)
+  assert_false(same.sidebar_open)
+  let (_, wide) = update(dispatch, ViewportResized(width=1280), same)
+  assert_false(wide.narrow)
+  assert_true(wide.sidebar_open)
+}
+
+///|
+test "the narrow drawer closes when navigation lands elsewhere" {
+  let dispatch = test_dispatch()
+  let (_, narrow) = update(dispatch, ViewportResized(width=390), test_model())
+  let (_, opened) = update(dispatch, ToggleSidebar, narrow)
+  assert_true(opened.sidebar_open)
+  // Navigating to the Skills page from the drawer closes it; on the wide
+  // layout the same navigation leaves the sidebar column alone.
+  let (_, settled) = update(dispatch, OpenSkills, opened)
+  assert_false(settled.sidebar_open)
+  let (_, wide) = update(dispatch, ViewportResized(width=1280), settled)
+  let (_, back) = update(dispatch, OpenSetup, wide)
+  assert_true(back.sidebar_open)
 }
 
 ///|
@@ -9300,7 +9356,7 @@ test "chip jumps relativize legacy absolute paths against the roots" {
     model,
   )
   assert_true(outside.file_panel.active is None)
-  assert_false(outside.file_panel.error.is_empty())
+  assert_true(outside.file_panel.error is Some(_))
 }
 
 ///|

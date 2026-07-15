@@ -80,6 +80,34 @@ test "rename commits only a non-blank name and clears on done" {
 }
 
 ///|
+test "the actions menu toggles per device and disarms a pending remove" {
+  let emit = test_emit()
+  let (_, signed) = update(emit, MeLoaded(login="o", avatar=""), Model::init())
+  let (_, listed) = update(emit, DevicesLoaded(sample_devices()), signed)
+  let (_, opened) = update(emit, MenuToggled("d_on"), listed)
+  assert_true(opened.menu_open is Some("d_on"))
+  // Opening another device's menu closes the first.
+  let (_, switched) = update(emit, MenuToggled("d_off"), opened)
+  assert_true(switched.menu_open is Some("d_off"))
+  // Arming Remove keeps the menu; toggling it away disarms.
+  let (_, armed) = update(emit, DeleteAsked("d_off"), switched)
+  assert_true(armed.confirm_delete is Some("d_off"))
+  assert_true(armed.menu_open is Some("d_off"))
+  let (_, closed) = update(emit, MenuToggled("d_off"), armed)
+  assert_true(closed.menu_open is None)
+  assert_true(closed.confirm_delete is None)
+  // Rename from the menu closes it and opens the field.
+  let (_, reopened) = update(emit, MenuToggled("d_on"), closed)
+  let (_, renaming) = update(
+    emit,
+    RenameStarted(device="d_on", current="Mac"),
+    reopened,
+  )
+  assert_true(renaming.menu_open is None)
+  assert_true(renaming.rename is Some({ device: "d_on", .. }))
+}
+
+///|
 test "delete needs its confirming second click" {
   let emit = test_emit()
   let (_, signed) = update(emit, MeLoaded(login="o", avatar=""), Model::init())

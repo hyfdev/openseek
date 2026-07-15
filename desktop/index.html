@@ -113,6 +113,17 @@
         overflow: hidden;
       }
 
+      /* Mobile browsers grow and shrink the viewport as their toolbars
+         collapse; the dynamic unit tracks the real visible height so the
+         composer stays glued to the bottom instead of floating mid-page. */
+      @supports (height: 100dvh) {
+        html,
+        body,
+        #app {
+          height: 100dvh;
+        }
+      }
+
       body {
         background: var(--paper);
         color: var(--ink);
@@ -2768,17 +2779,25 @@
         color: var(--ink-2);
         font-size: 13.5px;
       }
+      /* The darker accent as fill: plain --accent under 13px white text
+         sits just below the 4.5:1 contrast floor in both palettes. In dark
+         mode --accent-ink is the light shade, so the text flips dark. */
       .portal-button-link {
         display: inline-block;
         padding: 8px 14px;
         border-radius: var(--radius-sm);
-        background: var(--accent);
+        background: var(--accent-ink);
         color: #fff;
         text-decoration: none;
         font-size: 13px;
       }
+      @media (prefers-color-scheme: dark) {
+        .portal-button-link {
+          color: #10131a;
+        }
+      }
       .portal-button-link:hover {
-        background: var(--accent-ink);
+        filter: brightness(0.94);
       }
       .portal-section h2 {
         margin: 0 0 10px;
@@ -2787,20 +2806,31 @@
         letter-spacing: 0.06em;
         color: var(--ink-2);
       }
-      .portal-list {
+      /* One card per device, stacked. */
+      .portal-groups {
         display: flex;
         flex-direction: column;
+        gap: 14px;
+      }
+      .portal-groups > p {
+        margin: 0;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        background: var(--surface);
+      }
+      .portal-device-group {
         border: 1px solid var(--line);
         border-radius: var(--radius);
         background: var(--surface);
         overflow: hidden;
       }
-      .portal-list > * + * {
-        border-top: 1px solid var(--line);
+      .portal-device-group > * + * {
+        border-top: 1px solid var(--line-2);
       }
-      .portal-list p {
+      .portal-device-group > p {
         margin: 0;
-        padding: 12px 14px;
+        padding: 10px 14px;
       }
       .portal-dim {
         color: var(--ink-2);
@@ -2834,19 +2864,13 @@
         color: var(--ink-2);
         font-size: 12.5px;
       }
-      .portal-workspace-device {
-        color: var(--ink-2);
-        font-size: 12px;
-        border: 1px solid var(--line);
-        border-radius: 999px;
-        padding: 1px 8px;
-        white-space: nowrap;
-      }
-      .portal-device {
+      /* The group's header row: dot, identity, console link, "⋯". */
+      .portal-device-head {
         display: flex;
         align-items: center;
         gap: 10px;
         padding: 10px 14px;
+        background: var(--surface-2);
         font-size: 13px;
       }
       .portal-device-dot {
@@ -2859,17 +2883,83 @@
       .portal-device-dot.online {
         background: var(--add);
       }
+      .portal-device-title {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        flex: 1;
+        min-width: 0;
+        flex-wrap: wrap;
+      }
       .portal-device-name {
         font-weight: 600;
       }
-      .portal-device .portal-open-link {
+      .portal-device-host {
+        color: var(--ink-3);
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
+      .portal-device-offline {
+        color: var(--ink-3);
+        font-size: 11px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 0 7px;
+        white-space: nowrap;
+      }
+      .portal-device-head .portal-open-link {
         margin-left: auto;
-        color: var(--accent);
+        color: var(--accent-ink);
         text-decoration: none;
         font-size: 12.5px;
+        white-space: nowrap;
       }
-      .portal-device .portal-open-link:hover {
+      .portal-device-head .portal-open-link:hover {
         text-decoration: underline;
+      }
+      .portal-menu-button {
+        display: grid;
+        place-items: center;
+        width: 32px;
+        height: 28px;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--surface);
+        color: var(--ink-2);
+        font-size: 14px;
+        line-height: 1;
+      }
+      .portal-menu-button:not(:disabled):hover {
+        background: var(--surface-2);
+        color: var(--ink);
+      }
+      /* The "⋯" menu unfolds as an action bar under the header. */
+      .portal-device-menu {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 10px 14px;
+        background: var(--surface-2);
+      }
+      .portal-menu-item {
+        border: 1px solid var(--line);
+        border-radius: var(--radius-sm);
+        background: var(--surface);
+        color: var(--ink);
+        padding: 6px 12px;
+        font-size: 12px;
+      }
+      .portal-menu-item:not(:disabled):hover {
+        background: var(--surface-2);
+      }
+      .portal-menu-item.danger {
+        border-color: var(--del-line);
+        color: var(--del);
+      }
+      .portal-menu-item.danger:not(:disabled):hover {
+        background: var(--del);
+        border-color: var(--del);
+        color: #fff;
       }
       .portal-rename {
         flex: 1;
@@ -2892,26 +2982,157 @@
         color: #fff;
       }
 
+      /* ---------- narrow (phone) layout ---------- */
+      /* One breakpoint for the whole app; it must match NarrowBreakpoint in
+         frontend/model.mbt, whose flag drives the behavior half of these
+         rules (the drawer's default, the file panel's drill-down). */
+
+      /* The open drawer's dimmed backdrop; the view renders it only on the
+         narrow layout, so it needs no media query. A tap closes the drawer. */
+      .sidebar-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 51;
+        background: color-mix(in srgb, var(--ink) 32%, transparent);
+      }
+
       @media (max-width: 760px) {
+        /* The sidebar leaves the grid and overlays it as a drawer; the
+           content column always has the full width. */
         .app {
-          grid-template-columns: 1fr;
-          grid-template-rows: auto minmax(0, 1fr);
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .app > aside {
+          position: fixed;
+          inset: 0 auto 0 0;
+          z-index: 52;
+          width: min(320px, 86vw);
+          box-shadow: var(--shadow-pop);
         }
 
-        aside {
-          grid-template-rows: auto;
-          border-right: 0;
-          border-bottom: 1px solid var(--line);
-          max-height: 42vh;
-          overflow: auto;
-        }
-
+        /* The topbar keeps only what a phone needs: the toggle, the title,
+           the run state. The workspace chip and the counters live in the
+           composer/settings anyway. */
         .topbar-title {
           max-width: 38%;
         }
-
+        .topbar-workspace,
+        .topbar .pill {
+          display: none;
+        }
         .activity-row {
           padding-left: 0;
+        }
+        .composer-controls {
+          flex-wrap: wrap;
+        }
+
+        /* The files panel covers the whole app instead of splitting the
+           content; the conversation keeps the full width underneath. */
+        .content.panel-open {
+          grid-template-columns: minmax(0, 1fr) 0;
+        }
+        .content.panel-open .editor {
+          position: fixed;
+          inset: 0;
+          z-index: 45;
+          border-left: 0;
+        }
+        /* Drill-down: exactly one of tree/viewer shows. Opening a file
+           closes the tree (the fileeditor's narrow Ctx flag); the
+           breadcrumb's toggle brings the tree back. */
+        .editor.tree-open .viewer-stack {
+          display: none;
+        }
+        .editor .file-tree-pane,
+        .editor.tree-right .file-tree-pane {
+          flex: 1 1 auto;
+          border-top: 0;
+          border-left: 0;
+        }
+        .editor-resize-handle,
+        .tree-resize-handle {
+          display: none !important;
+        }
+
+        /* Settings and Skills: one column — label and description above,
+           the control below at full width. */
+        .setting-row {
+          flex-direction: column;
+          align-items: stretch;
+          gap: 8px;
+        }
+        .setting-control {
+          width: 100%;
+          justify-content: flex-start;
+        }
+        .settings-page,
+        .skills-page {
+          padding: 24px 16px;
+        }
+
+        /* Touch targets at 44px and 16px fields — a smaller font makes iOS
+           zoom the whole page when a field takes focus. */
+        input,
+        textarea,
+        select,
+        .composer textarea,
+        .portal-rename {
+          font-size: 16px;
+        }
+        .topbar,
+        .sidebar-header,
+        .editor-tabsbar {
+          height: 52px;
+        }
+        /* Center the 44px fallback toggle in the 52px header band. */
+        .page-sidebar-toggle {
+          top: 4px;
+          left: 8px;
+        }
+        .topbar-toggle,
+        .panel-toggle,
+        .launcher-button,
+        .portal-menu-button {
+          min-width: 44px;
+          min-height: 44px;
+        }
+        button.secondary,
+        button.primary:not(.sidebar-button),
+        .portal-menu-item,
+        .portal-button-link,
+        .modal-actions button {
+          min-height: 44px;
+          padding-top: 10px;
+          padding-bottom: 10px;
+        }
+        .conversation-row,
+        .sidebar-button {
+          min-height: 44px;
+        }
+
+        /* Portal: the header wraps instead of overflowing, and a workspace
+           row stacks its name over the full path. */
+        .portal-header {
+          flex-wrap: wrap;
+          gap: 10px;
+        }
+        .portal-header-right {
+          flex-wrap: wrap;
+          row-gap: 8px;
+        }
+        a.portal-workspace {
+          flex-direction: column;
+          align-items: stretch;
+          gap: 2px;
+          padding: 14px;
+        }
+        .portal-workspace-path {
+          white-space: normal;
+          overflow-wrap: anywhere;
+        }
+        .portal-device-head .portal-open-link {
+          padding: 10px 4px;
         }
       }
     </style>

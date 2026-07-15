@@ -21,7 +21,7 @@ APIs live under `/v1`:
 
 | Route | What |
 |---|---|
-| `GET /` | The frontend bundle's portal: sign-in, every online device's workspaces flattened into one list, device management |
+| `GET /` | The frontend bundle's portal: sign-in, one group per device (workspaces inside; rename/revoke behind the group's menu) |
 | `GET /d/<device>/` (and asset paths under it) | The same bundle, one device's console; `?workspace=<path>` preselects the workspace new conversations land in |
 | `GET /healthz` | Relay liveness probe, `200 ok` |
 | `/v1/auth/*`, `/v1/devices…` | The relay's own auth and device APIs (see Authentication) |

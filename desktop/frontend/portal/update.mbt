@@ -24,6 +24,8 @@ enum Msg {
   DevicesLoadFailed(String)
   // One device's `workspace.list` probe settled; None = unreachable.
   WorkspacesProbed(device~ : String, workspaces~ : Array[String]?)
+  // A device group's "⋯" actions menu was toggled.
+  MenuToggled(String)
   // The rename flow: open the field, edit it, commit or drop it.
   RenameStarted(device~ : String, current~ : String)
   RenameEdited(String)
@@ -73,6 +75,7 @@ pub fn update(
           auth: SignedOut,
           devices: DevicesLoading,
           rename: None,
+          menu_open: None,
           confirm_delete: None,
           busy: false,
         },
@@ -120,12 +123,23 @@ pub fn update(
       })
       (@cmd.none, { ..model, devices: DevicesReady(rows) })
     }
+    MenuToggled(device) => {
+      // Opening one device's menu closes any other; a second toggle on the
+      // same device closes it. Either way any armed Remove is disarmed.
+      let menu_open = if model.menu_open == Some(device) {
+        None
+      } else {
+        Some(device)
+      }
+      (@cmd.none, { ..model, menu_open, confirm_delete: None })
+    }
     RenameStarted(device~, current~) =>
       (
         @cmd.none,
         {
           ..model,
           rename: Some({ device, input: current }),
+          menu_open: None,
           confirm_delete: None,
           notice: None,
         },
@@ -147,19 +161,31 @@ pub fn update(
       )
     }
     DeleteAsked(device) =>
+      // The confirmation replaces the menu's Remove item in place; the menu
+      // stays open so the second click lands where the first did.
       (
         @cmd.none,
         { ..model, confirm_delete: Some(device), rename: None, notice: None },
       )
-    DeleteCancelled => (@cmd.none, { ..model, confirm_delete: None })
+    DeleteCancelled =>
+      (@cmd.none, { ..model, confirm_delete: None, menu_open: None })
     DeleteConfirmed(device) => {
       guard !model.busy else { return (@cmd.none, model) }
-      (delete_device(emit, device), { ..model, busy: true, notice: None })
+      (
+        delete_device(emit, device),
+        { ..model, busy: true, menu_open: None, notice: None },
+      )
     }
     MutationDone =>
       (
         fetch_devices(emit),
-        { ..model, busy: false, rename: None, confirm_delete: None },
+        {
+          ..model,
+          busy: false,
+          rename: None,
+          menu_open: None,
+          confirm_delete: None,
+        },
       )
     MutationFailed(message) =>
       (@cmd.none, { ..model, busy: false, notice: Some(message) })
@@ -175,6 +201,7 @@ pub fn update(
           auth: SignedOut,
           devices: DevicesLoading,
           rename: None,
+          menu_open: None,
           confirm_delete: None,
           busy: false,
         },
@@ -186,6 +213,7 @@ pub fn update(
           ..model,
           devices: DevicesLoading,
           rename: None,
+          menu_open: None,
           confirm_delete: None,
           notice: None,
         },

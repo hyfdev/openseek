@@ -2,6 +2,11 @@
 const DefaultModel : String = "deepseek-v4-pro"
 
 ///|
+/// Viewports at most this wide (CSS pixels) get the narrow layout. Must
+/// match the `@media (max-width: …)` breakpoint in index.html.
+const NarrowBreakpoint : Int = 760
+
+///|
 const DefaultMaxSteps : String = "1000"
 
 ///|
@@ -426,7 +431,7 @@ priv enum Screen {
   Chat
   Skills
   Settings
-}
+} derive(Eq)
 
 ///|
 /// Which trigger opened the composer's completion menu: `/` lists built-in
@@ -591,8 +596,16 @@ priv struct Model {
   // viewer's `data-theme` attribute, which CSS media queries cannot set.
   // Seeded at startup and kept fresh by `watch_color_scheme`.
   dark_mode : Bool
+  // Whether the viewport is phone-narrow (at most `NarrowBreakpoint` wide).
+  // Seeded from the window at startup and kept fresh by the resize
+  // subscription; the value must agree with index.html's one mobile media
+  // query, so layout-dependent behavior (the sidebar drawer, the file
+  // panel's drill-down) flips exactly where the CSS does.
+  narrow : Bool
   // Whether the left sidebar (chat list + navigation) is shown. Collapsing it
   // hands the full width to the conversation; the topbar toggle brings it back.
+  // On the narrow layout the sidebar is a full-screen drawer instead of a
+  // column, and starts closed.
   sidebar_open : Bool
   // Whether the sidebar's "Chats" section (the default store's loose
   // conversations) is folded down to its heading; clicking the heading flips
@@ -927,6 +940,8 @@ priv enum Msg {
   UpdateApplied
   OpenSetup
   ToggleSidebar
+  // The window was resized; `width` decides the narrow (phone) layout.
+  ViewportResized(width~ : Int)
   // The sidebar's "Chats" heading was clicked — fold or unfold the section.
   ToggleChatsSection
   // The sidebar's "Workspaces" heading was clicked — fold or unfold the section.
@@ -1241,6 +1256,13 @@ fn empty_conversation(
 
 ///|
 fn initial_model() -> Model {
+  // Read once here (main runs before the first render); afterwards the
+  // resize subscription keeps the flag current through `ViewportResized`.
+  // No window (a headless test runtime) reads as the wide layout.
+  let narrow = match @interop.viewport_width() {
+    Some(width) => width <= NarrowBreakpoint
+    None => false
+  }
   {
     bridge: Connecting,
     selected_model: DefaultModel,
@@ -1269,7 +1291,8 @@ fn initial_model() -> Model {
     wsl_distro: "",
     wsl_engine: "",
     dark_mode: host_prefers_dark(),
-    sidebar_open: true,
+    narrow,
+    sidebar_open: !narrow,
     chats_collapsed: false,
     workspaces_collapsed: false,
     active_session: "",

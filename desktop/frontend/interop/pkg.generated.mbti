@@ -42,6 +42,8 @@ pub fn set_workspace(@js.Object, @pathx.Absolute?) -> Unit
 
 pub fn using_proton_bridge() -> Bool
 
+pub fn viewport_width() -> Int?
+
 pub fn ws_connect(on_notification~ : (String, Map[String, Json]) -> Unit, on_down~ : () -> Unit) -> Unit
 
 // Errors

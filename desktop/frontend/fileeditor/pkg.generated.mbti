@@ -33,6 +33,7 @@ pub(all) struct Ctx {
   workspace : @pathx.Absolute?
   dark_mode : Bool
   tree_layout : TreeLayout
+  narrow : Bool
 }
 
 pub(all) enum FileContent {
@@ -111,7 +112,7 @@ pub(all) struct State {
   filter : String
   index : FileIndex
   cursor : @pathx.Relative?
-  error : String
+  error : String?
 }
 pub fn State::empty() -> Self
 

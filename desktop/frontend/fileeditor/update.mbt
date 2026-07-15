@@ -111,7 +111,15 @@ fn open_or_activate(
     } else {
       show
     }
-    return (cmd, { ..state, active: Some(path), error: "" })
+    return (
+      cmd,
+      {
+        ..state,
+        active: Some(path),
+        error: None,
+        tree_open: state.tree_open && !ctx.narrow,
+      },
+    )
   }
   let tabs = if tab_index(state, path) is Some(_) {
     state.tabs
@@ -136,7 +144,16 @@ fn open_or_activate(
   } else {
     read
   }
-  (cmd, { ..state, tabs, active: Some(path), error: "" })
+  (
+    cmd,
+    {
+      ..state,
+      tabs,
+      active: Some(path),
+      error: None,
+      tree_open: state.tree_open && !ctx.narrow,
+    },
+  )
 }
 
 ///|
@@ -333,7 +350,12 @@ pub fn update(
       } else if tab_index(state, path) is Some(index) {
         (
           show_tab(dispatch, ctx, state.tabs[index]),
-          { ..state, active: Some(path), error: "" },
+          {
+            ..state,
+            active: Some(path),
+            error: None,
+            tree_open: state.tree_open && !ctx.narrow,
+          },
         )
       } else {
         (@cmd.none, state)
@@ -528,7 +550,7 @@ pub fn update(
             ..state,
             children,
             loading: state.loading.filter(entry => entry != path),
-            error: "",
+            error: None,
           },
         )
       }
@@ -541,7 +563,7 @@ pub fn update(
           {
             ..state,
             loading: state.loading.filter(entry => entry != path),
-            error: message,
+            error: Some(message),
           },
         )
       }
@@ -725,7 +747,7 @@ pub fn update(
       if state.session != session {
         (@cmd.none, state)
       } else {
-        (@cmd.none, { ..state, error: message })
+        (@cmd.none, { ..state, error: Some(message) })
       }
     // Owned by the main package's update: the comment becomes a composer
     // chip there, which then clears the editor bubble through
@@ -751,6 +773,7 @@ fn test_ctx() -> Ctx {
     workspace: None,
     dark_mode: false,
     tree_layout: BottomPanel,
+    narrow: false,
   }
 }
 
@@ -797,6 +820,40 @@ test "FileSelected opens tabs in click order and activates the last" {
   )
   assert_eq(again.tabs.length(), 2)
   assert_true(again.active is Some(Relative("a.mbt")))
+}
+
+///|
+test "narrow ctx: opening or activating a file closes the tree pane" {
+  let emit = test_emit()
+  let narrow : Ctx = { ..test_ctx(), narrow: true }
+  let start = { ..open_state(), tree_open: true }
+  // A fresh open drills down into the viewer.
+  let (_, opened) = update(
+    emit,
+    FileSelected(path=Relative("a.mbt"), name="a.mbt"),
+    start,
+    narrow,
+  )
+  assert_false(opened.tree_open)
+  // Back to the tree (the breadcrumb toggle), then activating an open tab
+  // drills down again.
+  let (_, tree) = update(emit, ToggleTree, opened, narrow)
+  assert_true(tree.tree_open)
+  let (_, activated) = update(
+    emit,
+    FileSelected(path=Relative("a.mbt"), name="a.mbt"),
+    { ..tree, tabs: [loaded_tab("a.mbt", "a.mbt")], active: None },
+    narrow,
+  )
+  assert_false(activated.tree_open)
+  // The wide layout keeps the pane open alongside the viewer.
+  let (_, wide) = update(
+    emit,
+    FileSelected(path=Relative("b.mbt"), name="b.mbt"),
+    start,
+    test_ctx(),
+  )
+  assert_true(wide.tree_open)
 }
 
 ///|
@@ -989,6 +1046,7 @@ test "sync parks the outgoing conversation's tabs and restores them later" {
     workspace: None,
     dark_mode: false,
     tree_layout: BottomPanel,
+    narrow: false,
   }
   let (parked, _) = sync(emit, state, other)
   assert_eq(parked.session, "other-session")
@@ -1025,6 +1083,7 @@ test "a closed panel still re-roots when the conversation switches" {
     workspace: None,
     dark_mode: false,
     tree_layout: BottomPanel,
+    narrow: false,
   }
   let (parked, _) = sync(emit, state, other)
   assert_eq(parked.session, "other-session")

@@ -33,6 +33,17 @@ pub fn js_method_promise(
 }
 
 ///|
+/// `window.innerWidth` in CSS pixels, `None` where there is no window (a
+/// headless test runtime). Read once at startup to seed the narrow-layout
+/// flag; later changes arrive through the resize subscription.
+pub fn viewport_width() -> Int? {
+  js_prop(@js.globalThis, "innerWidth").map(width => {
+    let width : Double = width.cast()
+    width.to_int()
+  })
+}
+
+///|
 /// `globalThis.__MoonBit__` — the API object proton injects into its webview.
 pub fn moonbit_bridge_root() -> @js.Value? {
   js_prop(@js.globalThis, "__MoonBit__")

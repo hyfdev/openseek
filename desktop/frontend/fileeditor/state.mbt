@@ -153,8 +153,9 @@ pub(all) struct State {
   // rows appearing and disappearing around it; None until the keyboard
   // first moves.
   cursor : @pathx.Relative?
-  // The last directory/file failure, surfaced in the panel header.
-  error : String
+  // The last directory/file failure, surfaced in the panel header;
+  // `None` while nothing has failed.
+  error : String?
 }
 
 ///|
@@ -174,7 +175,7 @@ pub fn State::empty() -> State {
     filter: "",
     index: IndexEmpty,
     cursor: None,
-    error: "",
+    error: None,
   }
 }
 
@@ -218,6 +219,10 @@ pub(all) struct Ctx {
   workspace : @pathx.Absolute?
   dark_mode : Bool
   tree_layout : TreeLayout
+  // The app's phone-narrow layout flag. Narrow, the tree and the viewer
+  // share one full-width pane (CSS shows exactly one), so opening a file
+  // closes the tree — a drill-down — instead of showing both side by side.
+  narrow : Bool
 }
 
 ///|

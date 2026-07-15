@@ -68,18 +68,22 @@ fn settings_group(title : String, rows : Array[@html.Html]) -> @html.Html {
 
 ///|
 fn model_select(dispatch : @cmd.Emit[Msg], selected : String) -> @html.Html {
-  @html.select(on_change=dispatch.map(value => ModelChanged(value)), [
-    @html.option(
-      value="deepseek-v4-pro",
-      selected=selected == "deepseek-v4-pro",
-      "deepseek-v4-pro",
-    ),
-    @html.option(
-      value="deepseek-v4-flash",
-      selected=selected == "deepseek-v4-flash",
-      "deepseek-v4-flash",
-    ),
-  ])
+  @html.select(
+    on_change=dispatch.map(value => ModelChanged(value)),
+    attrs=@html.Attrs::build().aria_label("Model"),
+    [
+      @html.option(
+        value="deepseek-v4-pro",
+        selected=selected == "deepseek-v4-pro",
+        "deepseek-v4-pro",
+      ),
+      @html.option(
+        value="deepseek-v4-flash",
+        selected=selected == "deepseek-v4-flash",
+        "deepseek-v4-flash",
+      ),
+    ],
+  )
 }
 
 ///|
@@ -1462,24 +1466,28 @@ fn provider_select(
   dispatch : @cmd.Emit[Msg],
   selected : ApiProvider,
 ) -> @html.Html {
-  @html.select(on_change=dispatch.map(value => ProviderChanged(value)), [
-    @html.option(
-      value="openseek",
-      selected=selected is Openseek,
-      "OpenSeek (default, no API key)",
-    ),
-    @html.option(
-      value="openseek-staging",
-      selected=selected is OpenseekStaging,
-      "OpenSeek staging (testing)",
-    ),
-    @html.option(
-      value="deepseek",
-      selected=selected is Deepseek,
-      "DeepSeek official (your API key)",
-    ),
-    @html.option(value="custom", selected=selected is Custom, "Custom URL"),
-  ])
+  @html.select(
+    on_change=dispatch.map(value => ProviderChanged(value)),
+    attrs=@html.Attrs::build().aria_label("API endpoint"),
+    [
+      @html.option(
+        value="openseek",
+        selected=selected is Openseek,
+        "OpenSeek (default, no API key)",
+      ),
+      @html.option(
+        value="openseek-staging",
+        selected=selected is OpenseekStaging,
+        "OpenSeek staging (testing)",
+      ),
+      @html.option(
+        value="deepseek",
+        selected=selected is Deepseek,
+        "DeepSeek official (your API key)",
+      ),
+      @html.option(value="custom", selected=selected is Custom, "Custom URL"),
+    ],
+  )
 }
 
 ///|
@@ -1489,6 +1497,7 @@ fn corner_select(
 ) -> @html.Html {
   @html.select(
     on_change=dispatch.map(value => NotificationCornerChanged(value)),
+    attrs=@html.Attrs::build().aria_label("Notification corner"),
     [
       @html.option(
         value="bottom-right",
@@ -1515,18 +1524,22 @@ fn tree_layout_select(
   dispatch : @cmd.Emit[Msg],
   selected : @fileeditor.TreeLayout,
 ) -> @html.Html {
-  @html.select(on_change=dispatch.map(value => TreeLayoutChanged(value)), [
-    @html.option(
-      value="right-sidebar",
-      selected=selected is RightSidebar,
-      "Right sidebar",
-    ),
-    @html.option(
-      value="bottom-panel",
-      selected=selected is BottomPanel,
-      "Bottom panel",
-    ),
-  ])
+  @html.select(
+    on_change=dispatch.map(value => TreeLayoutChanged(value)),
+    attrs=@html.Attrs::build().aria_label("File tree layout"),
+    [
+      @html.option(
+        value="right-sidebar",
+        selected=selected is RightSidebar,
+        "Right sidebar",
+      ),
+      @html.option(
+        value="bottom-panel",
+        selected=selected is BottomPanel,
+        "Bottom panel",
+      ),
+    ],
+  )
 }
 
 ///|
@@ -1691,10 +1704,14 @@ fn update_check_controls(
 
 ///|
 fn wsl_select(dispatch : @cmd.Emit[Msg], enabled : Bool) -> @html.Html {
-  @html.select(on_change=dispatch.map(value => WslModeChanged(value)), [
-    @html.option(value="native", selected=!enabled, "Windows (native)"),
-    @html.option(value="wsl", selected=enabled, "WSL"),
-  ])
+  @html.select(
+    on_change=dispatch.map(value => WslModeChanged(value)),
+    attrs=@html.Attrs::build().aria_label("Engine environment"),
+    [
+      @html.option(value="native", selected=!enabled, "Windows (native)"),
+      @html.option(value="wsl", selected=enabled, "WSL"),
+    ],
+  )
 }
 
 ///|
@@ -1729,6 +1746,7 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
           value=model.max_steps,
           placeholder="1000",
           on_input=dispatch.map(value => MaxStepsChanged(value)),
+          attrs=@html.Attrs::build().aria_label("Max steps"),
         ),
       ],
       desc="How many agent steps one turn may take.",
@@ -1751,6 +1769,7 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
             value=model.custom_api_url,
             placeholder="https://host/chat/completions",
             on_input=dispatch.map(value => CustomApiUrlChanged(value)),
+            attrs=@html.Attrs::build().aria_label("Endpoint URL"),
           ),
         ],
         stack=true,
@@ -1784,6 +1803,7 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
               "sk-..."
             },
             on_input=dispatch.map(value => SetupApiKeyChanged(value)),
+            attrs=@html.Attrs::build().aria_label("API key"),
           ),
           @html.button(
             // The id is layout only (grid placement); the fill is the
@@ -1854,6 +1874,7 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
               value=model.wsl_distro,
               placeholder="default distro",
               on_input=dispatch.map(value => WslDistroChanged(value)),
+              attrs=@html.Attrs::build().aria_label("WSL distro"),
             ),
           ],
           desc="Blank uses the default distro.",
@@ -1868,6 +1889,7 @@ fn settings_page(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
               value=model.wsl_engine,
               placeholder="bundled engine",
               on_input=dispatch.map(value => WslEngineChanged(value)),
+              attrs=@html.Attrs::build().aria_label("Engine command in WSL"),
             ),
           ],
           desc="Blank runs the Linux engine bundled with the app, falling back to openseek on the distro's PATH.",
@@ -2259,7 +2281,12 @@ fn topbar_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
   if !conv.watcher_status.is_empty() {
     items.push(@html.span(class="pill", "moon_check \{conv.watcher_status}"))
   }
-  items.push(launcher_view(dispatch, model))
+  // The launcher opens GUI apps on the host machine, which only means
+  // something when the page IS that machine's desktop window; from a remote
+  // browser the launched app would appear on a screen the user is not at.
+  if model.is_desktop {
+    items.push(launcher_view(dispatch, model))
+  }
   // Rightmost: the toggle for the whole right-hand panel — only while the
   // panel is closed; an open panel carries the toggle at the right edge of
   // its breadcrumb instead, keeping this bar uncrowded. Both spots hug the
@@ -2343,6 +2370,18 @@ fn view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
       ),
     ]),
   ]
+  // On the narrow layout the open sidebar is a drawer over the content; the
+  // backdrop dims the page behind it and a tap there closes it. Appended
+  // after the stable shell children so toggling never re-keys them.
+  if model.narrow && model.sidebar_open {
+    children.push(
+      @html.div(
+        class="sidebar-backdrop",
+        on_click=dispatch(ToggleSidebar),
+        @html.nothing,
+      ),
+    )
+  }
   // The toast stack floats over everything (position: fixed), so appending
   // it last never shifts the layout; skipping it entirely while empty keeps
   // the corner clickable.
