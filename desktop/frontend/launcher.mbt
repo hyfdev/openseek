@@ -5,10 +5,14 @@
 ///|
 /// Fetch the apps the host detects as installed. Settles into `LauncherLoaded`
 /// on success or `LauncherFailed` on a bridge/decoding error.
-fn fetch_apps(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+fn fetch_apps(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
+        channel,
         "app.list",
         @js.Object::new().to_value(),
       ) catch {
@@ -33,6 +37,7 @@ fn fetch_apps(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
 /// host from `session`. A failure pops an error toast.
 fn launch_app(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session : String,
   cwd~ : @pathx.Absolute?,
   app : String,
@@ -44,6 +49,7 @@ fn launch_app(
       @interop.set_trimmed(payload, "cwd", workspace_token(cwd))
       payload["app"] = app
       let _ : @js.Value = @interop.bridge_request(
+        channel,
         "app.launch",
         payload.to_value(),
       ) catch {

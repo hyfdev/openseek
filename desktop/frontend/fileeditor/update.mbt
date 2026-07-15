@@ -36,6 +36,7 @@ fn show_tab(dispatch : @cmd.Emit[Msg], ctx : Ctx, tab : Tab) -> @cmd.Cmd {
       // show.
       read_file(
         dispatch,
+        channel=ctx.channel,
         ctx.session,
         tab.path,
         tab.name,
@@ -51,7 +52,10 @@ fn show_tab(dispatch : @cmd.Emit[Msg], ctx : Ctx, tab : Tab) -> @cmd.Cmd {
         restore_scroll=true,
       )
       if language_id(tab.name) == "moonbit" {
-        @cmd.batch([show, request_diagnostics(dispatch, absolute)])
+        @cmd.batch([
+          show,
+          request_diagnostics(dispatch, channel=ctx.channel, absolute),
+        ])
       } else {
         show
       }
@@ -69,6 +73,7 @@ fn show_tab(dispatch : @cmd.Emit[Msg], ctx : Ctx, tab : Tab) -> @cmd.Cmd {
       show,
       read_file(
         dispatch,
+        channel=ctx.channel,
         ctx.session,
         tab.path,
         tab.name,
@@ -133,6 +138,7 @@ fn open_or_activate(
   }
   let read = read_file(
     dispatch,
+    channel=ctx.channel,
     ctx.session,
     path,
     name,
@@ -197,7 +203,10 @@ fn with_watch(state : State, ctx : Ctx, cmd : @cmd.Cmd) -> (State, @cmd.Cmd) {
   } else {
     (
       { ..state, watching: want },
-      @cmd.batch([cmd, watch_workspace(want, workspace=ctx.workspace)]),
+      @cmd.batch([
+        cmd,
+        watch_workspace(channel=ctx.channel, want, workspace=ctx.workspace),
+      ]),
     )
   }
 }
@@ -261,6 +270,7 @@ pub fn sync(
       cmds.push(
         read_file(
           dispatch,
+          channel=ctx.channel,
           ctx.session,
           path,
           tabs[index].name,
@@ -306,6 +316,7 @@ pub fn sync(
       reroot_cmd,
       read_directory(
         dispatch,
+        channel=ctx.channel,
         ctx.session,
         @pathx.Relative::root(),
         workspace=ctx.workspace,
@@ -427,6 +438,7 @@ pub fn update(
             cmds.push(
               read_directory(
                 dispatch,
+                channel=ctx.channel,
                 ctx.session,
                 ancestor,
                 workspace=ctx.workspace,
@@ -469,7 +481,13 @@ pub fn update(
           let loading = state.loading.copy()
           loading.push(path)
           (
-            read_directory(dispatch, ctx.session, path, workspace=ctx.workspace),
+            read_directory(
+              dispatch,
+              channel=ctx.channel,
+              ctx.session,
+              path,
+              workspace=ctx.workspace,
+            ),
             { ..state, expanded, loading },
           )
         }
@@ -483,7 +501,12 @@ pub fn update(
       // that follow from stacking duplicate requests.
       if !query.trim().is_empty() && state.index is IndexEmpty {
         (
-          list_files(dispatch, ctx.session, workspace=ctx.workspace),
+          list_files(
+            dispatch,
+            channel=ctx.channel,
+            ctx.session,
+            workspace=ctx.workspace,
+          ),
           { ..state, index: IndexLoading },
         )
       } else {
@@ -638,7 +661,10 @@ pub fn update(
                 restore_scroll=previous is TabLoaded(..),
               )
               if language_id(name) == "moonbit" {
-                @cmd.batch([show, request_diagnostics(dispatch, absolute)])
+                @cmd.batch([
+                  show,
+                  request_diagnostics(dispatch, channel=ctx.channel, absolute),
+                ])
               } else {
                 show
               }
@@ -662,6 +688,7 @@ pub fn update(
         cmds.push(
           stat_files(
             dispatch,
+            channel=ctx.channel,
             state.session,
             state.tabs.map(tab => tab.path),
             workspace=ctx.workspace,
@@ -681,14 +708,27 @@ pub fn update(
       for dir in relist {
         loading.push(dir)
         cmds.push(
-          read_directory(dispatch, state.session, dir, workspace=ctx.workspace),
+          read_directory(
+            dispatch,
+            channel=ctx.channel,
+            state.session,
+            dir,
+            workspace=ctx.workspace,
+          ),
         )
       }
       // The fuzzy filter's index goes stale with the tree; rebuild it if
       // anyone has ever needed it (the reply just replaces the old list, so
       // the filter keeps showing the previous matches meanwhile).
       if !(state.index is IndexEmpty) {
-        cmds.push(list_files(dispatch, state.session, workspace=ctx.workspace))
+        cmds.push(
+          list_files(
+            dispatch,
+            channel=ctx.channel,
+            state.session,
+            workspace=ctx.workspace,
+          ),
+        )
       }
       (@cmd.batch(cmds), { ..state, loading, })
     }
@@ -736,6 +776,7 @@ pub fn update(
               cmds.push(
                 read_file(
                   dispatch,
+                  channel=ctx.channel,
                   state.session,
                   tab.path,
                   tab.name,
@@ -781,6 +822,7 @@ fn test_emit() -> @cmd.Emit[Msg] {
 ///|
 fn test_ctx() -> Ctx {
   {
+    channel: @interop.ChannelId::Local,
     session: "desktop-test",
     workspace: None,
     dark_mode: false,
@@ -1053,13 +1095,7 @@ test "sync parks the outgoing conversation's tabs and restores them later" {
     tree_open: false,
   }
   // Switch away: the tab set parks under its session id.
-  let other : Ctx = {
-    session: "other-session",
-    workspace: None,
-    dark_mode: false,
-    tree_layout: BottomPanel,
-    narrow: false,
-  }
+  let other : Ctx = { ..test_ctx(), session: "other-session" }
   let (parked, _) = sync(emit, state, other)
   assert_eq(parked.session, "other-session")
   assert_eq(parked.tabs.length(), 0)
@@ -1090,13 +1126,7 @@ test "a closed panel still re-roots when the conversation switches" {
     tabs: [loaded_tab("a.mbt", "a.mbt")],
     active: Some(Relative("a.mbt")),
   }
-  let other : Ctx = {
-    session: "other-session",
-    workspace: None,
-    dark_mode: false,
-    tree_layout: BottomPanel,
-    narrow: false,
-  }
+  let other : Ctx = { ..test_ctx(), session: "other-session" }
   let (parked, _) = sync(emit, state, other)
   assert_eq(parked.session, "other-session")
   assert_false(parked.open)

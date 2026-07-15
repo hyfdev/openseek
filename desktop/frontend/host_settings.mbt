@@ -48,11 +48,13 @@ fn reply_host_settings(reply : @js.Value) -> HostSettings? {
 /// it on the next change.
 fn fetch_host_settings(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   connection_generation : Int,
 ) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
+        channel,
         "settings.get",
         @js.Object::new().to_value(),
       ) catch {
@@ -79,13 +81,14 @@ fn fetch_host_settings(
 /// unchanged.
 fn push_host_settings(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   patch : @js.Value,
   connection_generation : Int,
   cleans_legacy? : Bool = false,
 ) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
-      let reply = @interop.bridge_request("settings.set", patch) catch {
+      let reply = @interop.bridge_request(channel, "settings.set", patch) catch {
         error => {
           scheduler.add(
             dispatch(

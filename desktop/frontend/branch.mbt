@@ -8,6 +8,7 @@
 ///|
 fn fetch_branch(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session : String,
   cwd : @pathx.Absolute?,
 ) -> @cmd.Cmd {
@@ -16,7 +17,11 @@ fn fetch_branch(
       let payload = @js.Object::new()
       payload["session"] = session
       @interop.set_trimmed(payload, "cwd", workspace_token(cwd))
-      let reply = @interop.bridge_request("git.branch", payload.to_value()) catch {
+      let reply = @interop.bridge_request(
+        channel,
+        "git.branch",
+        payload.to_value(),
+      ) catch {
         _ => {
           scheduler.add(dispatch(BranchLoaded(session~, branch=None)))
           return

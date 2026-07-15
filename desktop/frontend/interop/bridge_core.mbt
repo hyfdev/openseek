@@ -1,10 +1,9 @@
 // The engine-host calling core: one `bridge_request` for every frontend
-// package that talks to the host, routed by origin. A `proton://` page is
-// the desktop window and calls the injected `__MoonBit__.openseek` op
-// directly; any other origin is a browser reached through a relay and sends
-// the same method over the page's WebSocket (docs/remote-protocol.md). The
-// method names and payloads are identical either way — callers and reply
-// decoders cannot tell the transports apart.
+// package that talks to a host, routed by channel. `Local` is the desktop
+// window's injected `__MoonBit__.openseek` op; `Device(id)` is a relay
+// device reached over its WebSocket (docs/remote-protocol.md). The method
+// names and payloads are identical either way — callers and reply decoders
+// cannot tell the transports apart.
 
 ///|
 priv suberror BridgeError {
@@ -37,17 +36,22 @@ pub fn openseek_api() -> @js.Value? {
 }
 
 ///|
-/// Call one engine-host method and wait for its reply. Raises when the
-/// transport is missing/down, the call throws, or the host rejects the
-/// method.
-pub async fn bridge_request(op : String, payload : @js.Value) -> @js.Value {
-  if using_proton_bridge() {
-    guard openseek_api() is Some(api) && js_prop(api, op) is Some(_) else {
-      raise BridgeError("OpenSeek bridge unavailable")
+/// Call one engine-host method on a channel and wait for its reply. Raises
+/// when the transport is missing/down, the call throws, or the host rejects
+/// the method.
+pub async fn bridge_request(
+  channel : ChannelId,
+  op : String,
+  payload : @js.Value,
+) -> @js.Value {
+  match channel {
+    Local => {
+      guard openseek_api() is Some(api) && js_prop(api, op) is Some(_) else {
+        raise BridgeError("OpenSeek bridge unavailable")
+      }
+      js_method_promise(api, op, payload).wait()
     }
-    js_method_promise(api, op, payload).wait()
-  } else {
-    ws_request(op, payload)
+    Device(_) => ws_request(channel, op, payload)
   }
 }
 

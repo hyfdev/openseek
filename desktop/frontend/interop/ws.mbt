@@ -1,9 +1,8 @@
-// The browser transport: JSON-RPC 2.0 over the page's WebSocket
-// (docs/remote-protocol.md). Requests are correlated by a client-scoped id
-// against a pending map; notifications go to the handler the main package
-// installed. The connection is a process-wide singleton — `bridge_request`
-// is called from every feature package, and they all mean "the page's one
-// connection to its host".
+// The browser transport: JSON-RPC 2.0 over one WebSocket per device
+// channel (docs/remote-protocol.md). Requests are correlated by a
+// client-scoped id against the session's pending map; notifications go to
+// the handler installed with that connection. Sockets are JS objects, so
+// the registry lives here as module state rather than in the Elm model.
 
 ///|
 /// One live (or connecting) WebSocket session.
@@ -16,9 +15,10 @@ priv struct RpcSession {
 }
 
 ///|
-/// The page's connection; None before `ws_connect` (or on a proton page,
-/// which never calls it).
-let active_session : Ref[RpcSession?] = Ref(None)
+/// Every live (or connecting) WebSocket session, one per device channel.
+/// Empty before `ws_connect` (and forever on a proton page, which never
+/// calls it).
+let channels : Map[ChannelId, RpcSession] = Map([])
 
 ///|
 /// The device id in the page's own pathname — `/d/<device>/…` is the relay's
@@ -69,28 +69,29 @@ pub fn page_ws_origin() -> String? {
 }
 
 ///|
-/// The page's protocol WebSocket URL: same origin, the relay's
-/// `/v1/devices/<device>/ws` route for the device this page is scoped to.
-fn ws_url() -> String? {
-  guard page_device_id() is Some(device) else { return None }
+/// A device's protocol WebSocket URL: same origin, the relay's
+/// `/v1/devices/<device>/ws` route.
+fn ws_url(device : String) -> String? {
   guard page_ws_origin() is Some(origin) else { return None }
   Some("\{origin}/v1/devices/\{device}/ws")
 }
 
 ///|
-/// Open (or replace) the page's connection. `on_notification` receives every
-/// host-pushed notification's method and params; `on_down` fires once when
+/// Open (or replace) the connection to one device. `on_notification`
+/// receives every notification this host pushes; `on_down` fires once when
 /// the socket closes for any reason — the caller owns backoff and calls
 /// `ws_connect` again. Requests issued while down fail fast with a
 /// user-facing message.
 pub fn ws_connect(
+  device : String,
   on_notification~ : (String, Map[String, Json]) -> Unit,
   on_down~ : () -> Unit,
 ) -> Unit {
-  guard ws_url() is Some(url) else {
+  guard ws_url(device) is Some(url) else {
     on_down()
     return
   }
+  let channel = Device(device)
   let ctor : @js.Value = @js.globalThis.get_with_string("WebSocket")
   let socket : @js.Value = ctor.new([url])
   let session : RpcSession = {
@@ -99,7 +100,7 @@ pub fn ws_connect(
     next_id: 1,
     open_: false,
   }
-  active_session.val = Some(session)
+  channels[channel] = session
   socket.set_with_string("onopen", (_event : @js.Value) => session.open_ = true)
   socket.set_with_string("onmessage", (event : @js.Value) => {
     handle_message(session, event, on_notification)
@@ -107,19 +108,24 @@ pub fn ws_connect(
   socket.set_with_string("onclose", (_event : @js.Value) => {
     session.open_ = false
     reject_all(session, "OpenSeek connection lost")
-    // Only the current session reports down — a replaced socket's late
-    // close must not double-trigger the reconnect loop.
-    if active_session.val is Some(current) && physical_equal(current, session) {
-      active_session.val = None
+    // Only the channel's current session reports down — a replaced socket's
+    // late close must not double-trigger that channel's reconnect loop.
+    if channels.get(channel) is Some(current) &&
+      physical_equal(current, session) {
+      channels.remove(channel)
       on_down()
     }
   })
 }
 
 ///|
-/// Send one request over the page's connection and wait for its reply.
-async fn ws_request(op : String, payload : @js.Value) -> @js.Value {
-  guard active_session.val is Some(session) && session.open_ else {
+/// Send one request over a channel's connection and wait for its reply.
+async fn ws_request(
+  channel : ChannelId,
+  op : String,
+  payload : @js.Value,
+) -> @js.Value {
+  guard channels.get(channel) is Some(session) && session.open_ else {
     raise BridgeError("OpenSeek connection is down")
   }
   let id = session.next_id

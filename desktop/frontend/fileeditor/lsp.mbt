@@ -75,6 +75,9 @@ impl @language.HoverProvider for LspHoverProvider with fn provide_hover(
   guard !token.is_cancellation_requested() else { return None }
   guard model_uri_path(model.uri) is Some(path) else { return None }
   let reply = request_hover(
+    // A registry-global provider has no Ctx; the page's own channel is the
+    // one every open model belongs to while the app runs a single channel.
+    channel=@interop.page_channel().unwrap_or(@interop.ChannelId::Local),
     path~,
     // The viewer's Position is 1-based; the host op speaks 0-based LSP coords.
     line=position.line_number - 1,
@@ -99,6 +102,7 @@ fn register_hover_provider() -> Unit {
 /// Call the host `hover` op for the absolute `path` at a zero-based
 /// `line`/`character`.
 async fn request_hover(
+  channel~ : @interop.ChannelId,
   path~ : @pathx.Absolute,
   line~ : Int,
   character~ : Int,
@@ -107,7 +111,7 @@ async fn request_hover(
   payload["path"] = path.0
   payload["line"] = line
   payload["character"] = character
-  @interop.bridge_request("lsp.hover", payload.to_value())
+  @interop.bridge_request(channel, "lsp.hover", payload.to_value())
 }
 
 ///|
@@ -168,11 +172,14 @@ fn hover_range(
 /// with a server behind the op.
 fn request_diagnostics(
   dispatch : @cmd.Emit[Msg],
+  channel~ : @interop.ChannelId,
   absolute : @pathx.Absolute,
 ) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
-      let reply = request_lsp_open(path=absolute) catch { _ => return }
+      let reply = request_lsp_open(channel~, path=absolute) catch {
+        _ => return
+      }
       let diagnostics = reply_diagnostics(@interop.reply_json_text(reply))
       scheduler.add(dispatch(DiagnosticsPublished(absolute~, diagnostics~)))
     })
@@ -181,10 +188,13 @@ fn request_diagnostics(
 
 ///|
 /// Call the host `lsp_open` op for the absolute `path`.
-async fn request_lsp_open(path~ : @pathx.Absolute) -> @js.Value {
+async fn request_lsp_open(
+  channel~ : @interop.ChannelId,
+  path~ : @pathx.Absolute,
+) -> @js.Value {
   let payload = @js.Object::new()
   payload["path"] = path.0
-  @interop.bridge_request("lsp.open", payload.to_value())
+  @interop.bridge_request(channel, "lsp.open", payload.to_value())
 }
 
 ///|

@@ -215,6 +215,8 @@ pub fn TreeLayout::wire(self : TreeLayout) -> String {
 /// app is in dark mode (drives the embedded viewer's theme attribute), and
 /// the Settings choice of where the file tree docks.
 pub(all) struct Ctx {
+  // The device channel the conversation lives on — every panel op targets it.
+  channel : @interop.ChannelId
   session : String
   workspace : @pathx.Absolute?
   dark_mode : Bool

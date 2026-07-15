@@ -10,6 +10,7 @@
 /// fold the entries back as `DirLoaded`.
 fn read_directory(
   dispatch : @cmd.Emit[Msg],
+  channel~ : @interop.ChannelId,
   session : String,
   path : @pathx.Relative,
   workspace~ : @pathx.Absolute?,
@@ -21,6 +22,7 @@ fn read_directory(
       payload["path"] = path.0
       @interop.set_workspace(payload, workspace)
       let reply = @interop.bridge_request(
+        channel,
         "fs.read_directory",
         payload.to_value(),
       ) catch {
@@ -57,6 +59,7 @@ fn read_directory(
 /// `FileIndexFailed`, dropping the index so a later keystroke retries.
 fn list_files(
   dispatch : @cmd.Emit[Msg],
+  channel~ : @interop.ChannelId,
   session : String,
   workspace~ : @pathx.Absolute?,
 ) -> @cmd.Cmd {
@@ -65,7 +68,11 @@ fn list_files(
       let payload = @js.Object::new()
       payload["session"] = session
       @interop.set_workspace(payload, workspace)
-      let reply = @interop.bridge_request("fs.list_files", payload.to_value()) catch {
+      let reply = @interop.bridge_request(
+        channel,
+        "fs.list_files",
+        payload.to_value(),
+      ) catch {
         _ => {
           scheduler.add(dispatch(FileIndexFailed(session~)))
           return
@@ -105,6 +112,7 @@ fn decode_file_index(text : String) -> (Array[@pathx.Relative], Bool)? {
 /// over that range.
 pub fn read_file(
   dispatch : @cmd.Emit[Msg],
+  channel~ : @interop.ChannelId,
   session : String,
   path : @pathx.Relative,
   name : String,
@@ -118,7 +126,11 @@ pub fn read_file(
       payload["session"] = session
       payload["path"] = path.0
       @interop.set_workspace(payload, workspace)
-      let reply = @interop.bridge_request("fs.read_file", payload.to_value()) catch {
+      let reply = @interop.bridge_request(
+        channel,
+        "fs.read_file",
+        payload.to_value(),
+      ) catch {
         error => {
           scheduler.add(
             dispatch(
@@ -215,6 +227,7 @@ fn decode_file_content(text : String) -> FileContent? {
 /// Best-effort: a failed call is dropped — the next change push retries.
 fn stat_files(
   dispatch : @cmd.Emit[Msg],
+  channel~ : @interop.ChannelId,
   session : String,
   paths : Array[@pathx.Relative],
   workspace~ : @pathx.Absolute?,
@@ -225,7 +238,11 @@ fn stat_files(
       payload["session"] = session
       payload["paths"] = paths.map(path => path.0)
       @interop.set_workspace(payload, workspace)
-      let reply = @interop.bridge_request("fs.stat_files", payload.to_value()) catch {
+      let reply = @interop.bridge_request(
+        channel,
+        "fs.stat_files",
+        payload.to_value(),
+      ) catch {
         _ => return
       }
       guard decode_file_stats(@interop.reply_json_text(reply)) is Some(stats) else {
@@ -258,11 +275,16 @@ fn decode_file_stats(text : String) -> Array[FileStat]? {
 /// (`fs.unwatch`) when the panel no longer needs one. Fire-and-forget:
 /// there is no reply worth folding, and a failure just means no live
 /// updates until the next reconciliation re-sends.
-fn watch_workspace(session : String, workspace~ : @pathx.Absolute?) -> @cmd.Cmd {
+fn watch_workspace(
+  channel~ : @interop.ChannelId,
+  session : String,
+  workspace~ : @pathx.Absolute?,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(_scheduler => {
     @js.async_run(() => {
       if session.is_empty() {
         let _ : @js.Value = @interop.bridge_request(
+          channel,
           "fs.unwatch",
           @js.Object::new().to_value(),
         ) catch {
@@ -273,6 +295,7 @@ fn watch_workspace(session : String, workspace~ : @pathx.Absolute?) -> @cmd.Cmd 
         payload["session"] = session
         @interop.set_workspace(payload, workspace)
         let _ : @js.Value = @interop.bridge_request(
+          channel,
           "fs.watch",
           payload.to_value(),
         ) catch {

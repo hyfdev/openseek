@@ -2,7 +2,9 @@
 // at bridge time, `auth.connect`/`auth.disconnect` drive it from the
 // Settings page, and the `auth.changed` broadcast keeps it fresh (decoded
 // in bridge.mbt through the same `decode_remote_access`). Desktop-window
-// ops by convention — a browser signs in with the relay directly.
+// ops by convention — a browser signs in with the relay directly — so every
+// call here is pinned to the `Local` channel: the section describes this
+// host's own relay registration, never a focused remote device's.
 
 ///|
 /// Decode one status payload (a reply's JSON or a broadcast's params).
@@ -53,6 +55,7 @@ fn fetch_remote_status(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
+        Local,
         "auth.status",
         @js.Object::new().to_value(),
       ) catch {
@@ -73,6 +76,7 @@ fn connect_remote(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
+        Local,
         "auth.connect",
         @js.Object::new().to_value(),
       ) catch {
@@ -99,6 +103,7 @@ fn cancel_remote(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let _ = @interop.bridge_request(
+        Local,
         "auth.cancel",
         @js.Object::new().to_value(),
       ) catch {
@@ -119,6 +124,7 @@ fn disconnect_remote(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
+        Local,
         "auth.disconnect",
         @js.Object::new().to_value(),
       ) catch {

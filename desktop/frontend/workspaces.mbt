@@ -7,6 +7,7 @@
 ///|
 fn fetch_workspaces(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   connection_generation : Int,
   request_generation : Int,
 ) -> @cmd.Cmd {
@@ -14,6 +15,7 @@ fn fetch_workspaces(
     @js.async_run(() => {
       // A host without the op just reads as "no workspaces attached".
       let reply = @interop.bridge_request(
+        channel,
         "workspace.list",
         @js.Object::new().to_value(),
       ) catch {
@@ -39,13 +41,21 @@ fn fetch_workspaces(
 }
 
 ///|
-fn add_workspace(dispatch : @cmd.Emit[Msg], path : String) -> @cmd.Cmd {
-  workspace_action(dispatch, "workspace.add", path)
+fn add_workspace(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+  path : String,
+) -> @cmd.Cmd {
+  workspace_action(dispatch, channel, "workspace.add", path)
 }
 
 ///|
-fn remove_workspace(dispatch : @cmd.Emit[Msg], path : String) -> @cmd.Cmd {
-  workspace_action(dispatch, "workspace.remove", path)
+fn remove_workspace(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+  path : String,
+) -> @cmd.Cmd {
+  workspace_action(dispatch, channel, "workspace.remove", path)
 }
 
 ///|
@@ -54,6 +64,7 @@ fn remove_workspace(dispatch : @cmd.Emit[Msg], path : String) -> @cmd.Cmd {
 /// on the reply so the update can drop answers to superseded navigations.
 fn browse_directory(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   path : String,
   generation~ : Int,
 ) -> @cmd.Cmd {
@@ -61,7 +72,11 @@ fn browse_directory(
     @js.async_run(() => {
       let payload = @js.Object::new()
       @interop.set_trimmed(payload, "path", path)
-      let reply = @interop.bridge_request("fs.browse", payload.to_value()) catch {
+      let reply = @interop.bridge_request(
+        channel,
+        "fs.browse",
+        payload.to_value(),
+      ) catch {
         error => {
           scheduler.add(
             dispatch(
@@ -130,11 +145,14 @@ fn joined_path(dir : String, name : String) -> String {
 ///|
 fn workspace_action(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   op : String,
   path : String,
 ) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
-    @js.async_run(() => workspace_action_into(scheduler, dispatch, op, path))
+    @js.async_run(() => {
+      workspace_action_into(scheduler, dispatch, channel, op, path)
+    })
   })
 }
 
@@ -142,12 +160,13 @@ fn workspace_action(
 async fn workspace_action_into(
   scheduler : &@cmd.Scheduler,
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   op : String,
   path : String,
 ) -> Unit noraise {
   let payload = @js.Object::new()
   payload["path"] = path
-  let _ = @interop.bridge_request(op, payload.to_value()) catch {
+  let _ = @interop.bridge_request(channel, op, payload.to_value()) catch {
     error => {
       scheduler.add(
         dispatch(WorkspaceFailed(@interop.bridge_error_text(error))),

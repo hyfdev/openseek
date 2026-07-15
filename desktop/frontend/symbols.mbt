@@ -9,6 +9,7 @@
 /// matches back as `SymbolsLoaded`.
 fn read_workspace_symbols(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session : String,
   query : String,
   workspace~ : @pathx.Absolute?,
@@ -20,6 +21,7 @@ fn read_workspace_symbols(
       payload["query"] = query
       @interop.set_workspace(payload, workspace)
       let reply = @interop.bridge_request(
+        channel,
         "lsp.workspace_symbols",
         payload.to_value(),
       ) catch {

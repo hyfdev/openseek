@@ -6,13 +6,15 @@
 // decoders below.
 
 ///|
-/// Wire the host's notification stream into messages, once, over whichever
-/// transport this origin uses.
-fn install_bridge(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
-  if @interop.using_proton_bridge() {
-    install_proton_bridge(dispatch, 0)
-  } else {
-    connect_ws(dispatch, failures=0)
+/// Wire a host's notification stream into messages, once, over the
+/// channel's transport.
+fn install_bridge(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+) -> @cmd.Cmd {
+  match channel {
+    Local => install_proton_bridge(dispatch, 0)
+    Device(device) => connect_ws(dispatch, device, failures=0)
   }
 }
 
@@ -210,13 +212,18 @@ fn event_payload(event : @js.Value) -> Map[String, Json]? {
 const WsLostAfter = 3
 
 ///|
-/// Open the page's WebSocket and keep it alive: every close schedules a
+/// Open a device's WebSocket and keep it alive: every close schedules a
 /// reconnect with backoff, and a successful connection (the host's
 /// `agent.connected`) resets the failure count.
-fn connect_ws(dispatch : @cmd.Emit[Msg], failures~ : Int) -> @cmd.Cmd {
+fn connect_ws(
+  dispatch : @cmd.Emit[Msg],
+  device : String,
+  failures~ : Int,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     let counter : Ref[Int] = Ref(failures)
     @interop.ws_connect(
+      device,
       on_notification=(method_, params) => {
         if method_ == "agent.connected" {
           counter.val = 0
@@ -237,7 +244,10 @@ fn connect_ws(dispatch : @cmd.Emit[Msg], failures~ : Int) -> @cmd.Cmd {
           )
         }
         scheduler.add(
-          @cmd.delay(connect_ws(dispatch, failures=next), reconnect_delay(next)),
+          @cmd.delay(
+            connect_ws(dispatch, device, failures=next),
+            reconnect_delay(next),
+          ),
         )
       },
     )
@@ -268,13 +278,14 @@ fn reconnect_delay(failures : Int) -> Int {
 /// answer says nothing about the runs.
 fn fetch_runs(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   frontier : Array[RunSnapshotFrontier],
   connection_generation : Int,
 ) -> @cmd.Cmd {
   let payload = runs_payload(frontier)
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
-      let reply = @interop.bridge_request("agent.runs", payload) catch {
+      let reply = @interop.bridge_request(channel, "agent.runs", payload) catch {
         _ => return
       }
       let json = @json.parse(@interop.reply_json_text(reply)) catch {
@@ -362,10 +373,14 @@ fn runs_payload(frontier : Array[RunSnapshotFrontier]) -> @js.Value {
 /// WSL (a Windows host). The page's own user agent says nothing about the
 /// host, so the capability must come over the wire. A failed or malformed
 /// reply leaves the default (no WSL) in place.
-fn fetch_host_meta(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+fn fetch_host_meta(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
+        channel,
         "host.meta",
         @js.Object::new().to_value(),
       ) catch {
@@ -574,6 +589,7 @@ fn notification_clicked_msg(payload : Map[String, Json]) -> Msg? {
 ///|
 fn start_openseek(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   task : String,
   submission_id : String,
   selected_model : String,
@@ -591,7 +607,7 @@ fn start_openseek(
   )
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
-      let reply = @interop.bridge_request("agent.start", payload) catch {
+      let reply = @interop.bridge_request(channel, "agent.start", payload) catch {
         error => {
           let message = @interop.bridge_error_text(error)
           scheduler.add(
@@ -707,13 +723,14 @@ fn parsed_max_steps(text : String) -> Int? {
 /// Refresh the sidebar's session list from the engine's durable store.
 fn fetch_sessions(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   connection_generation : Int,
   request_generation : Int,
 ) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       refresh_sessions_into(
-        scheduler, dispatch, connection_generation, request_generation,
+        scheduler, dispatch, channel, connection_generation, request_generation,
       )
     })
   })
@@ -726,10 +743,12 @@ fn fetch_sessions(
 async fn refresh_sessions_into(
   scheduler : &@cmd.Scheduler,
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   connection_generation : Int,
   request_generation : Int,
 ) -> Unit noraise {
   let reply = @interop.bridge_request(
+    channel,
     "session.list",
     @js.Object::new().to_value(),
   ) catch {
@@ -755,11 +774,13 @@ async fn refresh_sessions_into(
 /// can also locate it by probing, so a stale value only costs the probe).
 fn open_session(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session_id : String,
   workspace~ : String,
   generation~ : Int,
 ) -> @cmd.Cmd {
   load_session_cmd(
+    channel,
     session_id,
     workspace~,
     on_loaded=view => {
@@ -791,11 +812,13 @@ fn open_session(
 /// stealing the screen.
 fn refresh_session(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session_id : String,
   workspace~ : String,
   generation~ : Int,
 ) -> @cmd.Cmd {
   load_session_cmd(
+    channel,
     session_id,
     workspace~,
     on_loaded=view => {
@@ -817,6 +840,7 @@ fn refresh_session(
 
 ///|
 fn load_session_cmd(
+  channel : @interop.ChannelId,
   session_id : String,
   workspace~ : String,
   on_loaded~ : (@transcript.SessionLoadView) -> @cmd.Cmd,
@@ -827,7 +851,11 @@ fn load_session_cmd(
       let payload = @js.Object::new()
       payload["session"] = session_id
       @interop.set_trimmed(payload, "workspace", workspace)
-      let reply = @interop.bridge_request("session.load", payload.to_value()) catch {
+      let reply = @interop.bridge_request(
+        channel,
+        "session.load",
+        payload.to_value(),
+      ) catch {
         error => {
           scheduler.add(on_failed(@interop.bridge_error_text(error)))
           return
@@ -849,6 +877,7 @@ fn load_session_cmd(
 /// failure: only the latter may still be followed by an exact engine receipt.
 fn steer_openseek(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session : String,
   submission_id : String,
   text : String,
@@ -856,7 +885,7 @@ fn steer_openseek(
 ) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
-      let delivered = steer_delivered(text, submission_id, run_id) catch {
+      let delivered = steer_delivered(channel, text, submission_id, run_id) catch {
         error => {
           scheduler.add(
             dispatch(
@@ -881,6 +910,7 @@ fn steer_openseek(
 
 ///|
 async fn steer_delivered(
+  channel : @interop.ChannelId,
   text : String,
   submission_id : String,
   run_id : String,
@@ -889,7 +919,11 @@ async fn steer_delivered(
   payload["text"] = text
   payload["submission_id"] = submission_id
   payload["run_id"] = run_id
-  let reply = @interop.bridge_request("agent.steer", payload.to_value())
+  let reply = @interop.bridge_request(
+    channel,
+    "agent.steer",
+    payload.to_value(),
+  )
   @interop.js_prop(reply, "steered") is Some(flag) &&
   (@js.Cast::into(flag) : Bool?) is Some(true)
 }
@@ -904,6 +938,7 @@ async fn steer_delivered(
 /// conversation on screen.
 fn compact_openseek(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session~ : String,
   model~ : String,
   max_steps~ : String,
@@ -914,6 +949,7 @@ fn compact_openseek(
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let _ : @js.Value = @interop.bridge_request(
+        channel,
         "agent.compact",
         payload.to_value(),
       ) catch {
@@ -937,12 +973,17 @@ fn compact_openseek(
 }
 
 ///|
-fn cancel_openseek(dispatch : @cmd.Emit[Msg], run_id : String) -> @cmd.Cmd {
+fn cancel_openseek(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+  run_id : String,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let payload = @js.Object::new()
       payload["run_id"] = run_id
       let _ : @js.Value = @interop.bridge_request(
+        channel,
         "agent.cancel",
         payload.to_value(),
       ) catch {
@@ -969,7 +1010,10 @@ fn cancel_openseek(dispatch : @cmd.Emit[Msg], run_id : String) -> @cmd.Cmd {
 fn apply_update(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
+      // Self-update always targets the page's own desktop host, never a
+      // focused remote device.
       let _ : @js.Value = @interop.bridge_request(
+        Local,
         "update.apply",
         @js.Object::new().to_value(),
       ) catch {
@@ -1005,6 +1049,7 @@ fn close_window() -> @cmd.Cmd {
 /// failure (no opener, missing file) pops an error toast.
 fn open_file(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session : String,
   cwd~ : @pathx.Absolute?,
   path : String,
@@ -1016,6 +1061,7 @@ fn open_file(
       @interop.set_trimmed(payload, "cwd", workspace_token(cwd))
       payload["path"] = path
       let _ : @js.Value = @interop.bridge_request(
+        channel,
         "host.open_path",
         payload.to_value(),
       ) catch {

@@ -540,6 +540,11 @@ priv struct ArchiveOverride {
 
 ///|
 priv struct Model {
+  // The device channel every UI action targets — the Settings/Skills
+  // screens, the composer, and the active conversation. The desktop window
+  // and a `/d/<device>/` console are born with theirs; on the portal page
+  // this is an inert `Local` default that nothing ever reads.
+  focused : @interop.ChannelId
   // Whether the host bridge is up; see `BridgeState`.
   bridge : BridgeState
   selected_model : String
@@ -1264,6 +1269,7 @@ fn initial_model() -> Model {
     None => false
   }
   {
+    focused: @interop.page_channel().unwrap_or(@interop.ChannelId::Local),
     bridge: Connecting,
     selected_model: DefaultModel,
     max_steps: DefaultMaxSteps,

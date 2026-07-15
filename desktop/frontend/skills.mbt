@@ -4,10 +4,14 @@
 
 ///|
 /// Fetch the registry's catalog of installable skills.
-fn fetch_skills_catalog(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+fn fetch_skills_catalog(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
+        channel,
         "skills.catalog",
         @js.Object::new().to_value(),
       ) catch {
@@ -32,10 +36,14 @@ fn fetch_skills_catalog(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
 
 ///|
 /// Refresh the local skills library's contents.
-fn fetch_installed_skills(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
+fn fetch_installed_skills(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
+        channel,
         "skills.installed",
         @js.Object::new().to_value(),
       ) catch {
@@ -65,6 +73,7 @@ fn fetch_installed_skills(dispatch : @cmd.Emit[Msg]) -> @cmd.Cmd {
 /// `SkillActionDone` either way; the busy key is the entry's source label.
 fn install_skill(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   item : @transcript.MarketSkillItem,
 ) -> @cmd.Cmd {
   let key = @transcript.market_source_label(item)
@@ -77,6 +86,7 @@ fn install_skill(
         payload["package_path"] = item.package_path
       }
       let _ : @js.Value = @interop.bridge_request(
+        channel,
         "skills.install",
         payload.to_value(),
       ) catch {
@@ -97,12 +107,17 @@ fn install_skill(
 ///|
 /// Remove one registry-installed skill from the library; the busy key is
 /// the library entry's id.
-fn uninstall_skill(dispatch : @cmd.Emit[Msg], id : String) -> @cmd.Cmd {
+fn uninstall_skill(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+  id : String,
+) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let payload = @js.Object::new()
       payload["id"] = id
       let _ : @js.Value = @interop.bridge_request(
+        channel,
         "skills.uninstall",
         payload.to_value(),
       ) catch {

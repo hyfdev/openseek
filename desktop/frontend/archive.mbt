@@ -9,6 +9,7 @@
 ///|
 fn fetch_archived(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   connection_generation : Int,
   request_generation : Int,
 ) -> @cmd.Cmd {
@@ -17,6 +18,7 @@ fn fetch_archived(
       // A host without the op (or without a session store) just reads as an
       // empty Archived group.
       let reply = @interop.bridge_request(
+        channel,
         "session.list_archived",
         @js.Object::new().to_value(),
       ) catch {
@@ -40,13 +42,14 @@ fn fetch_archived(
 ///|
 fn archive_session(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session : String,
   connection_generation : Int,
   sessions_request_generation : Int,
   archived_request_generation : Int,
 ) -> @cmd.Cmd {
   archive_action(
-    dispatch, "session.archive", session, connection_generation, sessions_request_generation,
+    dispatch, channel, "session.archive", session, connection_generation, sessions_request_generation,
     archived_request_generation,
   )
 }
@@ -54,13 +57,14 @@ fn archive_session(
 ///|
 fn unarchive_session(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   session : String,
   connection_generation : Int,
   sessions_request_generation : Int,
   archived_request_generation : Int,
 ) -> @cmd.Cmd {
   archive_action(
-    dispatch, "session.unarchive", session, connection_generation, sessions_request_generation,
+    dispatch, channel, "session.unarchive", session, connection_generation, sessions_request_generation,
     archived_request_generation,
   )
 }
@@ -68,6 +72,7 @@ fn unarchive_session(
 ///|
 fn archive_action(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   op : String,
   session : String,
   connection_generation : Int,
@@ -78,7 +83,7 @@ fn archive_action(
     @js.async_run(() => {
       let payload = @js.Object::new()
       payload["session"] = session
-      let reply = @interop.bridge_request(op, payload.to_value()) catch {
+      let reply = @interop.bridge_request(channel, op, payload.to_value()) catch {
         error => {
           scheduler.add(
             dispatch(ArchiveFailed(@interop.bridge_error_text(error))),
@@ -100,6 +105,7 @@ fn archive_action(
       // The record moved between the live and archived stores; the sidebar's
       // live list is stale until re-fetched.
       let sessions = @interop.bridge_request(
+        channel,
         "session.list",
         @js.Object::new().to_value(),
       ) catch {
