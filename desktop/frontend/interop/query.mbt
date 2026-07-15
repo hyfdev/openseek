@@ -1,18 +1,10 @@
 // The page's own query string, for parameters that ride a navigation into
-// the console — today just `?workspace=`, which the portal's flat
-// workspace list appends when it opens a device console.
+// the console — `?device=` and `?workspace=`, minted by the relay's
+// redirect off the retired `/d/<device>/` routes, preselect where the
+// first conversation lands.
 
 ///|
 extern "js" fn js_decode_uri_component(value : String) -> String = "(v) => { try { return decodeURIComponent(v) } catch { return v } }"
-
-///|
-extern "js" fn js_encode_uri_component(value : String) -> String = "(v) => encodeURIComponent(v)"
-
-///|
-/// Percent-encode one query-parameter value.
-pub fn encode_query_component(value : String) -> String {
-  js_encode_uri_component(value)
-}
 
 ///|
 /// The named parameter in the page's own query string, decoded; `None`

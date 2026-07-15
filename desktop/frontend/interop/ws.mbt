@@ -21,34 +21,6 @@ priv struct RpcSession {
 let channels : Map[ChannelId, RpcSession] = Map([])
 
 ///|
-/// The device id in the page's own pathname — `/d/<device>/…` is the relay's
-/// device-console prefix (docs/remote-protocol.md). `None` on any other path:
-/// the portal page at `/`, which never opens the protocol WebSocket. This is
-/// the one thing the relay's path scheme needs from the frontend.
-pub fn page_device_id() -> String? {
-  guard js_prop(@js.globalThis, "location") is Some(location) else {
-    return None
-  }
-  let pathname : String? = @js.Cast::into(
-    (location.get_with_string("pathname") : @js.Value),
-  )
-  guard pathname is Some(pathname) else { return None }
-  device_id_in_path(pathname)
-}
-
-///|
-/// `/d/<device>` or `/d/<device>/…` → the device id.
-pub fn device_id_in_path(pathname : String) -> String? {
-  guard pathname.strip_prefix("/d/") is Some(rest) else { return None }
-  let device = match rest.find("/") {
-    Some(index) => rest[:index]
-    None => rest[:]
-  }
-  guard !device.is_empty() else { return None }
-  Some(device.to_owned())
-}
-
-///|
 /// The page's own origin with the WebSocket scheme — `wss://host` for an
 /// `https:` page, `ws://host` otherwise; `None` outside a browser page.
 pub fn page_ws_origin() -> String? {

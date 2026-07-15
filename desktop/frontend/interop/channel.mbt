@@ -40,13 +40,11 @@ pub fn ChannelId::from_uri_authority(authority : String) -> ChannelId? {
 
 ///|
 /// The channel this page is born with: the desktop webview talks to its
-/// local host, a `/d/<device>/` console to that device. `None` on the
-/// portal page, which opens no engine connection.
+/// local host. `None` in a browser — the console at `/` holds no channel
+/// until it fetches the device roster and connects each device.
 pub fn page_channel() -> ChannelId? {
   if using_proton_bridge() {
     Some(Local)
-  } else if page_device_id() is Some(device) {
-    Some(Remote(device))
   } else {
     None
   }

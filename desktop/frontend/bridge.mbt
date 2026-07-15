@@ -254,6 +254,13 @@ fn connect_ws(dispatch : @cmd.Emit[Msg], device : String) -> @cmd.Cmd {
 }
 
 ///|
+/// Close a channel's socket and forget it, as a command — the roster
+/// reconcile retires channels from inside `update`, which stays pure.
+fn close_channel(channel : @interop.ChannelId) -> @cmd.Cmd {
+  @cmd.custom_cmd(_scheduler => @interop.ws_close(channel))
+}
+
+///|
 /// Reconnect backoff: quick first retries, settling at 15s so an
 /// overnight-idle page keeps probing without hammering.
 fn reconnect_delay(failures : Int) -> Int {

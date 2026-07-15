@@ -68,7 +68,7 @@ test "url derivations" {
   )
   inspect(
     device_url("https://relay.example", "d_abc"),
-    content="https://relay.example/d/d_abc/",
+    content="https://relay.example/?device=d_abc",
   )
   inspect(
     origin_from_relay_url("wss://relay.example/v1/tunnel"),
@@ -264,7 +264,7 @@ test "status shapes" {
     "device": {
       "id": "d_abc",
       "name": "My Mac",
-      "url": "https://relay.example/d/d_abc/",
+      "url": "https://relay.example/?device=d_abc",
     },
   })
   // The token itself never appears in any status.

@@ -608,13 +608,14 @@ fn empty_device_state(channel : @interop.ChannelId) -> DeviceState {
 
 ///|
 priv struct Model {
-  // Connected device channels in stable (sidebar) order; exactly one today —
-  // the page's own host — and empty on the portal page.
+  // Connected device channels in stable order: the desktop window's one
+  // Local host, or a browser console's roster devices — empty there until
+  // the roster loads (`apply_roster`).
   devices : Array[DeviceState]
   // The device channel every UI action targets — the Settings/Skills
   // screens, the composer, and the active conversation. The desktop window
-  // and a `/d/<device>/` console are born with theirs; on the portal page
-  // this is an inert `Local` default that nothing ever reads.
+  // is born with `Local`; a browser console starts on an inert `Local`
+  // default that nothing reads and focuses a device with its first roster.
   focused : @interop.ChannelId
   selected_model : String
   max_steps : String
@@ -658,10 +659,10 @@ priv struct Model {
   // close path — from a browser tab, `window.close()` exits nothing, and the
   // update would yank the app out from under whoever is at the machine.
   is_desktop : Bool
-  // The portal page's state when this page *is* the portal (a browser at
-  // the relay root, outside any device prefix); None everywhere else. The
-  // console — sidebar, transcript, bridge — never boots while this is set.
-  portal : @portal.Model?
+  // A browser page's account layer: the relay session and the device
+  // roster (see `ConsoleState`). None in the desktop window, whose one
+  // Local channel needs no account and no roster.
+  console : ConsoleState?
   wsl_enabled : Bool
   wsl_distro : String
   wsl_engine : String
@@ -854,8 +855,9 @@ priv struct HostSettings {
 ///|
 priv enum Msg {
   Init
-  // The portal page's own messages, routed through `@portal.update`.
-  Portal(@portal.Msg)
+  // The browser console's account layer (relay session, device roster),
+  // routed through `update_console_msg`.
+  Console(ConsoleMsg)
   // UI preferences read back from localStorage at startup. Engine endpoint
   // settings are the host's (`HostSettingsLoaded`); only page-local looks
   // live here.
@@ -1330,20 +1332,19 @@ fn initial_model() -> Model {
     Some(width) => width <= NarrowBreakpoint
     None => false
   }
-  // A portal link into this console may preselect the project
-  // (`?workspace=`); new conversations then land in it from the start.
-  let preselected_workspace = match @interop.page_query_param("workspace") {
-    Some(path) => path
-    None => ""
-  }
+  // A deep link may preselect the project (`?workspace=`) and, on the
+  // browser console, the device (`?device=`, minted by the relay's redirect
+  // off the retired `/d/<id>/` routes); the first conversation lands there.
+  let preselect_workspace = @interop.page_query_param("workspace")
   {
-    // The page's one channel; the portal page carries no devices at all.
+    // The desktop window's one channel; a browser page starts empty and
+    // fills `devices` from the fetched roster (`apply_roster`).
     devices: match @interop.page_channel() {
       Some(channel) =>
         [
           {
             ..empty_device_state(channel),
-            active_workspace: preselected_workspace,
+            active_workspace: preselect_workspace.unwrap_or(""),
           },
         ]
       None => []
@@ -1362,14 +1363,17 @@ fn initial_model() -> Model {
     legacy_cleanup_pending: false,
     host_wsl: false,
     is_desktop: @interop.using_proton_bridge(),
-    // A browser page outside any `/d/<device>/` prefix is the relay's
-    // portal (sign-in + the flat workspace list); the console never
-    // materializes there and the protocol WebSocket is never opened.
-    portal: if @interop.using_proton_bridge() ||
-      @interop.page_device_id() is Some(_) {
+    // Every browser page is the console: it signs in against the relay and
+    // fetches the device roster before any channel opens.
+    console: if @interop.using_proton_bridge() {
       None
     } else {
-      Some(@portal.Model::init())
+      Some(
+        empty_console_state(
+          @interop.page_query_param("device"),
+          preselect_workspace,
+        ),
+      )
     },
     wsl_enabled: false,
     wsl_distro: "",
@@ -1410,8 +1414,8 @@ fn initial_model() -> Model {
 
 ///|
 /// The state of one connected channel; `None` for a channel this page does
-/// not hold (never the case for the page's own channel in normal operation,
-/// but the portal page holds no devices).
+/// not hold — one the roster retired, or any channel before a browser
+/// console's first roster arrives.
 fn Model::device_state(
   self : Model,
   channel : @interop.ChannelId,
@@ -1477,7 +1481,7 @@ fn Model::with_active_workspace(self : Model, workspace : String) -> Model {
 
 ///|
 /// The focused channel's bridge state, `Connecting` when the page holds no
-/// devices — keeps the view total on the portal page.
+/// devices — keeps the view total before a browser console's roster lands.
 fn Model::bridge_state(self : Model) -> BridgeState {
   match self.focused_device() {
     Some(dev) => dev.bridge

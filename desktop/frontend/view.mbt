@@ -196,7 +196,7 @@ fn session_row(
 /// conversations mid-run is the point of keeping them concurrent.
 fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
   // The sidebar lists the focused device's collections; an absent device
-  // (the portal page, which never renders this sidebar) reads as empty.
+  // (a console whose roster has not landed yet) reads as empty.
   let dev = model.focused_device().unwrap_or(empty_device_state(model.focused))
   let rows : Array[@html.Html] = []
   let listed = (id : String) => {
@@ -2338,11 +2338,64 @@ fn page_with_toggle(
 }
 
 ///|
+/// The console's pre-sign-in page: one full-screen card. Checking shows
+/// progress (or the failure with a retry); signed out shows the GitHub
+/// sign-in link. Signed in never reaches here.
+fn console_gate_view(
+  dispatch : @cmd.Emit[Msg],
+  console : ConsoleState,
+) -> @html.Html {
+  let card : Array[@html.Html] = []
+  match console.auth {
+    AuthChecking => {
+      card.push(
+        @html.p(
+          match console.notice {
+            Some(notice) => notice
+            None => "Checking sign-in…"
+          },
+        ),
+      )
+      if console.notice is Some(_) {
+        card.push(
+          @html.button(
+            class="primary",
+            on_click=dispatch(Console(RefreshClicked)),
+            "Try again",
+          ),
+        )
+      }
+    }
+    AuthSignedOut => {
+      card.push(@html.h2("Sign in"))
+      card.push(
+        @html.p("Your OpenSeek devices and their workspaces, from any browser."),
+      )
+      card.push(
+        @html.a(
+          class="portal-button-link",
+          href="/v1/auth/login?return_to=%2F",
+          "Sign in with GitHub",
+        ),
+      )
+    }
+    AuthSignedIn(..) => ()
+  }
+  @html.section(class="portal", [
+    @html.div(class="portal-inner", [
+      @html.header(class="portal-header", [@html.h1("OpenSeek")]),
+      @html.div(class="portal-card", card),
+    ]),
+  ])
+}
+
+///|
 fn view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
-  // The portal page replaces the whole console frame — no sidebar, no
-  // composer, no overlays; it is its own full-screen layout.
-  if model.portal is Some(portal_model) {
-    return @portal.view(dispatch.map(m => Portal(m)), portal_model)
+  // A browser page is gated on the relay session: until `/v1/auth/me`
+  // answers signed-in, the console frame — sidebar, composer, overlays —
+  // stays unbuilt and the full-screen gate card is the page.
+  if model.console is Some(console) && !(console.auth is AuthSignedIn(..)) {
+    return console_gate_view(dispatch, console)
   }
   let content = match model.screen {
     Chat =>

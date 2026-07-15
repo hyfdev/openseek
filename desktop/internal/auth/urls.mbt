@@ -22,13 +22,15 @@ pub fn tunnel_url(server_url : String) -> String {
 }
 
 ///|
-/// The browser console URL for a device registered at `server_url`.
+/// The browser console URL for a device registered at `server_url`. The
+/// console lives at the root; `?device=` preselects this device there
+/// (the old `/d/<device>/` deep links redirect to the same place).
 pub fn device_url(server_url : String, device : String) -> String {
   let origin = match server_url.strip_suffix("/") {
     Some(origin) => origin.to_owned()
     None => server_url
   }
-  "\{origin}/d/\{device}/"
+  "\{origin}/?device=\{device}"
 }
 
 ///|

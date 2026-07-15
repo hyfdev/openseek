@@ -57,36 +57,41 @@ async fn main {
       ctx.get("/v1/devices/:device/ws", (req, res) => {
         serve_browser(relay, req, res)
       })
-      // `/d/<id>` and `/d/<id>/` both land here (the trie folds the empty
-      // trailing segment into the param route). With the slash, serve the
-      // app shell; without it, redirect so the page's document-relative
-      // paths keep the `/d/<id>/` prefix.
-      ctx.get("/d/:device", (req, res) => {
-        if req.path.has_suffix("/") {
-          serve_static(relay, "index.html", res)
-        } else {
-          guard req.params.get("device") is Some(device) else {
-            return res.send_json({ "error": "missing device id" }, status=400)
-          }
-          // Preserve the query across the redirect — whatever the caller
-          // put there belongs to the page, not to this hop.
-          let location = match req.search {
-            Some(search) => "/d/\{device}/?\{search}"
-            None => "/d/\{device}/"
-          }
-          res.send_void(status=302, headers=[("Location", location)])
-        }
+      // The retired `/d/<device>/…` deep links redirect into the console
+      // at `/`, the device id and any query translated to query parameters
+      // (`/d/<id>/?workspace=X` → `/?device=<id>&workspace=X`).
+      ctx.get("/d/:device", (req, res) => redirect_to_console(req, res))
+      ctx.get("/d/:device/*rest", (req, res) => redirect_to_console(req, res))
+      // Dev-only account stubs, so the console at `/` runs without the
+      // deployed relay's account layer: one fake signed-in user who owns
+      // every connected device. Rename is in-memory only, and revoking
+      // drops the registration but the host's reconnect re-registers it —
+      // approximations that are enough to exercise the console.
+      ctx.get("/v1/auth/me", (_req, res) => {
+        res.send_json({ "login": "dev", "avatar_url": "" })
       })
-      // Everything else under a device prefix is a frontend asset, served
-      // from the relay's own copy — the bundle never crosses the tunnel.
-      ctx.get("/d/:device/*rest", (req, res) => {
-        let file = match req.params.get("rest") {
-          Some(rest) if !rest.is_empty() => rest.to_owned()
-          _ => "index.html"
-        }
-        serve_static(relay, file, res)
+      ctx.get("/v1/auth/login", (_req, res) => {
+        res.send_void(status=302, headers=[("Location", "/")])
       })
-      // The portal page and its bare asset paths — same bundle, served at
+      ctx.post("/v1/auth/logout", (_req, res) => res.send_void(status=204))
+      ctx.get("/v1/devices", (_req, res) => {
+        let items : Array[Json] = []
+        for id, device in relay.devices {
+          items.push({
+            "id": id.to_json(),
+            "name": device.name.to_json(),
+            "online": true,
+          })
+        }
+        res.send_json({ "devices": items.to_json() })
+      })
+      ctx.add_route(Patch, "/v1/devices/:id", (req, res) => {
+        rename_device(relay, req, res)
+      })
+      ctx.add_route(Delete, "/v1/devices/:id", (req, res) => {
+        revoke_device(relay, req, res)
+      })
+      // The console page and its bare asset paths — the bundle, served at
       // the root like the deployed relay does. Registered last so every
       // explicit route above wins.
       ctx.get("/", (_req, res) => serve_static(relay, "index.html", res))
@@ -124,10 +129,69 @@ priv struct Relay {
 ///|
 /// One registered host. `out` is drained by a single writer task per
 /// control connection, which encodes frames at the socket — no other task
-/// touches the wire.
+/// touches the wire. `name` is mutable for the dev rename stub only.
 priv struct Device {
-  name : String
+  mut name : String
   out : @async.Queue[@tunnel.Frame]
+}
+
+///|
+/// The retired `/d/<device>/…` routes 302 into the console at `/`; the
+/// device id and the caller's query ride along as query parameters, so a
+/// stale deep link still preselects its device and workspace.
+async fn redirect_to_console(
+  req : @moonback.Request,
+  res : @moonback.Responder,
+) -> Unit {
+  guard req.params.get("device") is Some(device) else {
+    return res.send_json({ "error": "missing device id" }, status=400)
+  }
+  let location = match req.search {
+    Some(search) if !search.is_empty() => "/?device=\{device}&\{search}"
+    _ => "/?device=\{device}"
+  }
+  res.send_void(status=302, headers=[("Location", location)])
+}
+
+///|
+/// Dev stub: rename a connected device in memory.
+async fn rename_device(
+  relay : Relay,
+  req : @moonback.Request,
+  res : @moonback.Responder,
+) -> Unit {
+  guard req.params.get("id") is Some(id) &&
+    relay.devices.get(id.to_owned()) is Some(device) else {
+    return res.send_json({ "error": "unknown device" }, status=404)
+  }
+  let body = req.body.json() catch {
+    _ => return res.send_json({ "error": "malformed JSON" }, status=400)
+  }
+  guard body is Object(fields) &&
+    fields.get("name") is Some(String(name)) &&
+    !name.trim().is_empty() else {
+    return res.send_json({ "error": "missing name" }, status=400)
+  }
+  device.name = name.trim().to_owned()
+  res.send_void(status=204)
+}
+
+///|
+/// Dev stub: drop a device's registration and wake its control session's
+/// writer. The host's automatic reconnect re-registers it — enough to
+/// exercise the console's revoke path, not a real revocation.
+async fn revoke_device(
+  relay : Relay,
+  req : @moonback.Request,
+  res : @moonback.Responder,
+) -> Unit {
+  guard req.params.get("id") is Some(id) &&
+    relay.devices.get(id.to_owned()) is Some(device) else {
+    return res.send_json({ "error": "unknown device" }, status=404)
+  }
+  relay.devices.remove(id.to_owned())
+  device.out.close()
+  res.send_void(status=204)
 }
 
 ///|
@@ -404,7 +468,7 @@ fn value(matches : @argparse.Matches, name : String) -> String {
 fn cli_command() -> @argparse.Command {
   Command(
     "openseek-relay",
-    about="WebSocket-splicing relay: hosts dial in, browsers reach them at /d/<device>/.",
+    about="WebSocket-splicing relay: hosts dial in, browsers reach them from the console at /.",
     options=[
       OptionArg(
         "host",
@@ -425,7 +489,7 @@ fn cli_command() -> @argparse.Command {
         long="web-dir",
         env="OPENSEEK_RELAY_WEB_DIR",
         default_values=[""],
-        about="Directory of frontend assets served under /d/<device>/.",
+        about="Directory of frontend assets served at the root.",
       ),
     ],
   )

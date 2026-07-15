@@ -774,34 +774,34 @@ fn update_msg(
 ) -> (@cmd.Cmd, Model) {
   match msg {
     Init =>
-      // The portal page boots nothing of the console: no bridge, no
-      // session, no scroll watcher — its own init asks the relay who is
-      // signed in.
-      if model.portal is Some(_) {
-        (@portal.init_cmd(dispatch.map(m => Portal(m))), model)
-      } else {
-        (
-          @cmd.batch([
-            install_bridge(dispatch, model.focused),
-            load_saved_settings(dispatch),
-            watch_transcript_scroll(dispatch),
-            watch_color_scheme(dispatch),
-            rotate_session(dispatch),
-          ]),
-          model,
-        )
+      // A browser console boots by asking the relay who is signed in; the
+      // bridge, the session rotation, and the transcript scroll watcher
+      // wait for the first roster (`apply_roster`) — before sign-in there
+      // is no channel to install and no transcript DOM to watch. The
+      // desktop window boots its one Local channel directly.
+      match model.console {
+        Some(_) =>
+          (
+            @cmd.batch([
+              fetch_console_me(dispatch),
+              load_saved_settings(dispatch),
+              watch_color_scheme(dispatch),
+            ]),
+            model,
+          )
+        None =>
+          (
+            @cmd.batch([
+              install_bridge(dispatch, model.focused),
+              load_saved_settings(dispatch),
+              watch_transcript_scroll(dispatch),
+              watch_color_scheme(dispatch),
+              rotate_session(dispatch),
+            ]),
+            model,
+          )
       }
-    Portal(msg) => {
-      guard model.portal is Some(portal_model) else {
-        return (@cmd.none, model)
-      }
-      let (cmd, next) = @portal.update(
-        dispatch.map(m => Portal(m)),
-        msg,
-        portal_model,
-      )
-      (cmd, { ..model, portal: Some(next) })
-    }
+    Console(msg) => update_console_msg(dispatch, msg, model)
     SettingsLoaded(notification_corner~, tree_layout~) =>
       (
         @cmd.none,
@@ -3586,12 +3586,14 @@ fn test_model() -> Model {
   {
     ..initial_model()
     // The headless test runtime has no page location, so `initial_model()`
-    // seeds no devices; every test runs on an explicit Local channel.
+    // seeds no devices (and, looking like a browser, a console); every test
+    // here runs desktop-shaped, on an explicit Local channel.
     ,
     devices: [
       { ..empty_device_state(@interop.ChannelId::Local), bridge: Connected },
     ],
     focused: @interop.ChannelId::Local,
+    console: None,
     active_session: "desktop-test",
     conversations: [test_conversation()],
   }

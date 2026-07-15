@@ -21,16 +21,17 @@ APIs live under `/v1`:
 
 | Route | What |
 |---|---|
-| `GET /` | The frontend bundle's portal: sign-in, one group per device (workspaces inside; rename/revoke behind the group's menu) |
-| `GET /d/<device>/` (and asset paths under it) | The same bundle, one device's console; `?workspace=<path>` preselects the workspace new conversations land in |
+| `GET /` | The frontend bundle: sign-in, then the multi-device console — one sidebar group per device, one WebSocket per online device. `?device=<id>` preselects the focused device, `?workspace=<path>` the workspace its first conversation lands in |
+| `GET /d/<device>/…` | Retired: `302` to `/?device=<device>` with the original query appended, so old deep links keep their preselection |
 | `GET /healthz` | Relay liveness probe, `200 ok` |
 | `/v1/auth/*`, `/v1/devices…` | The relay's own auth and device APIs (see Authentication) |
 
 Everything else — commands, queries, and host-pushed events — travels over
-**one WebSocket per client**: `GET /v1/devices/<device>/ws`, upgraded from
+**one WebSocket per device**: `GET /v1/devices/<device>/ws`, upgraded from
 the same origin the bundle was served from and spliced through to the host.
-The frontend takes `<device>` from its own page path (`/d/<device>/…`).
-Frames are JSON text, shaped as **JSON-RPC 2.0**:
+The frontend takes each `<device>` from the roster it fetches at
+`GET /v1/devices` (or the `?device=` preselect). Frames are JSON text,
+shaped as **JSON-RPC 2.0**:
 
 ```jsonc
 // client → host: request
@@ -448,7 +449,7 @@ The status shape, also the params of every `auth.changed` notification:
   "connected": false,            // control WS currently registered
   "managed_by_env": true,        // present only under the OPENSEEK_RELAY_URL override
   "user":   {"login": "…", "avatar_url": "…"},   // absent when signed out
-  "device": {"id": "d_…", "name": "…", "url": "…/d/d_…/"}  // absent when signed out
+  "device": {"id": "d_…", "name": "…", "url": "…/?device=d_…"}  // absent when signed out
 }
 ```
 
@@ -522,10 +523,10 @@ bridge feeds — the host has no tunnel-specific protocol handling beyond the
 four control frames. Either side closing a spliced socket closes its twin;
 a dropped control connection closes every stream of that device.
 
-The relay serves the frontend bundle itself, at `/` (sign-in + device
-picker) and under `/d/<device>/` (the bundle never crosses the tunnel).
-Nothing else is tunneled: the client protocol has exactly one entry
-point, the WebSocket.
+The relay serves the frontend bundle itself, at `/` (sign-in + the
+multi-device console; the bundle never crosses the tunnel). Nothing else
+is tunneled: the client protocol has exactly one entry point, the
+WebSocket.
 
 ## Changes from v1
 
