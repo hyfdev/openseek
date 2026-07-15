@@ -12,6 +12,7 @@ fn fetch_branch(
   session : String,
   cwd : @pathx.Absolute?,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let payload = @js.Object::new()

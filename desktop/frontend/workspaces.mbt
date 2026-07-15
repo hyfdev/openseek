@@ -11,6 +11,7 @@ fn fetch_workspaces(
   connection_generation : Int,
   request_generation : Int,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       // A host without the op just reads as "no workspaces attached".
@@ -164,6 +165,7 @@ async fn workspace_action_into(
   op : String,
   path : String,
 ) -> Unit noraise {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   let payload = @js.Object::new()
   payload["path"] = path
   let _ = @interop.bridge_request(channel, op, payload.to_value()) catch {
@@ -271,7 +273,7 @@ test "workspaces loaded retains a detached conversation's durable placement" {
     }),
     active_workspace: "/gone",
   }
-  let (_, next) = update(
+  let (_, next) = update_dev(
     dispatch,
     WorkspacesLoaded(["/kept"], connection_generation=0, request_generation=0),
     model,
@@ -288,7 +290,7 @@ test "workspaces loaded retains a detached conversation's durable placement" {
     }),
     active_workspace: "/kept",
   }
-  let (_, kept) = update(
+  let (_, kept) = update_dev(
     dispatch,
     WorkspacesLoaded(["/kept"], connection_generation=0, request_generation=0),
     attached,
@@ -302,7 +304,7 @@ test "workspaces loaded retains a detached conversation's durable placement" {
 test "an older workspace reply cannot replace a newer same-connection reply" {
   let dispatch = test_dispatch()
   let model = { ..test_model(), workspaces_request_generation: 2 }
-  let (_, newest) = update(
+  let (_, newest) = update_dev(
     dispatch,
     WorkspacesLoaded(
       ["/current"],
@@ -314,7 +316,7 @@ test "an older workspace reply cannot replace a newer same-connection reply" {
   inspect(newest.workspaces.length(), content="1")
   inspect(newest.workspaces[0], content="/current")
   inspect(newest.sessions_request_generation, content="1")
-  let (_, stale) = update(
+  let (_, stale) = update_dev(
     dispatch,
     WorkspacesLoaded(["/old"], connection_generation=0, request_generation=1),
     newest,
@@ -332,12 +334,12 @@ test "a workspace commit broadcast supersedes list replies and refreshes session
     workspaces: ["/current"],
     workspaces_request_generation: 2,
   }
-  let (_, changed) = update(dispatch, WorkspacesChanged(["/new"]), model)
+  let (_, changed) = update_dev(dispatch, WorkspacesChanged(["/new"]), model)
   inspect(changed.workspaces_request_generation, content="3")
   inspect(changed.workspaces.length(), content="1")
   inspect(changed.workspaces[0], content="/new")
   inspect(changed.sessions_request_generation, content="1")
-  let (_, stale) = update(
+  let (_, stale) = update_dev(
     dispatch,
     WorkspacesLoaded(
       ["/current"],
@@ -351,10 +353,10 @@ test "a workspace commit broadcast supersedes list replies and refreshes session
 
 ///|
 test "workspace commit decoder carries the canonical registry list" {
-  guard bridge_msg("workspace.changed", {
+  guard bridge_msg(@interop.ChannelId::Local, "workspace.changed", {
       "workspaces": Json::array([Json::string("/one"), Json::string("/two")]),
     })
-    is Some(WorkspacesChanged(paths)) else {
+    is Some(FromDevice(_, WorkspacesChanged(paths))) else {
     fail("expected a workspace change")
   }
   inspect(paths.length(), content="2")
@@ -385,7 +387,7 @@ test "opening a stored session adopts its workspace" {
   let (_, opening) = update(dispatch, OpenSession("desktop-w"), model)
   inspect(opening.active_workspace, content="/proj")
   inspect(opening.loading_session, content="desktop-w")
-  let (_, loaded) = update(
+  let (_, loaded) = update_dev(
     dispatch,
     SessionLoaded(
       session="desktop-w",
@@ -482,7 +484,7 @@ test "picker paths join with the host's own separator" {
 ///|
 test "a workspace failure pops a toast" {
   let dispatch = test_dispatch()
-  let (_, next) = update(
+  let (_, next) = update_dev(
     dispatch,
     WorkspaceFailed("not a directory"),
     test_model(),

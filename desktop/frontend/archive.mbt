@@ -13,6 +13,7 @@ fn fetch_archived(
   connection_generation : Int,
   request_generation : Int,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       // A host without the op (or without a session store) just reads as an
@@ -79,6 +80,7 @@ fn archive_action(
   sessions_request_generation : Int,
   archived_request_generation : Int,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let payload = @js.Object::new()

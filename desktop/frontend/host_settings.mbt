@@ -51,6 +51,7 @@ fn fetch_host_settings(
   channel : @interop.ChannelId,
   connection_generation : Int,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
@@ -86,6 +87,7 @@ fn push_host_settings(
   connection_generation : Int,
   cleans_legacy? : Bool = false,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(channel, "settings.set", patch) catch {

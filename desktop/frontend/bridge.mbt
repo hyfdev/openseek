@@ -19,11 +19,29 @@ fn install_bridge(
 }
 
 ///|
-/// Route one notification to its decoder. `agent.connected` is the
+/// Route one notification to its decoder, stamped with the channel it
+/// arrived on. Device-scoped notifications wrap as `FromDevice`; the rest
+/// back page-global or focused-scoped state and stay root messages.
+fn bridge_msg(
+  channel : @interop.ChannelId,
+  method_ : String,
+  payload : Map[String, Json],
+) -> Msg? {
+  match method_ {
+    "auth.changed" =>
+      decode_remote_access(payload).map(status => RemoteStatusLoaded(status))
+    "lsp.diagnostics" => diagnostics_msg(payload)
+    "fs.changed" => fs_changed_msg(payload)
+    _ => device_msg(method_, payload).map(msg => FromDevice(channel, msg))
+  }
+}
+
+///|
+/// A device-scoped notification's decoder. `agent.connected` is the
 /// readiness/resync signal on both transports: it re-fires on every
 /// reconnect (and engine-pump restart), and the refetches BridgeReady
 /// triggers — including `agent.runs` — rebuild whatever was missed.
-fn bridge_msg(method_ : String, payload : Map[String, Json]) -> Msg? {
+fn device_msg(method_ : String, payload : Map[String, Json]) -> DeviceMsg? {
   match method_ {
     "agent.connected" => Some(BridgeReady)
     "agent.started" => started_msg(payload)
@@ -39,10 +57,6 @@ fn bridge_msg(method_ : String, payload : Map[String, Json]) -> Msg? {
       decode_host_settings(payload).map(settings => {
         HostSettingsLoaded(settings, connection_generation=None)
       })
-    "auth.changed" =>
-      decode_remote_access(payload).map(status => RemoteStatusLoaded(status))
-    "lsp.diagnostics" => diagnostics_msg(payload)
-    "fs.changed" => fs_changed_msg(payload)
     _ => None
   }
 }
@@ -51,7 +65,7 @@ fn bridge_msg(method_ : String, payload : Map[String, Json]) -> Msg? {
 /// Decode archive invalidation synchronously. A fresh id is allocated at the
 /// event boundary (outside `update`) so archiving the active conversation can
 /// switch immediately without a render where Send still targets the stale id.
-fn session_changed_msg(payload : Map[String, Json]) -> Msg? {
+fn session_changed_msg(payload : Map[String, Json]) -> DeviceMsg? {
   guard @jsonx.json_text(payload, "change") is Some(change) &&
     @jsonx.json_text(payload, "session") is Some(session) else {
     return None
@@ -99,7 +113,9 @@ fn install_proton_bridge(dispatch : @cmd.Emit[Msg], attempt : Int) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     guard bridge_handles() is Some((api, events)) else {
       if attempt > 120 {
-        scheduler.add(dispatch(BridgeUnavailable("Bridge unavailable")))
+        scheduler.add(
+          dispatch(FromDevice(Local, BridgeUnavailable("Bridge unavailable"))),
+        )
       } else {
         scheduler.add(
           @cmd.delay(install_proton_bridge(dispatch, attempt + 1), 25),
@@ -133,7 +149,12 @@ fn open_host_connection(
     ).wait() catch {
       error => {
         scheduler.add(
-          dispatch(BridgeUnavailable(@interop.bridge_error_text(error))),
+          dispatch(
+            FromDevice(
+              Local,
+              BridgeUnavailable(@interop.bridge_error_text(error)),
+            ),
+          ),
         )
         return
       }
@@ -179,7 +200,7 @@ fn wire_proton_events(
   }
 
   for method_ in proton_event_methods() {
-    on("openseek." + method_, payload => bridge_msg(method_, payload))
+    on("openseek." + method_, payload => bridge_msg(Local, method_, payload))
   }
   // Emitted by proton itself (not the openseek extension) when the user
   // clicks a system notification; the payload is the run id the host
@@ -222,13 +243,14 @@ fn connect_ws(
 ) -> @cmd.Cmd {
   @cmd.custom_cmd(scheduler => {
     let counter : Ref[Int] = Ref(failures)
+    let channel : @interop.ChannelId = Device(device)
     @interop.ws_connect(
       device,
       on_notification=(method_, params) => {
         if method_ == "agent.connected" {
           counter.val = 0
         }
-        if bridge_msg(method_, params) is Some(msg) {
+        if bridge_msg(channel, method_, params) is Some(msg) {
           scheduler.add(dispatch(msg))
         }
       },
@@ -237,8 +259,11 @@ fn connect_ws(
         if next == WsLostAfter {
           scheduler.add(
             dispatch(
-              BridgeUnavailable(
-                "Can't reach OpenSeek. Make sure OpenSeek is running, then reopen this page.",
+              FromDevice(
+                channel,
+                BridgeUnavailable(
+                  "Can't reach OpenSeek. Make sure OpenSeek is running, then reopen this page.",
+                ),
               ),
             ),
           )
@@ -282,6 +307,7 @@ fn fetch_runs(
   frontier : Array[RunSnapshotFrontier],
   connection_generation : Int,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   let payload = runs_payload(frontier)
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
@@ -377,6 +403,7 @@ fn fetch_host_meta(
   dispatch : @cmd.Emit[Msg],
   channel : @interop.ChannelId,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let reply = @interop.bridge_request(
@@ -395,7 +422,7 @@ fn fetch_host_meta(
 }
 
 ///|
-fn started_msg(payload : Map[String, Json]) -> Msg? {
+fn started_msg(payload : Map[String, Json]) -> DeviceMsg? {
   // `run_id`/`session`/`model`/`max_steps` are unconditional on this event
   // (the app's own start op always names a session); a payload missing one
   // is malformed and dropped. `cwd` is genuinely optional — omitted for a
@@ -468,7 +495,7 @@ fn recovered_settlement(payload : Map[String, Json]) -> RecoveredSettlement? {
 /// the transcript projector consumes. A payload missing any of it is
 /// malformed and dropped — the watermark gap it leaves behind is answered by
 /// a reload, so nothing is lost silently.
-fn session_event_msg(payload : Map[String, Json]) -> Msg? {
+fn session_event_msg(payload : Map[String, Json]) -> DeviceMsg? {
   guard @jsonx.json_text(payload, "session") is Some(session) &&
     @jsonx.json_int(payload, "sequence") is Some(sequence) &&
     payload.get("event") is Some(Object(event)) &&
@@ -481,7 +508,7 @@ fn session_event_msg(payload : Map[String, Json]) -> Msg? {
 }
 
 ///|
-fn engine_msg(payload : Map[String, Json]) -> Msg? {
+fn engine_msg(payload : Map[String, Json]) -> DeviceMsg? {
   guard payload.get("event") is Some(Object(raw)) else { return None }
   guard @transcript.decode_engine_event(raw) is Some(event) else { return None }
   // `run_id` is absent for events the engine emits before any run of its
@@ -503,7 +530,7 @@ fn engine_msg(payload : Map[String, Json]) -> Msg? {
 /// showing. Unlike other events, a malformed error is not dropped: an error
 /// must never vanish silently, so a missing or blank `message` still
 /// surfaces, labeled generically.
-fn error_msg(payload : Map[String, Json]) -> Msg? {
+fn error_msg(payload : Map[String, Json]) -> DeviceMsg? {
   let message = if @jsonx.json_text(payload, "message") is Some(message) &&
     !message.trim().is_empty() {
     message
@@ -521,7 +548,7 @@ fn error_msg(payload : Map[String, Json]) -> Msg? {
 }
 
 ///|
-fn finished_msg(payload : Map[String, Json]) -> Msg? {
+fn finished_msg(payload : Map[String, Json]) -> DeviceMsg? {
   // `answer` is present only when the agent finished with one.
   guard @jsonx.json_text(payload, "run_id") is Some(run_id) &&
     @jsonx.json_text(payload, "status") is Some(status) else {
@@ -538,7 +565,7 @@ fn finished_msg(payload : Map[String, Json]) -> Msg? {
 }
 
 ///|
-fn durable_boundary_msg(payload : Map[String, Json]) -> Msg? {
+fn durable_boundary_msg(payload : Map[String, Json]) -> DeviceMsg? {
   guard @jsonx.json_text(payload, "run_id") is Some(run_id) &&
     @jsonx.json_text(payload, "session") is Some(session) &&
     @jsonx.json_int(payload, "sequence") is Some(sequence) else {
@@ -597,6 +624,7 @@ fn start_openseek(
   session : String,
   workspace~ : @pathx.Absolute?,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   let payload = start_payload(
     task,
     selected_model,
@@ -747,6 +775,7 @@ async fn refresh_sessions_into(
   connection_generation : Int,
   request_generation : Int,
 ) -> Unit noraise {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   let reply = @interop.bridge_request(
     channel,
     "session.list",
@@ -779,6 +808,7 @@ fn open_session(
   workspace~ : String,
   generation~ : Int,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   load_session_cmd(
     channel,
     session_id,
@@ -817,6 +847,7 @@ fn refresh_session(
   workspace~ : String,
   generation~ : Int,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   load_session_cmd(
     channel,
     session_id,
@@ -883,6 +914,7 @@ fn steer_openseek(
   text : String,
   run_id : String,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   @cmd.custom_cmd(scheduler => {
     @js.async_run(() => {
       let delivered = steer_delivered(channel, text, submission_id, run_id) catch {
@@ -944,6 +976,7 @@ fn compact_openseek(
   max_steps~ : String,
   workspace? : @pathx.Absolute,
 ) -> @cmd.Cmd {
+  let dispatch = dispatch.map((msg : DeviceMsg) => FromDevice(channel, msg))
   let payload = @js.Object::new()
   set_engine_settings(payload, model~, max_steps~, session~, workspace?)
   @cmd.custom_cmd(scheduler => {

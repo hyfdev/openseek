@@ -814,34 +814,12 @@ priv struct HostSettings {
 ///|
 priv enum Msg {
   Init
-  BridgeReady
-  BridgeUnavailable(String)
   // The portal page's own messages, routed through `@portal.update`.
   Portal(@portal.Msg)
-  // The host's `host.meta` reply: whether the host itself can run the engine
-  // inside WSL (a Windows host). The page's own platform says nothing — a
-  // phone browser may drive a Windows host and a Windows browser a Mac one.
-  HostMetaLoaded(wsl~ : Bool)
   // UI preferences read back from localStorage at startup. Engine endpoint
   // settings are the host's (`HostSettingsLoaded`); only page-local looks
   // live here.
   SettingsLoaded(notification_corner~ : String, tree_layout~ : String)
-  // The host's settings, from a `settings.get` reply or a peer client's
-  // edit broadcast as `settings.changed`. Applied only while no local write
-  // is in flight — see `Model::settings_saves`.
-  HostSettingsLoaded(HostSettings, connection_generation~ : Int?)
-  // A `settings.set` this client sent came back with the post-write state.
-  HostSettingsApplied(
-    HostSettings,
-    connection_generation~ : Int,
-    cleans_legacy~ : Bool
-  )
-  // A `settings.set` this client sent failed; the message pops as a toast.
-  HostSettingsSaveFailed(
-    String,
-    connection_generation~ : Int,
-    cleans_legacy~ : Bool
-  )
   // The legacy localStorage engine settings, read at bridge time. The
   // desktop window migrates them up to the host once; a browser page only
   // purges them (a stale secret in shared storage is the leak this design
@@ -967,6 +945,111 @@ priv enum Msg {
   // installed list instead).
   SkillActionDone(key~ : String, error~ : String)
   Send
+  Stop
+  NewChat
+  SessionRotated(String)
+  OpenSession(String)
+  // The user clicked the system notification a finished run posted: jump to
+  // the conversation that owned that run (the window itself is already
+  // brought forward natively).
+  NotificationClicked(run_id~ : String)
+  // A host-side action with no conversation of its own (opening a file in
+  // the system app, launching an app) failed: pops an error toast.
+  HostActionFailed(String)
+  // Open the in-app folder picker (browsing starts at the host's home
+  // directory). The picker renders host-side listings, so it works the
+  // same against the embedded gateway and a remote one.
+  PickWorkspace
+  // Browse into a directory: a subdirectory row, the parent, or the typed
+  // path field on Enter.
+  WorkspacePickerNavigate(String)
+  // One directory's listing came back from the host; `generation` names
+  // the browse request it answers, so a stale reply is dropped.
+  WorkspacePickerLoaded(
+    path~ : String,
+    entries~ : Array[String],
+    generation~ : Int
+  )
+  // A navigation failed; the message shows in the picker and the previous
+  // listing stays usable.
+  WorkspacePickerFailed(message~ : String, generation~ : Int)
+  // The picker's path field changed.
+  WorkspacePickerInput(String)
+  // Register the picker's current directory and close it.
+  WorkspacePickerConfirm
+  WorkspacePickerClose
+  // Detach a workspace: only the registry entry goes away — the directory
+  // and the sessions inside it stay, so re-adding restores them.
+  RemoveWorkspace(String)
+  // Start a fresh conversation in a workspace ("" = the default store).
+  NewChatIn(String)
+  // Archive a conversation: the host moves its durable record into the
+  // store's `archived` twin and the sidebar moves the row under the Archived
+  // group.
+  ArchiveSession(String)
+  // Restore an archived conversation into the live list.
+  UnarchiveSession(String)
+  // The transcript's at-bottom state changed (the user scrolled away from,
+  // or back to, the tail). Reported by the DOM scroll watcher.
+  TranscriptPinned(Bool)
+  // The floating "jump to latest" button: scroll the transcript back to its
+  // tail and re-pin auto-follow.
+  JumpToLatest
+  // The host's dark-mode preference changed (the user switched the OS theme).
+  // Reported by the `matchMedia` watcher.
+  ColorSchemeChanged(Bool)
+  // A file path in the transcript was clicked: open it in the system's
+  // default app. The host resolves the path inside the active conversation's
+  // workspace.
+  OpenFile(String)
+  // Open or close the topbar app launcher; opening it fetches the installed-app
+  // list the first time.
+  ToggleLauncher
+  LauncherLoaded(Array[@transcript.LauncherAppItem])
+  LauncherFailed(String)
+  // Launch one detected app (by its id) on the active conversation's workspace.
+  LaunchApp(String)
+  // The editor side-panel's own messages (tree, viewer, diagnostics,
+  // comments), routed to the `fileeditor` package's update. The one
+  // exception is `EditorCommentAdded`, which this update intercepts: the
+  // comment becomes a chip on the composer draft, which only the app model
+  // knows about.
+  FileEditor(@fileeditor.Msg)
+  // A message produced by one device channel's connection — its lifecycle,
+  // its notification stream, and every reply fenced by its connection
+  // generation — tagged with the channel it came from.
+  FromDevice(@interop.ChannelId, DeviceMsg)
+}
+
+///|
+/// Everything one device channel's connection can tell the app: its
+/// lifecycle, its notification stream, and every reply fenced by its
+/// connection generation. Root `Msg` carries these as
+/// `FromDevice(channel, ...)`; messages that back page-global or
+/// focused-scoped state stay on `Msg` itself.
+priv enum DeviceMsg {
+  BridgeReady
+  BridgeUnavailable(String)
+  // The host's `host.meta` reply: whether the host itself can run the engine
+  // inside WSL (a Windows host). The page's own platform says nothing — a
+  // phone browser may drive a Windows host and a Windows browser a Mac one.
+  HostMetaLoaded(wsl~ : Bool)
+  // The host's settings, from a `settings.get` reply or a peer client's
+  // edit broadcast as `settings.changed`. Applied only while no local write
+  // is in flight — see `Model::settings_saves`.
+  HostSettingsLoaded(HostSettings, connection_generation~ : Int?)
+  // A `settings.set` this client sent came back with the post-write state.
+  HostSettingsApplied(
+    HostSettings,
+    connection_generation~ : Int,
+    cleans_legacy~ : Bool
+  )
+  // A `settings.set` this client sent failed; the message pops as a toast.
+  HostSettingsSaveFailed(
+    String,
+    connection_generation~ : Int,
+    cleans_legacy~ : Bool
+  )
   // The steer RPC failed before its outcome was known. The host may already
   // have accepted it, so its notice/ledger entry stays provisional.
   SteerUndelivered(
@@ -983,9 +1066,6 @@ priv enum Msg {
     text~ : String,
     run_id~ : String
   )
-  Stop
-  NewChat
-  SessionRotated(String)
   SessionsLoaded(
     Array[@transcript.SessionListItem],
     connection_generation~ : Int,
@@ -996,11 +1076,6 @@ priv enum Msg {
   // invalidate that exact live target immediately; both sidebar lists are
   // then re-read for their durable contents.
   SessionsChanged(change~ : String, session~ : String, fresh_session~ : String?)
-  OpenSession(String)
-  // The user clicked the system notification a finished run posted: jump to
-  // the conversation that owned that run (the window itself is already
-  // brought forward natively).
-  NotificationClicked(run_id~ : String)
   SessionLoaded(
     session~ : String,
     items~ : Array[@transcript.TranscriptItem],
@@ -1033,9 +1108,6 @@ priv enum Msg {
     kind~ : String,
     payload~ : Map[String, Json]
   )
-  // A host-side action with no conversation of its own (opening a file in
-  // the system app, launching an app) failed: pops an error toast.
-  HostActionFailed(String)
   // The registered workspaces — the reply to `workspace.list`. Both
   // generations are required: reconnect rejects a dead socket, while request
   // generation rejects an older reply from the current connection.
@@ -1047,40 +1119,7 @@ priv enum Msg {
   // The host's canonical post-commit registry broadcast. Every client adopts
   // the same list in durable write order and invalidates older list replies.
   WorkspacesChanged(Array[String])
-  // Open the in-app folder picker (browsing starts at the host's home
-  // directory). The picker renders host-side listings, so it works the
-  // same against the embedded gateway and a remote one.
-  PickWorkspace
-  // Browse into a directory: a subdirectory row, the parent, or the typed
-  // path field on Enter.
-  WorkspacePickerNavigate(String)
-  // One directory's listing came back from the host; `generation` names
-  // the browse request it answers, so a stale reply is dropped.
-  WorkspacePickerLoaded(
-    path~ : String,
-    entries~ : Array[String],
-    generation~ : Int
-  )
-  // A navigation failed; the message shows in the picker and the previous
-  // listing stays usable.
-  WorkspacePickerFailed(message~ : String, generation~ : Int)
-  // The picker's path field changed.
-  WorkspacePickerInput(String)
-  // Register the picker's current directory and close it.
-  WorkspacePickerConfirm
-  WorkspacePickerClose
-  // Detach a workspace: only the registry entry goes away — the directory
-  // and the sessions inside it stay, so re-adding restores them.
-  RemoveWorkspace(String)
   WorkspaceFailed(String)
-  // Start a fresh conversation in a workspace ("" = the default store).
-  NewChatIn(String)
-  // Archive a conversation: the host moves its durable record into the
-  // store's `archived` twin and the sidebar moves the row under the Archived
-  // group.
-  ArchiveSession(String)
-  // Restore an archived conversation into the live list.
-  UnarchiveSession(String)
   // The archived conversations — the reply to `archived_sessions` and to a
   // successful `archive_session`/`unarchive_session` alike.
   ArchivedLoaded(
@@ -1090,30 +1129,10 @@ priv enum Msg {
     fresh_session~ : String
   )
   ArchiveFailed(String)
-  // The transcript's at-bottom state changed (the user scrolled away from,
-  // or back to, the tail). Reported by the DOM scroll watcher.
-  TranscriptPinned(Bool)
-  // The floating "jump to latest" button: scroll the transcript back to its
-  // tail and re-pin auto-follow.
-  JumpToLatest
-  // The host's dark-mode preference changed (the user switched the OS theme).
-  // Reported by the `matchMedia` watcher.
-  ColorSchemeChanged(Bool)
   // A `workspace_branch` reply: the git branch of `session`'s workspace —
   // `Some("")` when it is not a repository, `None` when the probe failed or
   // answered unintelligibly.
   BranchLoaded(session~ : String, branch~ : String?)
-  // A file path in the transcript was clicked: open it in the system's
-  // default app. The host resolves the path inside the active conversation's
-  // workspace.
-  OpenFile(String)
-  // Open or close the topbar app launcher; opening it fetches the installed-app
-  // list the first time.
-  ToggleLauncher
-  LauncherLoaded(Array[@transcript.LauncherAppItem])
-  LauncherFailed(String)
-  // Launch one detected app (by its id) on the active conversation's workspace.
-  LaunchApp(String)
   // The host accepted a prompt: `session` routes the event to its
   // conversation, and everything after a `started` routes by `run_id`.
   // `task` is the prompt text — a client that did not send it (another
@@ -1150,12 +1169,6 @@ priv enum Msg {
   // by it, because a conversation compacted before its first prompt of this
   // app-lifetime has no run id to match.
   Engine(String?, @transcript.EngineEvent, session~ : String?)
-  // The editor side-panel's own messages (tree, viewer, diagnostics,
-  // comments), routed to the `fileeditor` package's update. The one
-  // exception is `EditorCommentAdded`, which this update intercepts: the
-  // comment becomes a chip on the composer draft, which only the app model
-  // knows about.
-  FileEditor(@fileeditor.Msg)
   // The exact local start request returned its run result. `accepted` is the
   // prompt's ownership receipt and can recover a Started notification lost on
   // the same connection; any other status leaves delivery unconfirmed.
