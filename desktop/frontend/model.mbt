@@ -539,14 +539,74 @@ priv struct ArchiveOverride {
 }
 
 ///|
+
+///|
+/// Everything that exists once per connected device channel. The app holds
+/// one entry per channel in `Model::devices` — exactly one today (the page's
+/// own host); the multi-device console renders one sidebar group per entry.
+priv struct DeviceState {
+  // The channel this state mirrors.
+  channel : @interop.ChannelId
+  // Whether the channel's host bridge is up; see `BridgeState`.
+  bridge : BridgeState
+  // Incremented at every BridgeReady. Session-list replies carry the value
+  // captured when their request was issued, so a reply from a dead connection
+  // cannot overwrite the lists rebuilt after reconnect.
+  connection_generation : Int
+  // Page-lifetime request tokens for the independently fetched sidebar
+  // collections. Connection generation rejects dead sockets; these reject an
+  // older reply from the same connection after a newer request was issued.
+  sessions_request_generation : Int
+  archived_request_generation : Int
+  workspaces_request_generation : Int
+  // Durable sessions known to the engine's store, newest first, refreshed
+  // when the bridge connects and when a run reaches the store. A new
+  // conversation appears here once its first turn has been persisted.
+  sessions : Array[@transcript.SessionListItem]
+  // Conversations the host has archived (durable record moved into the
+  // store's `archived` twin); the sidebar tucks their rows under a collapsed
+  // "Archived" group with an unarchive control. Reported by the host in the
+  // same entry shape as the live list.
+  archived : Array[@transcript.SessionListItem]
+  // Per-session archive facts newer than an unversioned whole-list reply.
+  // Cleared only at BridgeReady, immediately before fresh live and archived
+  // lists are requested for the new connection.
+  archive_overrides : Array[ArchiveOverride]
+  // Project directories attached as workspaces: the host registry's absolute
+  // paths in registration order. The sidebar shows one section per entry.
+  workspaces : Array[String]
+  // Where "New chat" lands: a registered workspace path, or "" for the
+  // default scratch store. Follows the conversation last opened or created.
+  active_workspace : String
+}
+
+///|
+fn empty_device_state(channel : @interop.ChannelId) -> DeviceState {
+  {
+    channel,
+    bridge: Connecting,
+    connection_generation: 0,
+    sessions_request_generation: 0,
+    archived_request_generation: 0,
+    workspaces_request_generation: 0,
+    sessions: [],
+    archived: [],
+    archive_overrides: [],
+    workspaces: [],
+    active_workspace: "",
+  }
+}
+
+///|
 priv struct Model {
+  // Connected device channels in stable (sidebar) order; exactly one today —
+  // the page's own host — and empty on the portal page.
+  devices : Array[DeviceState]
   // The device channel every UI action targets — the Settings/Skills
   // screens, the composer, and the active conversation. The desktop window
   // and a `/d/<device>/` console are born with theirs; on the portal page
   // this is an inert `Local` default that nothing ever reads.
   focused : @interop.ChannelId
-  // Whether the host bridge is up; see `BridgeState`.
-  bridge : BridgeState
   selected_model : String
   max_steps : String
   // Whether the host has a key stored for each keyed provider. The key text
@@ -630,16 +690,6 @@ priv struct Model {
   // This lives above individual conversations so pruning, archive removal,
   // and reopening cannot reuse a token that an older host reply still carries.
   transcript_request_generation : Int
-  // Incremented at every BridgeReady. Session-list replies carry the value
-  // captured when their request was issued, so a reply from a dead connection
-  // cannot overwrite the lists rebuilt after reconnect.
-  connection_generation : Int
-  // Page-lifetime request tokens for the independently fetched sidebar
-  // collections. Connection generation rejects dead sockets; these reject an
-  // older reply from the same connection after a newer request was issued.
-  sessions_request_generation : Int
-  archived_request_generation : Int
-  workspaces_request_generation : Int
   // A page-lifetime namespace plus monotonic counter allocate globally unique
   // submission ids without making `update` read randomness. Different windows
   // get independent timestamp/random namespaces; replaying the same model is
@@ -650,25 +700,6 @@ priv struct Model {
   // those still running in the background, and those visited and kept for an
   // instant switch back. Copy-on-write, like the transcript arrays.
   conversations : Array[Conversation]
-  // Durable sessions known to the engine's store, newest first, refreshed
-  // when the bridge connects and when a run reaches the store. A new
-  // conversation appears here once its first turn has been persisted.
-  sessions : Array[@transcript.SessionListItem]
-  // Conversations the host has archived (durable record moved into the
-  // store's `archived` twin); the sidebar tucks their rows under a collapsed
-  // "Archived" group with an unarchive control. Reported by the host in the
-  // same entry shape as the live list.
-  archived : Array[@transcript.SessionListItem]
-  // Per-session archive facts newer than an unversioned whole-list reply.
-  // Cleared only at BridgeReady, immediately before fresh live and archived
-  // lists are requested for the new connection.
-  archive_overrides : Array[ArchiveOverride]
-  // Project directories attached as workspaces: the host registry's absolute
-  // paths in registration order. The sidebar shows one section per entry.
-  workspaces : Array[String]
-  // Where "New chat" lands: a registered workspace path, or "" for the
-  // default scratch store. Follows the conversation last opened or created.
-  active_workspace : String
   // The in-app folder picker behind "Add a workspace"; None while closed.
   workspace_picker : WorkspacePicker?
   // Whether the transcript is scrolled to its bottom. Streaming output only
@@ -1281,9 +1312,25 @@ fn initial_model() -> Model {
     Some(width) => width <= NarrowBreakpoint
     None => false
   }
+  // A portal link into this console may preselect the project
+  // (`?workspace=`); new conversations then land in it from the start.
+  let preselected_workspace = match @interop.page_query_param("workspace") {
+    Some(path) => path
+    None => ""
+  }
   {
+    // The page's one channel; the portal page carries no devices at all.
+    devices: match @interop.page_channel() {
+      Some(channel) =>
+        [
+          {
+            ..empty_device_state(channel),
+            active_workspace: preselected_workspace,
+          },
+        ]
+      None => []
+    },
     focused: @interop.page_channel().unwrap_or(@interop.ChannelId::Local),
-    bridge: Connecting,
     selected_model: DefaultModel,
     max_steps: DefaultMaxSteps,
     deepseek_key_saved: false,
@@ -1317,23 +1364,9 @@ fn initial_model() -> Model {
     active_session: "",
     loading_session: "",
     transcript_request_generation: 0,
-    connection_generation: 0,
-    sessions_request_generation: 0,
-    archived_request_generation: 0,
-    workspaces_request_generation: 0,
     submission_namespace: generated_session_id() + "-submission",
     submission_sequence: 0,
     conversations: [],
-    sessions: [],
-    archived: [],
-    archive_overrides: [],
-    workspaces: [],
-    // A portal link into this console may preselect the project
-    // (`?workspace=`); new conversations then land in it from the start.
-    active_workspace: match @interop.page_query_param("workspace") {
-      Some(path) => path
-      None => ""
-    },
     workspace_picker: None,
     transcript_pinned: true,
     screen: Chat,
@@ -1354,6 +1387,83 @@ fn initial_model() -> Model {
     remote_access: None,
     remote_connecting: false,
     remote_error: None,
+  }
+}
+
+///|
+/// The state of one connected channel; `None` for a channel this page does
+/// not hold (never the case for the page's own channel in normal operation,
+/// but the portal page holds no devices).
+fn Model::device_state(
+  self : Model,
+  channel : @interop.ChannelId,
+) -> DeviceState? {
+  for dev in self.devices {
+    if dev.channel == channel {
+      return Some(dev)
+    }
+  }
+  None
+}
+
+///|
+/// The focused channel's state — what the sidebar, Settings, and the
+/// composer act on.
+fn Model::focused_device(self : Model) -> DeviceState? {
+  self.device_state(self.focused)
+}
+
+///|
+/// Replace the entry sharing `dev`'s channel, copy-on-write — prior model
+/// snapshots keep their own devices array. A channel this page does not
+/// hold is not adopted: device state only ever exists for channels the
+/// page connected.
+fn Model::replace_device(self : Model, dev : DeviceState) -> Model {
+  let devices = self.devices.copy()
+  for index, existing in devices {
+    if existing.channel == dev.channel {
+      devices[index] = dev
+      return { ..self, devices, }
+    }
+  }
+  { ..self, devices, }
+}
+
+///|
+/// The focused channel's connection generation — the fence root-scoped
+/// fetches (host settings, session snapshots) stamp on their requests. 0
+/// when the page holds no devices; no reply ever arrives to check it there.
+fn Model::focused_connection_generation(self : Model) -> Int {
+  match self.focused_device() {
+    Some(dev) => dev.connection_generation
+    None => 0
+  }
+}
+
+///|
+/// The focused channel's "New chat" placement ("" = the default store) —
+/// what the composer and sidebar act on.
+fn Model::focused_active_workspace(self : Model) -> String {
+  match self.focused_device() {
+    Some(dev) => dev.active_workspace
+    None => ""
+  }
+}
+
+///|
+/// Move the focused channel's "New chat" placement.
+fn Model::with_active_workspace(self : Model, workspace : String) -> Model {
+  guard self.focused_device() is Some(dev) else { return self }
+  self.replace_device({ ..dev, active_workspace: workspace })
+}
+
+///|
+/// The focused channel's bridge state, `Connecting` when the page holds no
+/// devices — keeps the view total on the portal page.
+fn Model::bridge_state(self : Model) -> BridgeState {
+  match self.focused_device() {
+    Some(dev) => dev.bridge
+    None => Connecting
   }
 }
 
@@ -1450,7 +1560,7 @@ fn Model::settings_status(self : Model) -> Status {
 /// the settings-derived readiness. Purely derived, so update handlers never
 /// have to keep a stored status in sync with settings changes.
 fn Model::display_status(self : Model) -> Status {
-  match self.bridge {
+  match self.bridge_state() {
     Connecting => WaitingBridge
     BridgeLost(message) => Unavailable(message)
     Connected =>
@@ -1594,7 +1704,11 @@ fn Model::matched_settlement_frontier(
 /// store knows the session, the live conversation's own placement otherwise
 /// (a fresh chat that has not reached the store yet). "" = the default store.
 fn Model::session_workspace(self : Model, session_id : String) -> String {
-  for item in self.sessions {
+  let sessions = match self.focused_device() {
+    Some(dev) => dev.sessions
+    None => []
+  }
+  for item in sessions {
     if item.id == session_id {
       return item.workspace
     }
@@ -1606,15 +1720,23 @@ fn Model::session_workspace(self : Model, session_id : String) -> String {
 }
 
 ///|
-/// The newest archive disposition this connection observed for `session`, if
-/// any. `true` means archived and `false` means live.
-fn Model::archive_override(self : Model, session : String) -> Bool? {
+/// The newest archive disposition this connection observed for `session`,
+/// if any. `true` means archived and `false` means live.
+fn DeviceState::archive_override(self : DeviceState, session : String) -> Bool? {
   for fact in self.archive_overrides {
     if fact.session == session {
       return Some(fact.archived)
     }
   }
   None
+}
+
+///|
+/// The focused device's archive disposition for `session` — the root-arm
+/// view of `DeviceState::archive_override`.
+fn Model::archive_override(self : Model, session : String) -> Bool? {
+  guard self.focused_device() is Some(dev) else { return None }
+  dev.archive_override(session)
 }
 
 ///|
@@ -1626,9 +1748,10 @@ fn Model::with_archive_override(
   session : String,
   archived : Bool,
 ) -> Model {
-  let overrides = self.archive_overrides.filter(item => item.session != session)
+  guard self.focused_device() is Some(dev) else { return self }
+  let overrides = dev.archive_overrides.filter(item => item.session != session)
   overrides.push({ session, archived })
-  { ..self, archive_overrides: overrides }
+  self.replace_device({ ..dev, archive_overrides: overrides })
 }
 
 ///|
@@ -1644,7 +1767,10 @@ fn Model::can_reload_transcript(self : Model, conv : Conversation) -> Bool {
     conv.overlay.iter().any(notice => notice.anchor is SnapshotCut(..)) {
     return true
   }
-  self.sessions.iter().any(item => item.id == conv.session_id)
+  match self.focused_device() {
+    Some(dev) => dev.sessions.iter().any(item => item.id == conv.session_id)
+    None => false
+  }
 }
 
 ///|
@@ -1669,7 +1795,8 @@ fn Model::composing_new_chat(self : Model) -> Bool {
   if conv.has_begun() {
     return false
   }
-  for item in self.sessions {
+  guard self.focused_device() is Some(dev) else { return true }
+  for item in dev.sessions {
     if item.id == conv.session_id {
       return false
     }

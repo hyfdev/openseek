@@ -195,9 +195,12 @@ fn session_row(
 /// first. Rows stay clickable while runs are active — switching between
 /// conversations mid-run is the point of keeping them concurrent.
 fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
+  // The sidebar lists the focused device's collections; an absent device
+  // (the portal page, which never renders this sidebar) reads as empty.
+  let dev = model.focused_device().unwrap_or(empty_device_state(model.focused))
   let rows : Array[@html.Html] = []
   let listed = (id : String) => {
-    for item in model.sessions {
+    for item in dev.sessions {
       if item.id == id {
         return true
       }
@@ -208,7 +211,7 @@ fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
   // normally cannot contain it; the filter covers the moment between the
   // archive reply and the list refetch that follows it.
   let archived = (id : String) => {
-    for item in model.archived {
+    for item in dev.archived {
       if item.id == id {
         return true
       }
@@ -231,7 +234,7 @@ fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
     ),
   )
   if !model.workspaces_collapsed {
-    for path in model.workspaces {
+    for path in dev.workspaces {
       rows.push(workspace_row(dispatch, model, path))
       let before = rows.length()
       push_group_rows(
@@ -270,7 +273,7 @@ fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
   // from the host's archived reply, not the live list; each row carries a
   // restore control instead of the archive one.
   let archived_rows : Array[@html.Html] = []
-  for item in model.archived {
+  for item in dev.archived {
     archived_rows.push(archived_row(dispatch, item))
   }
   if archived_rows.length() > 0 {
@@ -319,7 +322,8 @@ fn push_group_rows(
       )
     }
   }
-  for item in model.sessions {
+  let dev = model.focused_device().unwrap_or(empty_device_state(model.focused))
+  for item in dev.sessions {
     if item.workspace != workspace || archived(item.id) {
       continue
     }
@@ -388,7 +392,7 @@ fn workspace_row(
   path : String,
 ) -> @html.Html {
   let mut class = "workspace-row"
-  if path == model.active_workspace {
+  if path == model.focused_active_workspace() {
     class = class + " active"
     if model.composing_new_chat() {
       class = class + " composing"
@@ -1336,7 +1340,7 @@ fn composer_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
   let conv = model.active()
   let transcript_ready = conv.sync is Synced &&
     !conv.has_unresolved_run_tail_notice()
-  let has_input = model.bridge is Connected &&
+  let has_input = model.bridge_state() is Connected &&
     model.api_ready() &&
     transcript_ready &&
     conv.draft_sendable()
@@ -2402,7 +2406,7 @@ fn view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
   // A lost connection covers everything: with no event stream and every API
   // call failing, the app behind it can do nothing, so an honest dead-end
   // beats a half-broken UI.
-  if model.bridge is BridgeLost(message) {
+  if model.bridge_state() is BridgeLost(message) {
     children.push(bridge_lost_overlay(message))
   }
   @html.div(

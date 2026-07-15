@@ -29,17 +29,24 @@ fn session_snapshot_command(
 /// reply is stale even if it returns last.
 fn request_sessions_refresh(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   model : Model,
 ) -> (@cmd.Cmd, Model) {
-  let request_generation = model.sessions_request_generation + 1
+  guard model.device_state(channel) is Some(dev) else {
+    return (@cmd.none, model)
+  }
+  let request_generation = dev.sessions_request_generation + 1
   (
     fetch_sessions(
       dispatch,
-      model.focused,
-      model.connection_generation,
+      channel,
+      dev.connection_generation,
       request_generation,
     ),
-    { ..model, sessions_request_generation: request_generation },
+    model.replace_device({
+      ..dev,
+      sessions_request_generation: request_generation,
+    }),
   )
 }
 
@@ -49,17 +56,24 @@ fn request_sessions_refresh(
 /// archived reply.
 fn request_archived_refresh(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   model : Model,
 ) -> (@cmd.Cmd, Model) {
-  let request_generation = model.archived_request_generation + 1
+  guard model.device_state(channel) is Some(dev) else {
+    return (@cmd.none, model)
+  }
+  let request_generation = dev.archived_request_generation + 1
   (
     fetch_archived(
       dispatch,
-      model.focused,
-      model.connection_generation,
+      channel,
+      dev.connection_generation,
       request_generation,
     ),
-    { ..model, archived_request_generation: request_generation },
+    model.replace_device({
+      ..dev,
+      archived_request_generation: request_generation,
+    }),
   )
 }
 
@@ -69,20 +83,24 @@ fn request_archived_refresh(
 /// picker root. Session groups are then rebuilt against the same registry.
 fn adopt_workspaces(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   model : Model,
   paths : Array[String],
 ) -> (@cmd.Cmd, Model) {
-  let active_workspace = if model.active_workspace.is_empty() ||
-    paths.contains(model.active_workspace) {
-    model.active_workspace
+  guard model.device_state(channel) is Some(dev) else {
+    return (@cmd.none, model)
+  }
+  let active_workspace = if dev.active_workspace.is_empty() ||
+    paths.contains(dev.active_workspace) {
+    dev.active_workspace
   } else {
     ""
   }
-  request_sessions_refresh(dispatch, {
-    ..model,
-    workspaces: paths,
-    active_workspace,
-  })
+  request_sessions_refresh(
+    dispatch,
+    channel,
+    model.replace_device({ ..dev, workspaces: paths, active_workspace }),
+  )
 }
 
 ///|
@@ -141,7 +159,11 @@ fn retry_session_snapshot(
     }
     if activate_on_success && model.loading_session == session {
       let (toast, next) = next.notify_error(dispatch, message)
-      let (sessions, next) = request_sessions_refresh(dispatch, next)
+      let (sessions, next) = request_sessions_refresh(
+        dispatch,
+        model.focused,
+        next,
+      )
       (@cmd.batch([toast, sessions, scroll]), { ..next, loading_session: "" })
     } else {
       (scroll, next)
@@ -685,9 +707,8 @@ fn replace_archived_active(
     fresh
   }
   {
-    ..activated.replace_conversation(fresh),
+    ..activated.replace_conversation(fresh).with_active_workspace(workspace),
     screen: Chat,
-    active_workspace: workspace,
     loading_session: "",
     transcript_pinned: true,
     completion: None,
@@ -736,7 +757,7 @@ fn push_wsl_settings(
         distro=model.wsl_distro,
         engine=model.wsl_engine,
       ),
-      model.connection_generation,
+      model.focused_connection_generation(),
     ),
     { ..model, settings_saves: model.settings_saves + 1 },
   )
@@ -835,7 +856,7 @@ fn update_msg(
             dispatch,
             model.focused,
             patch,
-            model.connection_generation,
+            model.focused_connection_generation(),
             cleans_legacy=true,
           ),
           next,
@@ -967,7 +988,7 @@ fn update_msg(
           dispatch,
           model.focused,
           provider_settings_patch(provider),
-          model.connection_generation,
+          model.focused_connection_generation(),
         ),
         {
           ..model,
@@ -984,7 +1005,7 @@ fn update_msg(
           dispatch,
           model.focused,
           custom_url_settings_patch(value),
-          model.connection_generation,
+          model.focused_connection_generation(),
         ),
         {
           ..model,
@@ -1261,7 +1282,7 @@ fn update_msg(
                 dispatch,
                 model.focused,
                 api_key_settings_patch(provider, api_key),
-                model.connection_generation,
+                model.focused_connection_generation(),
               ),
               { ..next, screen: if next.api_ready() { Chat } else { Settings } },
             )
@@ -1339,7 +1360,7 @@ fn update_msg(
       // context without an instruction and stay in the composer.
       let task = compose_prompt(conv.mentions, conv.task).trim().to_owned()
       if !conv.draft_sendable() ||
-        !(model.bridge is Connected) ||
+        !(model.bridge_state() is Connected) ||
         !model.api_ready() {
         (@cmd.none, model)
       } else if !(conv.sync is Synced) {
@@ -1473,8 +1494,7 @@ fn update_msg(
       (
         rotate_session(dispatch),
         {
-          ..model,
-          active_workspace: workspace,
+          ..model.with_active_workspace(workspace),
           loading_session: "",
           chats_collapsed: model.chats_collapsed && !workspace.is_empty(),
           workspaces_collapsed: model.workspaces_collapsed &&
@@ -1489,7 +1509,10 @@ fn update_msg(
         if conv.session_id == session_id &&
           conv.messages.length() == 0 &&
           !conv.is_running() {
-          { ..conv, workspace: workspace_root(model.active_workspace) }
+          {
+            ..conv,
+            workspace: workspace_root(model.focused_active_workspace()),
+          }
         } else {
           conv
         }
@@ -1596,33 +1619,47 @@ fn update_msg(
     RemoveWorkspace(path) =>
       (remove_workspace(dispatch, model.focused, path), model)
     ArchiveSession(session_id) => {
-      let sessions_request_generation = model.sessions_request_generation + 1
-      let archived_request_generation = model.archived_request_generation + 1
+      guard model.focused_device() is Some(dev) else {
+        return (@cmd.none, model)
+      }
+      let sessions_request_generation = dev.sessions_request_generation + 1
+      let archived_request_generation = dev.archived_request_generation + 1
       (
         archive_session(
           dispatch,
           model.focused,
           session_id,
-          model.connection_generation,
+          dev.connection_generation,
           sessions_request_generation,
           archived_request_generation,
         ),
-        { ..model, sessions_request_generation, archived_request_generation },
+        model.replace_device({
+          ..dev,
+          sessions_request_generation,
+          archived_request_generation,
+        }),
       )
     }
     UnarchiveSession(session_id) => {
-      let sessions_request_generation = model.sessions_request_generation + 1
-      let archived_request_generation = model.archived_request_generation + 1
+      guard model.focused_device() is Some(dev) else {
+        return (@cmd.none, model)
+      }
+      let sessions_request_generation = dev.sessions_request_generation + 1
+      let archived_request_generation = dev.archived_request_generation + 1
       (
         unarchive_session(
           dispatch,
           model.focused,
           session_id,
-          model.connection_generation,
+          dev.connection_generation,
           sessions_request_generation,
           archived_request_generation,
         ),
-        { ..model, sessions_request_generation, archived_request_generation },
+        model.replace_device({
+          ..dev,
+          sessions_request_generation,
+          archived_request_generation,
+        }),
       )
     }
     NotificationClicked(run_id~) => {
@@ -1703,8 +1740,7 @@ fn update_msg(
             ""
           },
           completion: None,
-          active_workspace: workspace_token(conv.workspace),
-        }
+        }.with_active_workspace(workspace_token(conv.workspace))
         let commands = [scroll_transcript_after_render()]
         if generation is Some(generation) {
           commands.push(
@@ -1721,12 +1757,9 @@ fn update_msg(
         let (model, generation) = model.begin_transcript_reload(
           empty_conversation(session_id, workspace~),
         )
-        let next = {
-          ..model,
-          screen: Chat,
-          loading_session: session_id,
-          active_workspace: workspace,
-        }
+        let next = { ..model, screen: Chat, loading_session: session_id }.with_active_workspace(
+          workspace,
+        )
         if generation is Some(generation) {
           (
             session_snapshot_command(
@@ -1809,21 +1842,19 @@ fn update_device_msg(
   msg : DeviceMsg,
   model : Model,
 ) -> (@cmd.Cmd, Model) {
+  guard model.device_state(channel) is Some(dev) else {
+    return (@cmd.none, model)
+  }
   match msg {
     BridgeReady => {
-      let connection_generation = model.connection_generation + 1
-      let sessions_request_generation = model.sessions_request_generation + 1
-      let archived_request_generation = model.archived_request_generation + 1
-      let workspaces_request_generation = model.workspaces_request_generation +
-        1
+      let connection_generation = dev.connection_generation + 1
+      let sessions_request_generation = dev.sessions_request_generation + 1
+      let archived_request_generation = dev.archived_request_generation + 1
+      let workspaces_request_generation = dev.workspaces_request_generation + 1
       // Capture the exact per-session lifecycle frontier before issuing the
       // unversioned runs snapshot. A live Started or Finished received before
       // its reply then wins over both stale positive rows and stale absence.
       let run_frontier = model.run_snapshot_frontier()
-      // The installed skills also feed the composer's `$` completion, so they
-      // are fetched on connect rather than only when the Skills page opens.
-      // The startup update check rides here too: settings (the channel)
-      // load synchronously at Init, so they are in by bridge time.
       let commands = [
         fetch_sessions(
           dispatch, channel, connection_generation, sessions_request_generation,
@@ -1832,12 +1863,6 @@ fn update_device_msg(
         // learns each live run's identity — the resync half of the
         // protocol's reconnect story (docs/remote-protocol.md).
         fetch_runs(dispatch, channel, run_frontier, connection_generation),
-        fetch_host_meta(dispatch, channel),
-        fetch_host_settings(dispatch, channel, connection_generation),
-        // Legacy client-stored engine settings: the desktop migrates them
-        // up to the host, a browser purges them (see `LegacySettingsRead`).
-        read_legacy_engine_settings(dispatch),
-        fetch_installed_skills(dispatch, channel),
         fetch_archived(
           dispatch, channel, connection_generation, archived_request_generation,
         ),
@@ -1845,18 +1870,35 @@ fn update_device_msg(
           dispatch, channel, connection_generation, workspaces_request_generation,
         ),
       ]
-      // Self-update and the relay sign-in are the desktop window's alone
-      // (see `is_desktop`); a browser never checks, so neither UI
-      // materializes there.
-      if model.is_desktop {
+      // The focused-scoped half: the host-settings mirror, host meta, and
+      // the installed skills (they feed the composer's `$` completion, so
+      // they load on connect rather than when the Skills page opens) follow
+      // the device the UI acts on — always this one while the app runs a
+      // single channel.
+      if channel == model.focused {
+        commands.push(fetch_host_meta(dispatch, channel))
         commands.push(
-          check_for_updates(
-            dispatch,
-            model.api_provider.update_channel(),
-            explicit=false,
-          ),
+          fetch_host_settings(dispatch, channel, connection_generation),
         )
-        commands.push(fetch_remote_status(dispatch))
+        // Legacy client-stored engine settings: the desktop migrates them
+        // up to the host, a browser purges them (see `LegacySettingsRead`).
+        commands.push(read_legacy_engine_settings(dispatch))
+        commands.push(fetch_installed_skills(dispatch, channel))
+        // Self-update and the relay sign-in are the desktop window's alone
+        // (see `is_desktop`); a browser never checks, so neither UI
+        // materializes there. The startup update check rides here: settings
+        // (the update channel) load synchronously at Init, so they are in by
+        // bridge time.
+        if model.is_desktop {
+          commands.push(
+            check_for_updates(
+              dispatch,
+              model.api_provider.update_channel(),
+              explicit=false,
+            ),
+          )
+          commands.push(fetch_remote_status(dispatch))
+        }
       }
       // Delta streams are not replayable across a connection boundary; keep
       // none of the pre-gap fragment, or the first post-gap delta would splice
@@ -1876,22 +1918,31 @@ fn update_device_msg(
         ),
         compaction: NotCompacting,
       })
-      let model = {
-        ..model,
-        conversations,
+      let model = model.replace_device({
+        ..dev,
+        bridge: Connected,
         connection_generation,
         sessions_request_generation,
         archived_request_generation,
         workspaces_request_generation,
         archive_overrides: [],
-        // Replies from writes issued on the dead bridge carry their captured
-        // generation and are ignored below. The new host may have restarted
-        // its in-memory settings revision, so its first authoritative status
-        // starts a fresh monotonic round.
-        settings_saves: 0,
-        host_settings_revision: -1,
-        deferred_host_settings: None,
-        legacy_cleanup_pending: false,
+      })
+      // Replies from writes issued on the dead bridge carry their captured
+      // generation and are ignored below. The new host may have restarted
+      // its in-memory settings revision, so its first authoritative status
+      // starts a fresh monotonic round. Focused-scoped, like the fetches
+      // that repopulate the mirror.
+      let model = if channel == model.focused {
+        {
+          ..model,
+          conversations,
+          settings_saves: 0,
+          host_settings_revision: -1,
+          deferred_host_settings: None,
+          legacy_cleanup_pending: false,
+        }
+      } else {
+        { ..model, conversations, }
       }
       // The resync's other half: whatever landed while this client was away
       // (another client's prompts, items a still-running turn completed, a
@@ -1926,15 +1977,18 @@ fn update_device_msg(
         }
         _ => model
       }
+      guard channel == model.focused else {
+        return (@cmd.batch(commands), model)
+      }
       (
         @cmd.batch(commands),
         {
-          ..model,
-          bridge: Connected,
+          ..model
           // The host this bridge just (re)connected to may be a fresh
           // process with no filesystem watcher; forgetting what was watched
           // makes the post-dispatch panel sync re-issue `fs.watch` instead
           // of reading the stale record as "already placed".
+          ,
           file_panel: { ..model.file_panel, watching: "" },
           // An unusable endpoint routes straight to Settings — the composer
           // could do nothing anyway.
@@ -1948,10 +2002,10 @@ fn update_device_msg(
     }
     HostMetaLoaded(wsl~) => (@cmd.none, { ..model, host_wsl: wsl })
     BridgeUnavailable(message) =>
-      (@cmd.none, { ..model, bridge: BridgeLost(message) })
+      (@cmd.none, model.replace_device({ ..dev, bridge: BridgeLost(message) }))
     HostSettingsLoaded(settings, connection_generation~) => {
       guard connection_generation is None ||
-        connection_generation == Some(model.connection_generation) else {
+        connection_generation == Some(dev.connection_generation) else {
         return (@cmd.none, model)
       }
       if settings.revision < model.host_settings_revision {
@@ -1963,7 +2017,7 @@ fn update_device_msg(
       }
     }
     HostSettingsApplied(settings, connection_generation~, cleans_legacy~) => {
-      guard connection_generation == model.connection_generation else {
+      guard connection_generation == dev.connection_generation else {
         return (@cmd.none, model)
       }
       let next = {
@@ -1996,7 +2050,7 @@ fn update_device_msg(
       )
     }
     HostSettingsSaveFailed(message, connection_generation~, cleans_legacy~) => {
-      guard connection_generation == model.connection_generation else {
+      guard connection_generation == dev.connection_generation else {
         return (@cmd.none, model)
       }
       let next = {
@@ -2029,7 +2083,7 @@ fn update_device_msg(
         // An authoritative get (same-revision statuses are accepted) restores
         // host truth after a definite or ambiguous write failure.
         commands.push(
-          fetch_host_settings(dispatch, channel, model.connection_generation),
+          fetch_host_settings(dispatch, channel, dev.connection_generation),
         )
       }
       (@cmd.batch(commands), notified)
@@ -2084,8 +2138,8 @@ fn update_device_msg(
         (@cmd.none, model)
       }
     SessionsLoaded(items, connection_generation~, request_generation~) => {
-      guard connection_generation == model.connection_generation &&
-        request_generation == model.sessions_request_generation else {
+      guard connection_generation == dev.connection_generation &&
+        request_generation == dev.sessions_request_generation else {
         return (@cmd.none, model)
       }
       // Whole-list replies have no store revision. An identity notification
@@ -2093,11 +2147,11 @@ fn update_device_msg(
       // newly archived rows and retain newly unarchived rows from the current
       // model when the stale reply omitted them.
       let items = items.filter(item => {
-        !(model.archive_override(item.id) is Some(true))
+        !(dev.archive_override(item.id) is Some(true))
       })
-      for fact in model.archive_overrides {
+      for fact in dev.archive_overrides {
         if !fact.archived && !items.iter().any(item => item.id == fact.session) {
-          for current in model.sessions {
+          for current in dev.sessions {
             if current.id == fact.session {
               items.push(current)
             }
@@ -2118,17 +2172,15 @@ fn update_device_msg(
         }
         { ..conv, workspace, }
       })
-      let mut active_workspace = model.active_workspace
+      let mut active_workspace = dev.active_workspace
       for item in items {
         if item.id == model.active_session {
           active_workspace = item.workspace
         }
       }
       let mut next = {
-        ..model,
-        sessions: items,
+        ..model.replace_device({ ..dev, sessions: items, active_workspace }),
         conversations,
-        active_workspace,
       }
       let commands : Array[@cmd.Cmd] = []
       // A start may have been accepted just before the connection vanished,
@@ -2157,25 +2209,25 @@ fn update_device_msg(
       (@cmd.batch(commands), next)
     }
     WorkspacesLoaded(paths, connection_generation~, request_generation~) => {
-      guard connection_generation == model.connection_generation &&
-        request_generation == model.workspaces_request_generation else {
+      guard connection_generation == dev.connection_generation &&
+        request_generation == dev.workspaces_request_generation else {
         return (@cmd.none, model)
       }
       // Detaching only hides the registry entry; a conversation's durable
       // placement remains part of its identity. Keep that hint so a later
       // start is rejected as detached instead of silently creating the same
       // session id in the default store.
-      adopt_workspaces(dispatch, model, paths)
+      adopt_workspaces(dispatch, channel, model, paths)
     }
     WorkspacesChanged(paths) => {
       // The post-commit broadcast is newer than every list request issued so
       // far. Advance the token before applying it, so an older list reply can
       // never roll any client back after this canonical mutation order.
-      let next = {
-        ..model,
-        workspaces_request_generation: model.workspaces_request_generation + 1,
-      }
-      adopt_workspaces(dispatch, next, paths)
+      let next = model.replace_device({
+        ..dev,
+        workspaces_request_generation: dev.workspaces_request_generation + 1,
+      })
+      adopt_workspaces(dispatch, channel, next, paths)
     }
     WorkspaceFailed(message) =>
       model.notify_error(dispatch, "Workspace error: \{message}")
@@ -2185,19 +2237,19 @@ fn update_device_msg(
       request_generation~,
       fresh_session~
     ) => {
-      guard connection_generation == model.connection_generation &&
-        request_generation == model.archived_request_generation else {
+      guard connection_generation == dev.connection_generation &&
+        request_generation == dev.archived_request_generation else {
         return (@cmd.none, model)
       }
       // A newer unarchive notification wins over an older whole-list reply;
       // a newer archive notification is supplemented from the current list
       // when that reply predates the move.
       let items = items.filter(item => {
-        !(model.archive_override(item.id) is Some(false))
+        !(dev.archive_override(item.id) is Some(false))
       })
-      for fact in model.archive_overrides {
+      for fact in dev.archive_overrides {
         if fact.archived && !items.iter().any(item => item.id == fact.session) {
-          for current in model.archived {
+          for current in dev.archived {
             if current.id == fact.session {
               items.push(current)
             }
@@ -2233,8 +2285,17 @@ fn update_device_msg(
       let conversations = next.conversations.filter(conv => {
         !archived_now(conv.session_id)
       })
-      let sessions = next.sessions.filter(item => !archived_now(item.id))
-      (@cmd.none, { ..next, archived: items, sessions, conversations })
+      guard next.device_state(channel) is Some(ndev) else {
+        return (@cmd.none, { ..next, conversations, })
+      }
+      let sessions = ndev.sessions.filter(item => !archived_now(item.id))
+      (
+        @cmd.none,
+        {
+          ..next.replace_device({ ..ndev, archived: items, sessions }),
+          conversations,
+        },
+      )
     }
     ArchiveFailed(message) =>
       model.notify_error(dispatch, "Archive failed: \{message}")
@@ -2244,25 +2305,30 @@ fn update_device_msg(
     // lists are stale, but this identity-bearing fact takes effect for its
     // session immediately and remains authoritative over in-flight replies.
     SessionsChanged(change~, session~, fresh_session~) => {
-      let (sessions, model) = request_sessions_refresh(dispatch, model)
-      let (archived, model) = request_archived_refresh(dispatch, model)
+      let (sessions, model) = request_sessions_refresh(dispatch, channel, model)
+      let (archived, model) = request_archived_refresh(dispatch, channel, model)
       let commands = @cmd.batch([sessions, archived])
+      guard model.device_state(channel) is Some(dev) else {
+        return (commands, model)
+      }
       if change == "unarchived" {
         let mut restored : @transcript.SessionListItem? = None
-        for item in model.archived {
+        for item in dev.archived {
           if item.id == session {
             restored = Some(item)
           }
         }
-        let archived = model.archived.filter(item => item.id != session)
-        let sessions = model.sessions.copy()
+        let archived = dev.archived.filter(item => item.id != session)
+        let sessions = dev.sessions.copy()
         if restored is Some(item) &&
           !sessions.iter().any(current => current.id == session) {
           sessions.push(item)
         }
         return (
           commands,
-          { ..model.with_archive_override(session, false), sessions, archived },
+          model
+          .replace_device({ ..dev, sessions, archived })
+          .with_archive_override(session, false),
         )
       }
       if change != "archived" {
@@ -2272,11 +2338,11 @@ fn update_device_msg(
       // placeholder archived entry also blocks a late session.event from
       // rematerializing it during this window.
       let workspace = model.session_workspace(session)
-      let sessions = model.sessions.filter(item => item.id != session)
+      let sessions = dev.sessions.filter(item => item.id != session)
       let conversations = model.conversations.filter(conv => {
         conv.session_id != session
       })
-      let archived = model.archived.copy()
+      let archived = dev.archived.copy()
       if !archived.iter().any(item => item.id == session) {
         let mut item : @transcript.SessionListItem = {
           id: session,
@@ -2284,17 +2350,20 @@ fn update_device_msg(
           workspace,
           workspace_name: "",
         }
-        for live in model.sessions {
+        for live in dev.sessions {
           if live.id == session {
             item = live
           }
         }
         archived.push(item)
       }
+      let overridden = model.with_archive_override(session, true)
+      let overridden = match overridden.device_state(channel) {
+        Some(ndev) => overridden.replace_device({ ..ndev, sessions, archived })
+        None => overridden
+      }
       let next = {
-        ..model.with_archive_override(session, true),
-        sessions,
-        archived,
+        ..overridden,
         conversations: if model.active_session == session {
           model.conversations
         } else {
@@ -2340,9 +2409,9 @@ fn update_device_msg(
       // Archiving removes live client state after the hub's ordered final
       // commit. A stale/replayed commit seen after that local fact must not
       // resurrect the archived record as a live hidden conversation.
-      let archived = match model.archive_override(session) {
+      let archived = match dev.archive_override(session) {
         Some(value) => value
-        None => model.archived.iter().any(item => item.id == session)
+        None => dev.archived.iter().any(item => item.id == session)
       }
       if archived {
         return (@cmd.none, model)
@@ -2621,7 +2690,7 @@ fn update_device_msg(
       }
     }
     RunsLoaded(runs~, settled~, live~, frontier~, connection_generation~) => {
-      guard connection_generation == model.connection_generation else {
+      guard connection_generation == dev.connection_generation else {
         return (@cmd.none, model)
       }
       // Accept the snapshot as one state transition. No intermediate replayed
@@ -3073,14 +3142,16 @@ fn update_device_msg(
         let (model, generation) = model.ensure_transcript_reload_after_current(
           next,
         )
-        let (sessions, model) = request_sessions_refresh(dispatch, model)
+        let (sessions, model) = request_sessions_refresh(
+          dispatch, channel, model,
+        )
         let commands = [
           sessions,
           fetch_runs(
             dispatch,
             channel,
             model.run_snapshot_frontier(),
-            model.connection_generation,
+            dev.connection_generation,
           ),
         ]
         if generation is Some(generation) {
@@ -3122,14 +3193,16 @@ fn update_device_msg(
             unconfirmed
           }
           let updated = model.replace_conversation(next)
-          let (sessions, updated) = request_sessions_refresh(dispatch, updated)
+          let (sessions, updated) = request_sessions_refresh(
+            dispatch, channel, updated,
+          )
           let commands = [
             sessions,
             fetch_runs(
               dispatch,
               channel,
               updated.run_snapshot_frontier(),
-              model.connection_generation,
+              dev.connection_generation,
             ),
           ]
           if changed {
@@ -3316,7 +3389,9 @@ fn update_device_msg(
         // sidebar list (and this conversation's title) may have changed —
         // and the turn may have created the repository or switched branches.
         let mut next = model.replace_conversation(base)
-        let (sessions, requested) = request_sessions_refresh(dispatch, next)
+        let (sessions, requested) = request_sessions_refresh(
+          dispatch, channel, next,
+        )
         next = requested
         let commands = [
           sessions,
@@ -3363,7 +3438,7 @@ fn update_device_msg(
       } else {
         // Even when this page missed both Started and every commit, the list
         // can reveal the finished durable session for a later open.
-        request_sessions_refresh(dispatch, model)
+        request_sessions_refresh(dispatch, channel, model)
       }
     DurableBoundary(run_id~, session~, sequence~) =>
       if model.find_conversation(session) is Some(conv) &&
@@ -3420,7 +3495,7 @@ fn update_device_msg(
             dispatch,
             channel,
             model.run_snapshot_frontier(),
-            model.connection_generation,
+            dev.connection_generation,
           ),
           model,
         )
@@ -3477,11 +3552,37 @@ fn running_conversation() -> Conversation {
 ///|
 fn test_model() -> Model {
   {
-    ..initial_model(),
-    bridge: Connected,
+    ..initial_model()
+    // The headless test runtime has no page location, so `initial_model()`
+    // seeds no devices; every test runs on an explicit Local channel.
+    ,
+    devices: [
+      { ..empty_device_state(@interop.ChannelId::Local), bridge: Connected },
+    ],
+    focused: @interop.ChannelId::Local,
     active_session: "desktop-test",
     conversations: [test_conversation()],
   }
+}
+
+///|
+/// Test-only: the focused device's state; raising keeps a broken model a
+/// test failure rather than a silent mismatch.
+fn Model::dev(self : Model) -> DeviceState raise {
+  guard self.focused_device() is Some(dev) else {
+    fail("the model holds no focused device")
+  }
+  dev
+}
+
+///|
+/// Test-only: transform the focused device's state, e.g. seeding a session
+/// list on `test_model()`.
+fn Model::with_dev(
+  self : Model,
+  transform : (DeviceState) -> DeviceState,
+) -> Model raise {
+  self.replace_device(transform(self.dev()))
 }
 
 ///|
@@ -4146,9 +4247,9 @@ test "sessions loaded replaces the sidebar list" {
   ]
   let (_, once) = update(dispatch, sessions_loaded(items), test_model())
   let (_, twice) = update(dispatch, sessions_loaded(items), test_model())
-  inspect(once.sessions.length(), content="1")
-  inspect(once.sessions[0].id, content="desktop-a")
-  inspect(twice.sessions.length(), content="1")
+  inspect(once.dev().sessions.length(), content="1")
+  inspect(once.dev().sessions[0].id, content="desktop-a")
+  inspect(twice.dev().sessions.length(), content="1")
 }
 
 ///|
@@ -4181,7 +4282,7 @@ test "session list assigns a commit-first conversation to its durable workspace"
     fail("listed conversation disappeared")
   }
   inspect(workspace_token(reconciled.workspace), content="/work/foreign")
-  inspect(listed.active_workspace, content="/work/foreign")
+  inspect(listed.dev().active_workspace, content="/work/foreign")
   assert_true(encoded_start_workspace(reconciled) is Some("/work/foreign"))
 }
 
@@ -4555,12 +4656,12 @@ test "open session tracks the latest load and ignores stale replies" {
 ///|
 test "reselecting a synced active session reloads idle external writes" {
   let dispatch = test_dispatch()
-  let model = {
-    ..test_model(),
+  let model = test_model().with_dev(dev => {
+    ..dev,
     sessions: [
       { id: "desktop-test", title: Some(""), workspace: "", workspace_name: "" },
     ],
-  }
+  })
   let (_, reloading) = update(dispatch, OpenSession("desktop-test"), model)
   inspect(reloading.loading_session, content="desktop-test")
   guard reloading.active().sync is Reloading(generation=1, attempt=1, ..) else {
@@ -5690,7 +5791,7 @@ test "a stale runs snapshot cannot replay a foreign run after BridgeReady" {
     settled=[],
     live=["old-run"],
     frontier=generation_one.run_snapshot_frontier(),
-    connection_generation=generation_one.connection_generation,
+    connection_generation=generation_one.dev().connection_generation,
   )
   let (_, generation_two) = update_dev(dispatch, BridgeReady, generation_one)
   // The current generation's empty answer wins first. The delayed older
@@ -5702,7 +5803,7 @@ test "a stale runs snapshot cannot replay a foreign run after BridgeReady" {
       settled=[],
       live=[],
       frontier=generation_two.run_snapshot_frontier(),
-      connection_generation=generation_two.connection_generation,
+      connection_generation=generation_two.dev().connection_generation,
     ),
     generation_two,
   )
@@ -5710,8 +5811,8 @@ test "a stale runs snapshot cannot replay a foreign run after BridgeReady" {
   let (_, twice) = update_dev(dispatch, stale, current)
   assert_true(once.find_conversation("old-session") is None)
   assert_true(twice.find_conversation("old-session") is None)
-  inspect(once.connection_generation, content="2")
-  inspect(twice.connection_generation, content="2")
+  inspect(once.dev().connection_generation, content="2")
+  inspect(twice.dev().connection_generation, content="2")
 }
 
 ///|
@@ -5743,7 +5844,7 @@ test "runs settlement restores a Starting prompt that reached exact-zero EOF off
       ],
       live=[],
       frontier~,
-      connection_generation=bridged.connection_generation,
+      connection_generation=bridged.dev().connection_generation,
     ),
     bridged,
   )
@@ -5777,7 +5878,7 @@ test "a late durable boundary refetches a Starting settlement hidden by the firs
       settled=[],
       live=[],
       frontier=first_frontier,
-      connection_generation=before.connection_generation,
+      connection_generation=before.dev().connection_generation,
     ),
     before,
   )
@@ -5820,7 +5921,7 @@ test "a late durable boundary refetches a Starting settlement hidden by the firs
       ],
       live=[],
       frontier=second_frontier,
-      connection_generation=after_boundary.connection_generation,
+      connection_generation=after_boundary.dev().connection_generation,
     ),
     after_boundary,
   )
@@ -5887,7 +5988,7 @@ test "runs settlement recovers a transport-undelivered prompt by submission id" 
       ],
       live=[],
       frontier~,
-      connection_generation=bridged.connection_generation,
+      connection_generation=bridged.dev().connection_generation,
     ),
     bridged,
   )
@@ -5920,7 +6021,7 @@ test "runs settlement restores an Open prompt whose zero boundary was missed" {
       ],
       live=[],
       frontier~,
-      connection_generation=bridged.connection_generation,
+      connection_generation=bridged.dev().connection_generation,
     ),
     bridged,
   )
@@ -5961,7 +6062,7 @@ test "one runs snapshot keeps an active successor after settling its predecessor
       ],
       live=["run-successor"],
       frontier~,
-      connection_generation=before.connection_generation,
+      connection_generation=before.dev().connection_generation,
     ),
     before,
   )
@@ -6009,7 +6110,7 @@ test "a settlement captured for an older Starting owner cannot close its success
       ],
       live=[],
       frontier~,
-      connection_generation=model.connection_generation,
+      connection_generation=model.dev().connection_generation,
     ),
     model,
   )
@@ -8789,20 +8890,22 @@ test "session.changed decoder preserves archive invalidation identity" {
 test "archive broadcast invalidates the active send target before list replies" {
   let dispatch = test_dispatch()
   let mention : Mention = { ref_: Skill(name="draft-skill"), range: None }
-  let model = {
-    ..test_model().replace_conversation({
+  let model = test_model()
+    .replace_conversation({
       ..test_conversation(),
       task: "must not target archived session",
       mentions: [mention],
-    }),
-    sessions: [
-      {
-        ..archived_item("desktop-test"),
-        workspace: "/work/archived",
-        workspace_name: "archived",
-      },
-    ],
-  }
+    })
+    .with_dev(dev => {
+      ..dev,
+      sessions: [
+        {
+          ..archived_item("desktop-test"),
+          workspace: "/work/archived",
+          workspace_name: "archived",
+        },
+      ],
+    })
   let (_, invalidated) = update_dev(
     dispatch,
     SessionsChanged(
@@ -8815,7 +8918,7 @@ test "archive broadcast invalidates the active send target before list replies" 
   inspect(invalidated.active_session, content="desktop-fresh")
   assert_true(invalidated.find_conversation("desktop-test") is None)
   inspect(invalidated.active().session_id, content="desktop-fresh")
-  inspect(invalidated.active_workspace, content="/work/archived")
+  inspect(invalidated.dev().active_workspace, content="/work/archived")
   inspect(
     workspace_token(invalidated.active().workspace),
     content="/work/archived",
@@ -8826,10 +8929,10 @@ test "archive broadcast invalidates the active send target before list replies" 
     invalidated.active().mentions[0].ref_ is Skill(name="draft-skill"),
   )
   assert_true(
-    invalidated.archived.iter().any(item => item.id == "desktop-test"),
+    invalidated.dev().archived.iter().any(item => item.id == "desktop-test"),
   )
   assert_false(
-    invalidated.sessions.iter().any(item => item.id == "desktop-test"),
+    invalidated.dev().sessions.iter().any(item => item.id == "desktop-test"),
   )
   // Even before either sidebar refresh returns, the next submit belongs to
   // the replacement conversation; no live state can target the archived id.
@@ -8848,13 +8951,9 @@ test "archive broadcast invalidates the active send target before list replies" 
 ///|
 test "an archive response arriving before its notification preserves the draft once" {
   let dispatch = test_dispatch()
-  let model = {
-    ..test_model().replace_conversation({
-      ..test_conversation(),
-      task: "keep this draft",
-    }),
-    sessions: [archived_item("desktop-test")],
-  }
+  let model = test_model()
+    .replace_conversation({ ..test_conversation(), task: "keep this draft" })
+    .with_dev(dev => { ..dev, sessions: [archived_item("desktop-test")] })
   let (_, responded) = update(
     dispatch,
     archived_loaded([archived_item("desktop-test")]),
@@ -8891,15 +8990,14 @@ test "archiving a pending start restores its original composer without ownership
     "original draft",
     [sent_mention],
   )
-  let model = {
-    ..test_model().replace_conversation({
+  let model = test_model()
+    .replace_conversation({
       ..pending,
       run: Starting(submission_id="pending-start"),
       task: "typed afterward",
       mentions: [newer_mention],
-    }),
-    sessions: [archived_item("desktop-test")],
-  }
+    })
+    .with_dev(dev => { ..dev, sessions: [archived_item("desktop-test")] })
   let (_, next) = update_dev(
     dispatch,
     SessionsChanged(
@@ -8923,7 +9021,7 @@ test "archiving a pending start restores its original composer without ownership
 test "an archive notification wins over a stale live-list reply" {
   let dispatch = test_dispatch()
   let item = archived_item("desktop-test")
-  let model = { ..test_model(), sessions: [item] }
+  let model = test_model().with_dev(dev => { ..dev, sessions: [item] })
   let (_, invalidated) = update_dev(
     dispatch,
     SessionsChanged(
@@ -8938,8 +9036,10 @@ test "an archive notification wins over a stale live-list reply" {
     sessions_loaded([item], request_generation=1),
     invalidated,
   )
-  assert_false(stale.sessions.iter().any(current => current.id == item.id))
-  assert_true(stale.archived.iter().any(current => current.id == item.id))
+  assert_false(
+    stale.dev().sessions.iter().any(current => current.id == item.id),
+  )
+  assert_true(stale.dev().archived.iter().any(current => current.id == item.id))
   inspect(stale.active_session, content="desktop-safe")
 }
 
@@ -8947,7 +9047,7 @@ test "an archive notification wins over a stale live-list reply" {
 test "an unarchive notification wins over a stale archived-list reply" {
   let dispatch = test_dispatch()
   let item = archived_item("desktop-old")
-  let model = { ..test_model(), archived: [item] }
+  let model = test_model().with_dev(dev => { ..dev, archived: [item] })
   let (_, restored) = update_dev(
     dispatch,
     SessionsChanged(
@@ -8962,21 +9062,22 @@ test "an unarchive notification wins over a stale archived-list reply" {
     archived_loaded([item], request_generation=1),
     restored,
   )
-  assert_false(stale.archived.iter().any(current => current.id == item.id))
-  assert_true(stale.sessions.iter().any(current => current.id == item.id))
+  assert_false(
+    stale.dev().archived.iter().any(current => current.id == item.id),
+  )
+  assert_true(stale.dev().sessions.iter().any(current => current.id == item.id))
 }
 
 ///|
 test "BridgeReady replaces archive overrides with fresh-list truth" {
   let dispatch = test_dispatch()
   let item = archived_item("desktop-old")
-  let model = {
-    ..test_model().with_archive_override("desktop-old", true),
-    archived: [item],
-  }
+  let model = test_model()
+    .with_archive_override("desktop-old", true)
+    .with_dev(dev => { ..dev, archived: [item] })
   let (_, ready) = update_dev(dispatch, BridgeReady, model)
-  inspect(ready.connection_generation, content="1")
-  inspect(ready.archive_overrides.length(), content="0")
+  inspect(ready.dev().connection_generation, content="1")
+  inspect(ready.dev().archive_overrides.length(), content="0")
   let (_, live) = update_dev(
     dispatch,
     SessionsLoaded([item], connection_generation=1, request_generation=1),
@@ -8992,8 +9093,10 @@ test "BridgeReady replaces archive overrides with fresh-list truth" {
     ),
     live,
   )
-  assert_true(reconciled.sessions.iter().any(current => current.id == item.id))
-  inspect(reconciled.archived.length(), content="0")
+  assert_true(
+    reconciled.dev().sessions.iter().any(current => current.id == item.id),
+  )
+  inspect(reconciled.dev().archived.length(), content="0")
   let (_, stale) = update_dev(
     dispatch,
     ArchivedLoaded(
@@ -9004,7 +9107,7 @@ test "BridgeReady replaces archive overrides with fresh-list truth" {
     ),
     reconciled,
   )
-  inspect(stale.archived.length(), content="0")
+  inspect(stale.dev().archived.length(), content="0")
 }
 
 ///|
@@ -9017,7 +9120,10 @@ test "an older same-connection live list cannot replace a newer reply" {
     workspace_name: "",
   }
   let current = { ..old, title: Some("current title") }
-  let model = { ..test_model(), sessions_request_generation: 2 }
+  let model = test_model().with_dev(dev => {
+    ..dev,
+    sessions_request_generation: 2,
+  })
   let (_, newest) = update_dev(
     dispatch,
     SessionsLoaded([current], connection_generation=0, request_generation=2),
@@ -9028,8 +9134,8 @@ test "an older same-connection live list cannot replace a newer reply" {
     SessionsLoaded([old], connection_generation=0, request_generation=1),
     newest,
   )
-  inspect(stale.sessions.length(), content="1")
-  assert_true(stale.sessions[0].title is Some("current title"))
+  inspect(stale.dev().sessions.length(), content="1")
+  assert_true(stale.dev().sessions[0].title is Some("current title"))
 }
 
 ///|
@@ -9042,7 +9148,10 @@ test "an older same-connection archived list cannot replace a newer reply" {
     workspace_name: "",
   }
   let current = { ..old, title: Some("current title") }
-  let model = { ..test_model(), archived_request_generation: 2 }
+  let model = test_model().with_dev(dev => {
+    ..dev,
+    archived_request_generation: 2,
+  })
   let (_, newest) = update_dev(
     dispatch,
     ArchivedLoaded(
@@ -9063,8 +9172,8 @@ test "an older same-connection archived list cannot replace a newer reply" {
     ),
     newest,
   )
-  inspect(stale.archived.length(), content="1")
-  assert_true(stale.archived[0].title is Some("current title"))
+  inspect(stale.dev().archived.length(), content="1")
+  assert_true(stale.dev().archived[0].title is Some("current title"))
 }
 
 ///|
@@ -9079,8 +9188,8 @@ test "an archived background session drops its live state, active stays" {
     archived_loaded([archived_item("desktop-old")]),
     model,
   )
-  inspect(next.archived.length(), content="1")
-  inspect(next.archived[0].id, content="desktop-old")
+  inspect(next.dev().archived.length(), content="1")
+  inspect(next.dev().archived[0].id, content="desktop-old")
   assert_true(next.find_conversation("desktop-old") is None)
   inspect(next.active_session, content="desktop-test")
 }
@@ -9095,7 +9204,7 @@ test "an archived-list reply immediately replaces the active conversation" {
   )
   assert_true(next.find_conversation("desktop-test") is None)
   inspect(next.active_session, content="desktop-archive-replacement")
-  inspect(next.archived[0].id, content="desktop-test")
+  inspect(next.dev().archived[0].id, content="desktop-test")
 }
 
 ///|
@@ -10635,8 +10744,8 @@ test "a gapped commit for an unknown session materializes then reloads" {
 ///|
 test "a late commit cannot resurrect a locally known archived session" {
   let dispatch = test_dispatch()
-  let model = {
-    ..test_model(),
+  let model = test_model().with_dev(dev => {
+    ..dev,
     archived: [
       {
         id: "desktop-archived",
@@ -10645,7 +10754,7 @@ test "a late commit cannot resurrect a locally known archived session" {
         workspace_name: "",
       },
     ],
-  }
+  })
   let (_, next) = update_dev(
     dispatch,
     SessionCommitted(session="desktop-archived", sequence=1, kind="user", payload={

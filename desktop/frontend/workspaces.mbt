@@ -245,15 +245,18 @@ test "workspace labels are the folder's basename" {
 ///|
 test "a workspace new chat rotates into that workspace" {
   let dispatch = test_dispatch()
-  let model = { ..test_model(), workspaces: ["/home/u/proj"] }
+  let model = test_model().with_dev(dev => {
+    ..dev,
+    workspaces: ["/home/u/proj"],
+  })
   let (_, chosen) = update(dispatch, NewChatIn("/home/u/proj"), model)
-  inspect(chosen.active_workspace, content="/home/u/proj")
+  inspect(chosen.dev().active_workspace, content="/home/u/proj")
   // The rotation lands like any other; the fresh conversation carries the
   // active workspace, and the next plain "New chat" stays there.
   let (_, rotated) = update(dispatch, SessionRotated("desktop-ws"), chosen)
   assert_true(rotated.active().workspace is Some(Absolute("/home/u/proj")))
   inspect(rotated.active_session, content="desktop-ws")
-  inspect(rotated.active_workspace, content="/home/u/proj")
+  inspect(rotated.dev().active_workspace, content="/home/u/proj")
 }
 
 ///|
@@ -266,44 +269,45 @@ test "a scratch rotation leaves the conversation in the default store" {
 ///|
 test "workspaces loaded retains a detached conversation's durable placement" {
   let dispatch = test_dispatch()
-  let model = {
-    ..test_model().replace_conversation({
+  let model = test_model()
+    .replace_conversation({
       ..test_conversation(),
       workspace: Some(Absolute("/gone")),
-    }),
-    active_workspace: "/gone",
-  }
+    })
+    .with_dev(dev => { ..dev, active_workspace: "/gone" })
   let (_, next) = update_dev(
     dispatch,
     WorkspacesLoaded(["/kept"], connection_generation=0, request_generation=0),
     model,
   )
-  inspect(next.workspaces.length(), content="1")
-  inspect(next.sessions_request_generation, content="1")
+  inspect(next.dev().workspaces.length(), content="1")
+  inspect(next.dev().sessions_request_generation, content="1")
   assert_true(next.active().workspace is Some(Absolute("/gone")))
-  inspect(next.active_workspace, content="")
+  inspect(next.dev().active_workspace, content="")
   // A still-registered placement survives the same reply.
-  let attached = {
-    ..test_model().replace_conversation({
+  let attached = test_model()
+    .replace_conversation({
       ..test_conversation(),
       workspace: Some(Absolute("/kept")),
-    }),
-    active_workspace: "/kept",
-  }
+    })
+    .with_dev(dev => { ..dev, active_workspace: "/kept" })
   let (_, kept) = update_dev(
     dispatch,
     WorkspacesLoaded(["/kept"], connection_generation=0, request_generation=0),
     attached,
   )
-  inspect(kept.sessions_request_generation, content="1")
+  inspect(kept.dev().sessions_request_generation, content="1")
   assert_true(kept.active().workspace is Some(Absolute("/kept")))
-  inspect(kept.active_workspace, content="/kept")
+  inspect(kept.dev().active_workspace, content="/kept")
 }
 
 ///|
 test "an older workspace reply cannot replace a newer same-connection reply" {
   let dispatch = test_dispatch()
-  let model = { ..test_model(), workspaces_request_generation: 2 }
+  let model = test_model().with_dev(dev => {
+    ..dev,
+    workspaces_request_generation: 2,
+  })
   let (_, newest) = update_dev(
     dispatch,
     WorkspacesLoaded(
@@ -313,32 +317,32 @@ test "an older workspace reply cannot replace a newer same-connection reply" {
     ),
     model,
   )
-  inspect(newest.workspaces.length(), content="1")
-  inspect(newest.workspaces[0], content="/current")
-  inspect(newest.sessions_request_generation, content="1")
+  inspect(newest.dev().workspaces.length(), content="1")
+  inspect(newest.dev().workspaces[0], content="/current")
+  inspect(newest.dev().sessions_request_generation, content="1")
   let (_, stale) = update_dev(
     dispatch,
     WorkspacesLoaded(["/old"], connection_generation=0, request_generation=1),
     newest,
   )
-  inspect(stale.workspaces.length(), content="1")
-  inspect(stale.workspaces[0], content="/current")
-  inspect(stale.sessions_request_generation, content="1")
+  inspect(stale.dev().workspaces.length(), content="1")
+  inspect(stale.dev().workspaces[0], content="/current")
+  inspect(stale.dev().sessions_request_generation, content="1")
 }
 
 ///|
 test "a workspace commit broadcast supersedes list replies and refreshes sessions" {
   let dispatch = test_dispatch()
-  let model = {
-    ..test_model(),
+  let model = test_model().with_dev(dev => {
+    ..dev,
     workspaces: ["/current"],
     workspaces_request_generation: 2,
-  }
+  })
   let (_, changed) = update_dev(dispatch, WorkspacesChanged(["/new"]), model)
-  inspect(changed.workspaces_request_generation, content="3")
-  inspect(changed.workspaces.length(), content="1")
-  inspect(changed.workspaces[0], content="/new")
-  inspect(changed.sessions_request_generation, content="1")
+  inspect(changed.dev().workspaces_request_generation, content="3")
+  inspect(changed.dev().workspaces.length(), content="1")
+  inspect(changed.dev().workspaces[0], content="/new")
+  inspect(changed.dev().sessions_request_generation, content="1")
   let (_, stale) = update_dev(
     dispatch,
     WorkspacesLoaded(
@@ -348,7 +352,7 @@ test "a workspace commit broadcast supersedes list replies and refreshes session
     ),
     changed,
   )
-  inspect(stale.workspaces[0], content="/new")
+  inspect(stale.dev().workspaces[0], content="/new")
 }
 
 ///|
@@ -373,8 +377,8 @@ test "proton subscribes to canonical durable and workspace notifications" {
 ///|
 test "opening a stored session adopts its workspace" {
   let dispatch = test_dispatch()
-  let model = {
-    ..test_model(),
+  let model = test_model().with_dev(dev => {
+    ..dev,
     sessions: [
       {
         id: "desktop-w",
@@ -383,9 +387,9 @@ test "opening a stored session adopts its workspace" {
         workspace_name: "proj",
       },
     ],
-  }
+  })
   let (_, opening) = update(dispatch, OpenSession("desktop-w"), model)
-  inspect(opening.active_workspace, content="/proj")
+  inspect(opening.dev().active_workspace, content="/proj")
   inspect(opening.loading_session, content="desktop-w")
   let (_, loaded) = update_dev(
     dispatch,
@@ -467,7 +471,7 @@ test "confirming registers the browsed directory and closes the picker" {
   )
   let (_, confirmed) = update(dispatch, WorkspacePickerConfirm, loaded)
   assert_true(confirmed.workspace_picker is None)
-  inspect(confirmed.workspaces_request_generation, content="0")
+  inspect(confirmed.dev().workspaces_request_generation, content="0")
   // Confirming before anything was browsed has nothing to register and
   // keeps the picker open.
   let (_, early) = update(dispatch, WorkspacePickerConfirm, opened)
