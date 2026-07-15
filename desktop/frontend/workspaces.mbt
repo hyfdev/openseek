@@ -249,7 +249,11 @@ test "a workspace new chat rotates into that workspace" {
     ..dev,
     workspaces: ["/home/u/proj"],
   })
-  let (_, chosen) = update(dispatch, NewChatIn("/home/u/proj"), model)
+  let (_, chosen) = update(
+    dispatch,
+    NewChatIn(@interop.ChannelId::Local, "/home/u/proj"),
+    model,
+  )
   inspect(chosen.dev().active_workspace, content="/home/u/proj")
   // The rotation lands like any other; the fresh conversation carries the
   // active workspace, and the next plain "New chat" stays there.
@@ -388,7 +392,11 @@ test "opening a stored session adopts its workspace" {
       },
     ],
   })
-  let (_, opening) = update(dispatch, OpenSession("desktop-w"), model)
+  let (_, opening) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-w"),
+    model,
+  )
   inspect(opening.dev().active_workspace, content="/proj")
   inspect(opening.loading_session, content="desktop-w")
   let (_, loaded) = update_dev(
@@ -408,7 +416,11 @@ test "opening a stored session adopts its workspace" {
 ///|
 test "the picker opens loading and adopts the first listing" {
   let dispatch = test_dispatch()
-  let (_, opened) = update(dispatch, PickWorkspace, test_model())
+  let (_, opened) = update(
+    dispatch,
+    PickWorkspace(@interop.ChannelId::Local),
+    test_model(),
+  )
   guard opened.workspace_picker is Some(opening) else {
     fail("picker did not open")
   }
@@ -441,7 +453,11 @@ test "a listing for a closed picker is dropped" {
 ///|
 test "a failed navigation keeps the listing and shows the error" {
   let dispatch = test_dispatch()
-  let (_, opened) = update(dispatch, PickWorkspace, test_model())
+  let (_, opened) = update(
+    dispatch,
+    PickWorkspace(@interop.ChannelId::Local),
+    test_model(),
+  )
   let (_, loaded) = update(
     dispatch,
     WorkspacePickerLoaded(path="/home/u", entries=["proj"], generation=1),
@@ -463,7 +479,11 @@ test "a failed navigation keeps the listing and shows the error" {
 ///|
 test "confirming registers the browsed directory and closes the picker" {
   let dispatch = test_dispatch()
-  let (_, opened) = update(dispatch, PickWorkspace, test_model())
+  let (_, opened) = update(
+    dispatch,
+    PickWorkspace(@interop.ChannelId::Local),
+    test_model(),
+  )
   let (_, loaded) = update(
     dispatch,
     WorkspacePickerLoaded(path="/home/u/proj", entries=[], generation=1),
@@ -503,7 +523,11 @@ test "a workspace failure pops a toast" {
 ///|
 test "typing in the picker's path field only changes the field" {
   let dispatch = test_dispatch()
-  let (_, opened) = update(dispatch, PickWorkspace, test_model())
+  let (_, opened) = update(
+    dispatch,
+    PickWorkspace(@interop.ChannelId::Local),
+    test_model(),
+  )
   let (_, loaded) = update(
     dispatch,
     WorkspacePickerLoaded(path="/home/u", entries=[], generation=1),
@@ -520,7 +544,11 @@ test "typing in the picker's path field only changes the field" {
 ///|
 test "a listing for a superseded navigation is dropped" {
   let dispatch = test_dispatch()
-  let (_, opened) = update(dispatch, PickWorkspace, test_model())
+  let (_, opened) = update(
+    dispatch,
+    PickWorkspace(@interop.ChannelId::Local),
+    test_model(),
+  )
   let (_, navigated) = update(
     dispatch,
     WorkspacePickerNavigate("/home/u/proj"),

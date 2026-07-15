@@ -990,7 +990,9 @@ priv enum Msg {
   Stop
   NewChat
   SessionRotated(String)
-  OpenSession(String)
+  // Open a conversation on one device's channel; clicking another
+  // device's row is also the console's focus switch.
+  OpenSession(@interop.ChannelId, String)
   // The user clicked the system notification a finished run posted: jump to
   // the conversation that owned that run (the window itself is already
   // brought forward natively).
@@ -998,10 +1000,10 @@ priv enum Msg {
   // A host-side action with no conversation of its own (opening a file in
   // the system app, launching an app) failed: pops an error toast.
   HostActionFailed(String)
-  // Open the in-app folder picker (browsing starts at the host's home
-  // directory). The picker renders host-side listings, so it works the
-  // same against the embedded gateway and a remote one.
-  PickWorkspace
+  // Open the in-app folder picker against one device's host (browsing
+  // starts at that host's home directory); on the console this also
+  // focuses the device the picker will register the workspace on.
+  PickWorkspace(@interop.ChannelId)
   // Browse into a directory: a subdirectory row, the parent, or the typed
   // path field on Enter.
   WorkspacePickerNavigate(String)
@@ -1020,17 +1022,19 @@ priv enum Msg {
   // Register the picker's current directory and close it.
   WorkspacePickerConfirm
   WorkspacePickerClose
-  // Detach a workspace: only the registry entry goes away — the directory
-  // and the sessions inside it stay, so re-adding restores them.
-  RemoveWorkspace(String)
-  // Start a fresh conversation in a workspace ("" = the default store).
-  NewChatIn(String)
-  // Archive a conversation: the host moves its durable record into the
-  // store's `archived` twin and the sidebar moves the row under the Archived
-  // group.
-  ArchiveSession(String)
-  // Restore an archived conversation into the live list.
-  UnarchiveSession(String)
+  // Detach a workspace from one device: only the registry entry goes
+  // away — the directory and the sessions inside it stay, so re-adding
+  // restores them.
+  RemoveWorkspace(@interop.ChannelId, String)
+  // Start a fresh conversation in a device's workspace ("" = the default
+  // store); on the console this also focuses that device.
+  NewChatIn(@interop.ChannelId, String)
+  // Archive a conversation on its device: the host moves its durable
+  // record into the store's `archived` twin and the sidebar moves the row
+  // under the Archived group.
+  ArchiveSession(@interop.ChannelId, String)
+  // Restore an archived conversation into its device's live list.
+  UnarchiveSession(@interop.ChannelId, String)
   // The transcript's at-bottom state changed (the user scrolled away from,
   // or back to, the tail). Reported by the DOM scroll watcher.
   TranscriptPinned(Bool)
@@ -1481,6 +1485,20 @@ fn Model::focused_active_workspace(self : Model) -> String {
 fn Model::with_active_workspace(self : Model, workspace : String) -> Model {
   guard self.focused_device() is Some(dev) else { return self }
   self.replace_device({ ..dev, active_workspace: workspace })
+}
+
+///|
+/// The focused device's roster name — the console banner's subject. The
+/// desktop window (no roster) is always its own local host.
+fn Model::focused_device_name(self : Model) -> String {
+  if self.console is Some(console) && self.focused is Remote(id) {
+    for meta in console.roster {
+      if meta.id == id {
+        return meta.name
+      }
+    }
+  }
+  "OpenSeek"
 }
 
 ///|

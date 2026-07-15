@@ -25,6 +25,147 @@ fn session_snapshot_command(
 }
 
 ///|
+/// Move the UI's focus to `channel`: refetch the focused-scoped mirrors
+/// that BridgeReady only loads for the then-focused device (host meta,
+/// host settings, installed skills) and reset their local bookkeeping, so
+/// nothing of the previous device's host bleeds through. The active
+/// conversation is the caller's to place afterwards (an activation or a
+/// rotation); until it does, nothing is selected. A no-op when focus is
+/// already there — or when the page does not hold the channel.
+fn focus_channel(
+  dispatch : @cmd.Emit[Msg],
+  model : Model,
+  channel : @interop.ChannelId,
+) -> (@cmd.Cmd, Model) {
+  guard channel != model.focused && model.device_state(channel) is Some(dev) else {
+    return (@cmd.none, model)
+  }
+  (
+    @cmd.batch([
+      fetch_host_meta(dispatch, channel),
+      fetch_host_settings(dispatch, channel, dev.connection_generation),
+      fetch_installed_skills(dispatch, channel),
+    ]),
+    {
+      ..model,
+      focused: channel,
+      active_session: "",
+      loading_session: "",
+      settings_saves: 0,
+      host_settings_revision: -1,
+      deferred_host_settings: None,
+      legacy_cleanup_pending: false,
+      host_wsl: false,
+      installed_skills: [],
+      completion: None,
+      // Forgetting what was watched makes the post-dispatch panel sync
+      // re-root `fs.watch` against the newly focused host.
+      file_panel: { ..model.file_panel, watching: "" },
+    },
+  )
+}
+
+///|
+/// The OpenSession body against an explicit channel — the caller has
+/// already moved focus there, so `channel == model.focused` throughout.
+fn open_session_on(
+  dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
+  model : Model,
+  session_id : String,
+) -> (@cmd.Cmd, Model) {
+  if session_id == model.active_session {
+    let base = { ..model, screen: Chat, completion: None }
+    // Re-selecting is an explicit catch-up point for writes made by an
+    // idle CLI or another client. It also restarts an exhausted retry
+    // round; an existing request stays single-flight. A fresh chat has no
+    // durable record to read, including when returning here from Skills.
+    match model.find_conversation(channel, session_id) {
+      Some(conv) if !(conv.sync is Reloading(..)) &&
+        model.can_reload_transcript(conv) => {
+        let (next, generation) = base.begin_transcript_reload(conv)
+        let next = { ..next, loading_session: session_id }
+        if generation is Some(generation) {
+          (
+            session_snapshot_command(
+              dispatch, channel, next, session_id, generation, true,
+            ),
+            next,
+          )
+        } else {
+          (@cmd.none, next)
+        }
+      }
+      _ =>
+        (
+          @cmd.none,
+          {
+            ..base,
+            loading_session: if base.loading_session == session_id {
+              session_id
+            } else {
+              ""
+            },
+          },
+        )
+    }
+  } else if model.find_conversation(channel, session_id) is Some(conv) {
+    // Switching focus; the transcript re-pins at the tail. The store is
+    // also re-read behind the switch — the local copy may date from
+    // before a reconnect, or another client may be driving this
+    // conversation — and the current view stays on screen while the
+    // reply is in flight. A failed/ongoing first load also needs to stay
+    // attached even though it has no transcript yet.
+    let reread = model.can_reload_transcript(conv) || !(conv.sync is Synced)
+    let (model, generation) = if reread {
+      model.begin_transcript_reload(conv)
+    } else {
+      (model.replace_conversation(conv), None)
+    }
+    let next = {
+      ..model.activate(channel, session_id),
+      screen: Chat,
+      transcript_pinned: true,
+      loading_session: if generation is Some(_) {
+        session_id
+      } else {
+        ""
+      },
+      completion: None,
+    }.with_active_workspace(workspace_token(conv.workspace))
+    let commands = [scroll_transcript_after_render()]
+    if generation is Some(generation) {
+      commands.push(
+        session_snapshot_command(
+          dispatch, channel, next, session_id, generation, true,
+        ),
+      )
+    }
+    (@cmd.batch(commands), next)
+  } else {
+    // The sidebar item says which store holds the session; opening it
+    // also makes its workspace the active one, so "New chat" follows.
+    let workspace = model.session_workspace(channel, session_id)
+    let (model, generation) = model.begin_transcript_reload(
+      empty_conversation(channel, session_id, workspace~),
+    )
+    let next = { ..model, screen: Chat, loading_session: session_id }.with_active_workspace(
+      workspace,
+    )
+    if generation is Some(generation) {
+      (
+        session_snapshot_command(
+          dispatch, channel, next, session_id, generation, true,
+        ),
+        next,
+      )
+    } else {
+      (@cmd.none, next)
+    }
+  }
+}
+
+///|
 /// Issue a live-session list request with a page-lifetime token. The token is
 /// advanced before the command leaves update, so any older same-connection
 /// reply is stale even if it returns last.
@@ -1489,13 +1630,15 @@ fn update_msg(
       // running in the background and stays one sidebar click away. It lands
       // in the active workspace — the one the on-screen conversation uses.
       (rotate_session(dispatch), { ..model, loading_session: "" })
-    NewChatIn(workspace) =>
+    NewChatIn(channel, workspace) => {
       // A workspace section's own "new chat": the fresh conversation lands in
       // that project, and the workspace stays active for the next one. A new
       // loose chat unfolds the Chats section so its row is visible; a new
       // workspace chat unfolds the Workspaces section for the same reason.
+      // On the console, another device's ＋ first moves focus there.
+      let (focus_cmd, model) = focus_channel(dispatch, model, channel)
       (
-        rotate_session(dispatch),
+        @cmd.batch([focus_cmd, rotate_session(dispatch)]),
         {
           ..model.with_active_workspace(workspace),
           loading_session: "",
@@ -1504,6 +1647,7 @@ fn update_msg(
           workspace.is_empty(),
         },
       )
+    }
     SessionRotated(session_id) => {
       let activated = model.activate(model.focused, session_id)
       // A rotation creates the conversation, so stamp it with the workspace
@@ -1532,15 +1676,16 @@ fn update_msg(
         },
       )
     }
-    PickWorkspace => {
+    PickWorkspace(channel) => {
+      // The picker registers its pick on the focused device, so focus moves
+      // first; the later navigate/confirm messages then follow `focused`.
+      let (focus_cmd, model) = focus_channel(dispatch, model, channel)
       let picker = opening_workspace_picker()
       (
-        browse_directory(
-          dispatch,
-          model.focused,
-          "",
-          generation=picker.generation,
-        ),
+        @cmd.batch([
+          focus_cmd,
+          browse_directory(dispatch, channel, "", generation=picker.generation),
+        ]),
         { ..model, workspace_picker: Some(picker) },
       )
     }
@@ -1619,10 +1764,11 @@ fn update_msg(
         _ => (@cmd.none, model)
       }
     WorkspacePickerClose => (@cmd.none, { ..model, workspace_picker: None })
-    RemoveWorkspace(path) =>
-      (remove_workspace(dispatch, model.focused, path), model)
-    ArchiveSession(session_id) => {
-      guard model.focused_device() is Some(dev) else {
+    RemoveWorkspace(channel, path) =>
+      (remove_workspace(dispatch, channel, path), model)
+    ArchiveSession(channel, session_id) => {
+      // Archiving acts on the row's own device and never moves focus.
+      guard model.device_state(channel) is Some(dev) else {
         return (@cmd.none, model)
       }
       let sessions_request_generation = dev.sessions_request_generation + 1
@@ -1630,7 +1776,7 @@ fn update_msg(
       (
         archive_session(
           dispatch,
-          model.focused,
+          channel,
           session_id,
           dev.connection_generation,
           sessions_request_generation,
@@ -1643,8 +1789,8 @@ fn update_msg(
         }),
       )
     }
-    UnarchiveSession(session_id) => {
-      guard model.focused_device() is Some(dev) else {
+    UnarchiveSession(channel, session_id) => {
+      guard model.device_state(channel) is Some(dev) else {
         return (@cmd.none, model)
       }
       let sessions_request_generation = dev.sessions_request_generation + 1
@@ -1652,7 +1798,7 @@ fn update_msg(
       (
         unarchive_session(
           dispatch,
-          model.focused,
+          channel,
           session_id,
           dev.connection_generation,
           sessions_request_generation,
@@ -1676,119 +1822,26 @@ fn update_msg(
         model.conversation_by_run(model.focused, run_id)
       }
       if conv is Some(conv) {
-        update_msg(dispatch, OpenSession(conv.session_id), model)
+        update_msg(dispatch, OpenSession(conv.device, conv.session_id), model)
       } else {
         (@cmd.none, model)
       }
     }
-    OpenSession(session_id) =>
+    OpenSession(channel, session_id) =>
       // Selecting a conversation always returns to the chat — including
-      // re-selecting the active one from the Skills page.
+      // re-selecting the active one from the Skills page. On the console a
+      // click in another device's group is also the focus switch: the
+      // focused-scoped mirrors refetch, then the open runs on that channel.
       if session_id.is_empty() {
         (@cmd.none, model)
-      } else if session_id == model.active_session {
-        let base = { ..model, screen: Chat, completion: None }
-        // Re-selecting is an explicit catch-up point for writes made by an
-        // idle CLI or another client. It also restarts an exhausted retry
-        // round; an existing request stays single-flight. A fresh chat has no
-        // durable record to read, including when returning here from Skills.
-        match model.find_conversation(model.focused, session_id) {
-          Some(conv) if !(conv.sync is Reloading(..)) &&
-            model.can_reload_transcript(conv) => {
-            let (next, generation) = base.begin_transcript_reload(conv)
-            let next = { ..next, loading_session: session_id }
-            if generation is Some(generation) {
-              (
-                session_snapshot_command(
-                  dispatch,
-                  model.focused,
-                  next,
-                  session_id,
-                  generation,
-                  true,
-                ),
-                next,
-              )
-            } else {
-              (@cmd.none, next)
-            }
-          }
-          _ =>
-            (
-              @cmd.none,
-              {
-                ..base,
-                loading_session: if base.loading_session == session_id {
-                  session_id
-                } else {
-                  ""
-                },
-              },
-            )
-        }
-      } else if model.find_conversation(model.focused, session_id) is Some(conv) {
-        // Switching focus; the transcript re-pins at the tail. The store is
-        // also re-read behind the switch — the local copy may date from
-        // before a reconnect, or another client may be driving this
-        // conversation — and the current view stays on screen while the
-        // reply is in flight. A failed/ongoing first load also needs to stay
-        // attached even though it has no transcript yet.
-        let reread = model.can_reload_transcript(conv) || !(conv.sync is Synced)
-        let (model, generation) = if reread {
-          model.begin_transcript_reload(conv)
-        } else {
-          (model.replace_conversation(conv), None)
-        }
-        let next = {
-          ..model.activate(model.focused, session_id),
-          screen: Chat,
-          transcript_pinned: true,
-          loading_session: if generation is Some(_) {
-            session_id
-          } else {
-            ""
-          },
-          completion: None,
-        }.with_active_workspace(workspace_token(conv.workspace))
-        let commands = [scroll_transcript_after_render()]
-        if generation is Some(generation) {
-          commands.push(
-            session_snapshot_command(
-              dispatch,
-              model.focused,
-              next,
-              session_id,
-              generation,
-              true,
-            ),
-          )
-        }
-        (@cmd.batch(commands), next)
       } else {
-        // The sidebar item says which store holds the session; opening it
-        // also makes its workspace the active one, so "New chat" follows.
-        let workspace = model.session_workspace(model.focused, session_id)
-        let (model, generation) = model.begin_transcript_reload(
-          empty_conversation(model.focused, session_id, workspace~),
-        )
-        let next = { ..model, screen: Chat, loading_session: session_id }.with_active_workspace(
-          workspace,
-        )
-        if generation is Some(generation) {
-          (
-            session_snapshot_command(
-              dispatch,
-              model.focused,
-              next,
-              session_id,
-              generation,
-              true,
-            ),
-            next,
-          )
-        } else {
-          (@cmd.none, next)
+        // A row click that raced its device's removal has nowhere to go.
+        guard model.device_state(channel) is Some(_) else {
+          return (@cmd.none, model)
         }
+        let (focus_cmd, model) = focus_channel(dispatch, model, channel)
+        let (cmd, model) = open_session_on(dispatch, channel, model, session_id)
+        (@cmd.batch([focus_cmd, cmd]), model)
       }
     TranscriptPinned(pinned) =>
       (@cmd.none, { ..model, transcript_pinned: pinned })
@@ -4437,7 +4490,11 @@ test "sessions failure pops a toast without touching the transcript" {
 ///|
 test "open session is a no-op for the current session" {
   let dispatch = test_dispatch()
-  let (_, next) = update(dispatch, OpenSession("desktop-test"), test_model())
+  let (_, next) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-test"),
+    test_model(),
+  )
   inspect(next.active_session, content="desktop-test")
   inspect(next.conversations.length(), content="1")
 }
@@ -4452,8 +4509,16 @@ test "open session keeps live state on screen while re-reading the store" {
     messages: [{ kind: User, content: "background task" }],
   }
   let model = running_model().replace_conversation(background)
-  let (_, once) = update(dispatch, OpenSession("desktop-bg"), model)
-  let (_, twice) = update(dispatch, OpenSession("desktop-bg"), model)
+  let (_, once) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-bg"),
+    model,
+  )
+  let (_, twice) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-bg"),
+    model,
+  )
   inspect(once.active_session, content="desktop-bg")
   // The live state stays on screen; the store re-read happens behind it
   // (this client may have been absent for part of this conversation).
@@ -4752,10 +4817,18 @@ test "SessionsLoaded retries an unconfirmed start after an empty recovery" {
 ///|
 test "open session tracks the latest load and ignores stale replies" {
   let dispatch = test_dispatch()
-  let (_, loading_a) = update(dispatch, OpenSession("desktop-a"), test_model())
+  let (_, loading_a) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-a"),
+    test_model(),
+  )
   inspect(loading_a.active_session, content="desktop-test")
   inspect(loading_a.loading_session, content="desktop-a")
-  let (_, loading_b) = update(dispatch, OpenSession("desktop-b"), loading_a)
+  let (_, loading_b) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-b"),
+    loading_a,
+  )
   inspect(loading_b.loading_session, content="desktop-b")
   let a_items : Array[@transcript.TranscriptItem] = [
     { kind: User, content: "old selection" },
@@ -4801,14 +4874,18 @@ test "reselecting a synced active session reloads idle external writes" {
       { id: "desktop-test", title: Some(""), workspace: "", workspace_name: "" },
     ],
   })
-  let (_, reloading) = update(dispatch, OpenSession("desktop-test"), model)
+  let (_, reloading) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-test"),
+    model,
+  )
   inspect(reloading.loading_session, content="desktop-test")
   guard reloading.active().sync is Reloading(generation=1, attempt=1, ..) else {
     fail("expected active reselect to catch up")
   }
   let (_, still_single_flight) = update(
     dispatch,
-    OpenSession("desktop-test"),
+    OpenSession(@interop.ChannelId::Local, "desktop-test"),
     reloading,
   )
   inspect(still_single_flight.transcript_request_generation, content="1")
@@ -4843,7 +4920,11 @@ test "returning to a fresh active chat does not load a missing session" {
     }),
     screen: Skills,
   }
-  let (_, next) = update(dispatch, OpenSession("desktop-test"), model)
+  let (_, next) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-test"),
+    model,
+  )
   assert_true(next.screen is Chat)
   inspect(next.loading_session, content="")
   inspect(next.transcript_request_generation, content="0")
@@ -4856,7 +4937,7 @@ test "pruning and reopening cannot reuse a transcript request token" {
   let dispatch = test_dispatch()
   let (_, opening) = update(
     dispatch,
-    OpenSession("desktop-pruned"),
+    OpenSession(@interop.ChannelId::Local, "desktop-pruned"),
     test_model(),
   )
   guard opening.find_conversation(@interop.ChannelId::Local, "desktop-pruned")
@@ -4869,7 +4950,11 @@ test "pruning and reopening cannot reuse a transcript request token" {
     pruned.find_conversation(@interop.ChannelId::Local, "desktop-pruned")
     is None,
   )
-  let (_, reopened) = update(dispatch, OpenSession("desktop-pruned"), pruned)
+  let (_, reopened) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-pruned"),
+    pruned,
+  )
   guard reopened.find_conversation(@interop.ChannelId::Local, "desktop-pruned")
     is Some(second) &&
     second.sync is Reloading(generation=2, ..) else {
@@ -4914,7 +4999,7 @@ test "archive removal and reopening cannot reuse a transcript request token" {
   let dispatch = test_dispatch()
   let (_, opening) = update(
     dispatch,
-    OpenSession("desktop-archived"),
+    OpenSession(@interop.ChannelId::Local, "desktop-archived"),
     test_model(),
   )
   let (_, archived) = update(
@@ -4929,7 +5014,7 @@ test "archive removal and reopening cannot reuse a transcript request token" {
   let (_, restored) = update(dispatch, archived_loaded([]), archived)
   let (_, reopened) = update(
     dispatch,
-    OpenSession("desktop-archived"),
+    OpenSession(@interop.ChannelId::Local, "desktop-archived"),
     restored,
   )
   guard reopened.find_conversation(
@@ -4963,7 +5048,11 @@ test "archive removal and reopening cannot reuse a transcript request token" {
 ///|
 test "an abandoned session load retries silently" {
   let dispatch = test_dispatch()
-  let (_, loading) = update(dispatch, OpenSession("desktop-a"), test_model())
+  let (_, loading) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-a"),
+    test_model(),
+  )
   let (_, abandoned) = update(dispatch, NewChat, loading)
   let (_, next) = update_dev(
     dispatch,
@@ -4982,7 +5071,11 @@ test "an abandoned session load retries silently" {
 ///|
 test "a foreground load preserves state through retries and reports exhaustion" {
   let dispatch = test_dispatch()
-  let (_, loading) = update(dispatch, OpenSession("desktop-a"), test_model())
+  let (_, loading) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-a"),
+    test_model(),
+  )
   let failure = SessionLoadFailed(
     session="desktop-a",
     message="failed to load session desktop-a: no such file",
@@ -5122,7 +5215,11 @@ test "session loaded swaps the active conversation onto the stored session" {
     streaming_response: "leftover",
     messages: [{ kind: User, content: "old chat" }],
   })
-  let (_, loading) = update(dispatch, OpenSession("desktop-stored"), model)
+  let (_, loading) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-stored"),
+    model,
+  )
   let items : Array[@transcript.TranscriptItem] = [
     { kind: User, content: "stored question" },
     { kind: Assistant(false), content: "stored answer" },
@@ -5170,7 +5267,7 @@ test "session loaded adopts the store transcript and keeps live run state" {
   // The active conversation runs; loading some other stored session is fine.
   let (_, loading_other) = update(
     dispatch,
-    OpenSession("desktop-stored"),
+    OpenSession(@interop.ChannelId::Local, "desktop-stored"),
     model,
   )
   let (_, other) = update_dev(
@@ -6692,10 +6789,18 @@ test "the composer draft stays with its conversation across a switch" {
     messages: [{ kind: User, content: "earlier" }],
   })
   let (_, drafted) = update(dispatch, TaskChanged("half a thought"), model)
-  let (_, switched) = update(dispatch, OpenSession("desktop-second"), drafted)
+  let (_, switched) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-second"),
+    drafted,
+  )
   // The other conversation starts with its own (empty) draft …
   inspect(switched.active().task, content="")
-  let (_, back) = update(dispatch, OpenSession("desktop-test"), switched)
+  let (_, back) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-test"),
+    switched,
+  )
   // … and the original draft is still waiting where it was typed.
   inspect(back.active().task, content="half a thought")
 }
@@ -7920,7 +8025,7 @@ test "a runs snapshot cannot retire a steer submitted after its frontier" {
   }
   let (_, switched) = update(
     dispatch,
-    OpenSession("desktop-other"),
+    OpenSession(@interop.ChannelId::Local, "desktop-other"),
     after_r2.replace_conversation(other),
   )
   guard switched.find_conversation(@interop.ChannelId::Local, "desktop-test")
@@ -9547,14 +9652,19 @@ test "explicit user actions re-pin the transcript" {
     ),
     transcript_pinned: false,
   }
-  let (_, switched) = update(dispatch, OpenSession("desktop-other"), two)
+  let (_, switched) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-other"),
+    two,
+  )
   inspect(switched.transcript_pinned, content="true")
 
   // So does loading a stored session or rotating to a fresh one.
-  let (_, loading_old) = update(dispatch, OpenSession("desktop-old"), {
-    ..test_model(),
-    transcript_pinned: false,
-  })
+  let (_, loading_old) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-old"),
+    { ..test_model(), transcript_pinned: false },
+  )
   let (_, loaded) = update_dev(
     dispatch,
     SessionLoaded(
@@ -9615,7 +9725,11 @@ test "selecting a conversation returns from the skills page to the chat" {
   assert_true(opened.screen is Skills)
 
   // Re-selecting the active conversation is enough to switch back…
-  let (_, back) = update(dispatch, OpenSession("desktop-test"), opened)
+  let (_, back) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-test"),
+    opened,
+  )
   assert_true(back.screen is Chat)
 
   // …and so is rotating to a fresh one.
@@ -10668,7 +10782,11 @@ test "reopening an active failed reload retries and preserves other local notice
     ],
   })
   let model = { ..model, transcript_request_generation: 1 }
-  let (_, reopened) = update(dispatch, OpenSession("desktop-test"), model)
+  let (_, reopened) = update(
+    dispatch,
+    OpenSession(@interop.ChannelId::Local, "desktop-test"),
+    model,
+  )
   inspect(reopened.loading_session, content="desktop-test")
   guard reopened.active().sync
     is Reloading(generation=2, attempt=1, buffered~, ..) else {

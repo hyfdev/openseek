@@ -116,13 +116,16 @@ fn conversation_title(conv : Conversation) -> String {
 fn session_row(
   dispatch : @cmd.Emit[Msg],
   model : Model,
+  channel : @interop.ChannelId,
   session_id : String,
   label : String,
   archivable? : Bool = false,
   nested? : Bool = false,
 ) -> @html.Html {
-  let active = session_id == model.active_session
-  let conv = model.find_conversation(model.focused, session_id)
+  // Session ids can collide across devices, so the accent pill needs the
+  // channel to agree too.
+  let active = channel == model.focused && session_id == model.active_session
+  let conv = model.find_conversation(channel, session_id)
   let running = conv is Some(conv) && conv.is_running()
   // The row's status dot: pulsing while a run is in flight, then — when the
   // run finished off screen — settling into a solid dot (accent for success,
@@ -172,7 +175,7 @@ fn session_row(
         attrs=@html.Attrs::build().on_click(event => {
           // The row itself opens the session; the archive click must not.
           event.stop_propagation()
-          dispatch(ArchiveSession(session_id))
+          dispatch(ArchiveSession(channel, session_id))
         }),
         icon(icon_archive),
       ),
@@ -184,20 +187,128 @@ fn session_row(
   @html.div(
     class~,
     title=session_id,
-    on_click=dispatch(OpenSession(session_id)),
+    on_click=dispatch(OpenSession(channel, session_id)),
     children,
   )
 }
 
 ///|
-/// Sidebar rows: conversations that only exist in this app run (no turn has
-/// reached the store yet) first, then the engine's durable sessions, newest
-/// first. Rows stay clickable while runs are active — switching between
-/// conversations mid-run is the point of keeping them concurrent.
+/// Sidebar rows. The desktop window lists its one Local device with no
+/// group chrome; the console renders one group per roster device — header,
+/// then that device's sections — in the roster's order.
 fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
-  // The sidebar lists the focused device's collections; an absent device
-  // (a console whose roster has not landed yet) reads as empty.
-  let dev = model.focused_device().unwrap_or(empty_device_state(model.focused))
+  match model.console {
+    None => {
+      let dev = model
+        .focused_device()
+        .unwrap_or(empty_device_state(model.focused))
+      device_section_rows(dispatch, model, dev)
+    }
+    Some(console) => console_session_rows(dispatch, model, console)
+  }
+}
+
+///|
+/// The console sidebar: the roster's device groups, with the load/failure
+/// and no-devices states as plain rows in their place.
+fn console_session_rows(
+  dispatch : @cmd.Emit[Msg],
+  model : Model,
+  console : ConsoleState,
+) -> Array[@html.Html] {
+  let rows : Array[@html.Html] = []
+  match console.roster_sync {
+    RosterLoading =>
+      if console.roster.is_empty() {
+        rows.push(dim_row("Loading devices…"))
+      }
+    RosterFailed(message) => rows.push(dim_row(message))
+    RosterReady =>
+      if console.roster.is_empty() {
+        rows.push(
+          dim_row(
+            "No devices yet — open OpenSeek Desktop and sign in under Settings → Remote access.",
+          ),
+        )
+      }
+  }
+  for meta in console.roster {
+    rows.push(device_group_header(model, meta))
+    match model.device_state(Remote(meta.id)) {
+      Some(dev) =>
+        for row in device_section_rows(dispatch, model, dev) {
+          rows.push(row)
+        }
+      None =>
+        // No channel: the device is offline (or just came online and its
+        // state lands with the next refresh) — the header dot says which.
+        rows.push(
+          dim_row("Offline — its chats will list again when it reconnects."),
+        )
+    }
+  }
+  rows
+}
+
+///|
+fn dim_row(text : String) -> @html.Html {
+  @html.div(class="conversation-row placeholder", [
+    @html.span(class="sidebar-label", text),
+  ])
+}
+
+///|
+/// One roster device's group header: the online/bridge dot, the name, and
+/// the connection state. Focus follows session and new-chat clicks inside
+/// the group, so the header itself is inert chrome (the ⋯ device menu
+/// arrives with device management).
+fn device_group_header(model : Model, meta : DeviceMeta) -> @html.Html {
+  let dev = model.device_state(Remote(meta.id))
+  let connected = dev is Some(dev) && dev.bridge is Connected
+  let dot = if meta.online && connected {
+    "device-dot online"
+  } else {
+    "device-dot"
+  }
+  let children : Array[@html.Html] = [
+    @html.span(class=dot, ""),
+    @html.span(class="sidebar-label device-name", meta.name),
+  ]
+  let status : String? = if !meta.online {
+    Some("offline")
+  } else {
+    match dev {
+      Some(dev) =>
+        match dev.bridge {
+          Connected => None
+          Connecting => Some("connecting…")
+          BridgeLost(_) => Some("reconnecting…")
+        }
+      None => Some("connecting…")
+    }
+  }
+  if status is Some(text) {
+    children.push(@html.span(class="device-status", text))
+  }
+  let title = match meta.hostname {
+    Some(hostname) => "\{meta.name} — \{hostname}"
+    None => meta.name
+  }
+  @html.div(class="sidebar-heading device-heading", title~, children)
+}
+
+///|
+/// One device's sections: conversations that only exist in this app run (no
+/// turn has reached the store yet) first, then the engine's durable
+/// sessions, newest first. Rows stay clickable while runs are active —
+/// switching between conversations mid-run is the point of keeping them
+/// concurrent. The section-collapse flags are page-global, shared by every
+/// group on the console (a per-device fold is a possible follow-up).
+fn device_section_rows(
+  dispatch : @cmd.Emit[Msg],
+  model : Model,
+  dev : DeviceState,
+) -> Array[@html.Html] {
   let rows : Array[@html.Html] = []
   let listed = (id : String) => {
     for item in dev.sessions {
@@ -227,7 +338,7 @@ fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
     section_heading(
       dispatch,
       "Workspaces",
-      PickWorkspace,
+      PickWorkspace(dev.channel),
       action_title="Add a workspace",
       toggle=ToggleWorkspacesSection,
       collapsed=model.workspaces_collapsed,
@@ -235,12 +346,13 @@ fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
   )
   if !model.workspaces_collapsed {
     for path in dev.workspaces {
-      rows.push(workspace_row(dispatch, model, path))
+      rows.push(workspace_row(dispatch, model, dev, path))
       let before = rows.length()
       push_group_rows(
         rows,
         dispatch,
         model,
+        dev,
         path,
         listed~,
         archived~,
@@ -259,14 +371,14 @@ fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
     section_heading(
       dispatch,
       "Chats",
-      NewChatIn(""),
+      NewChatIn(dev.channel, ""),
       action_title="New chat outside any workspace",
       toggle=ToggleChatsSection,
       collapsed=model.chats_collapsed,
     ),
   )
   if !model.chats_collapsed {
-    push_group_rows(rows, dispatch, model, "", listed~, archived~)
+    push_group_rows(rows, dispatch, model, dev, "", listed~, archived~)
   }
   // Archived conversations fold behind a collapsed group at the end of the
   // list. Their records live in the store's `archived` twin, so they come
@@ -274,7 +386,7 @@ fn session_rows(dispatch : @cmd.Emit[Msg], model : Model) -> Array[@html.Html] {
   // restore control instead of the archive one.
   let archived_rows : Array[@html.Html] = []
   for item in dev.archived {
-    archived_rows.push(archived_row(dispatch, item))
+    archived_rows.push(archived_row(dispatch, dev.channel, item))
   }
   if archived_rows.length() > 0 {
     rows.push(
@@ -298,6 +410,7 @@ fn push_group_rows(
   rows : Array[@html.Html],
   dispatch : @cmd.Emit[Msg],
   model : Model,
+  dev : DeviceState,
   workspace : String,
   listed~ : (String) -> Bool,
   archived~ : (String) -> Bool,
@@ -307,7 +420,8 @@ fn push_group_rows(
   // "New chat" is already on screen, and a row for it is just noise until
   // its first send.
   for conv in model.conversations.rev_iter() {
-    if workspace_token(conv.workspace) == workspace &&
+    if conv.device == dev.channel &&
+      workspace_token(conv.workspace) == workspace &&
       conv.has_begun() &&
       !listed(conv.session_id) &&
       !archived(conv.session_id) {
@@ -315,6 +429,7 @@ fn push_group_rows(
         session_row(
           dispatch,
           model,
+          dev.channel,
           conv.session_id,
           conversation_title(conv),
           nested~,
@@ -322,19 +437,27 @@ fn push_group_rows(
       )
     }
   }
-  let dev = model.focused_device().unwrap_or(empty_device_state(model.focused))
   for item in dev.sessions {
     if item.workspace != workspace || archived(item.id) {
       continue
     }
-    let label = if model.find_conversation(model.focused, item.id) is Some(conv) &&
+    let label = if model.find_conversation(dev.channel, item.id) is Some(conv) &&
+      dev.channel == model.focused &&
       item.id == model.active_session {
       conversation_title(conv)
     } else {
       session_item_label(item)
     }
     rows.push(
-      session_row(dispatch, model, item.id, label, archivable=true, nested~),
+      session_row(
+        dispatch,
+        model,
+        dev.channel,
+        item.id,
+        label,
+        archivable=true,
+        nested~,
+      ),
     )
   }
 }
@@ -389,10 +512,11 @@ fn section_heading(
 fn workspace_row(
   dispatch : @cmd.Emit[Msg],
   model : Model,
+  dev : DeviceState,
   path : String,
 ) -> @html.Html {
   let mut class = "workspace-row"
-  if path == model.focused_active_workspace() {
+  if dev.channel == model.focused && path == dev.active_workspace {
     class = class + " active"
     if model.composing_new_chat() {
       class = class + " composing"
@@ -407,7 +531,7 @@ fn workspace_row(
       title="Detach this workspace — its files and sessions stay",
       attrs=@html.Attrs::build().on_click(event => {
         event.stop_propagation()
-        dispatch(RemoveWorkspace(path))
+        dispatch(RemoveWorkspace(dev.channel, path))
       }),
       icon(icon_close),
     ),
@@ -417,7 +541,7 @@ fn workspace_row(
       title="New chat in this workspace",
       attrs=@html.Attrs::build().on_click(event => {
         event.stop_propagation()
-        dispatch(NewChatIn(path))
+        dispatch(NewChatIn(dev.channel, path))
       }),
       icon(icon_add),
     ),
@@ -443,6 +567,7 @@ fn session_item_label(item : @transcript.SessionListItem) -> String {
 /// brings it back is the unarchive control.
 fn archived_row(
   dispatch : @cmd.Emit[Msg],
+  channel : @interop.ChannelId,
   item : @transcript.SessionListItem,
 ) -> @html.Html {
   @html.div(class="conversation-row archived", title=item.id, [
@@ -453,7 +578,7 @@ fn archived_row(
       title="Restore this conversation to the sidebar",
       attrs=@html.Attrs::build().on_click(event => {
         event.stop_propagation()
-        dispatch(UnarchiveSession(item.id))
+        dispatch(UnarchiveSession(channel, item.id))
       }),
       icon(icon_arrow_up),
     ),
@@ -1336,6 +1461,27 @@ fn mention_tray(dispatch : @cmd.Emit[Msg], conv : Conversation) -> @html.Html {
 }
 
 ///|
+
+///|
+/// The console's connection banner: a permanent first child of the composer
+/// whose class flips visibility — inserting it conditionally would shift
+/// the composer-inner index and rebuild the textarea, dropping focus the
+/// moment the connection hiccups mid-typing. Desktop keeps the full-screen
+/// overlay instead and renders this hidden.
+fn connection_banner(model : Model) -> @html.Html {
+  let visible = model.console is Some(_) &&
+    model.bridge_state() is BridgeLost(_)
+  if visible {
+    @html.div(
+      class="composer-banner",
+      "Can't reach \{model.focused_device_name()} — reconnecting…",
+    )
+  } else {
+    @html.div(class="composer-banner hidden", "")
+  }
+}
+
+///|
 fn composer_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
   let conv = model.active()
   let transcript_ready = conv.sync is Synced &&
@@ -1408,7 +1554,9 @@ fn composer_view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
       ),
     )
   }
-  let children : Array[@html.Html] = []
+  // Permanent first child (see `connection_banner`) so the later children's
+  // indices never shift when the connection drops mid-typing.
+  let children : Array[@html.Html] = [connection_banner(model)]
   if !conv.pending_steers().is_empty() {
     children.push(pending_steers_panel(conv))
   }
@@ -2456,10 +2604,12 @@ fn view(dispatch : @cmd.Emit[Msg], model : Model) -> @html.Html {
   if model.workspace_picker is Some(picker) {
     children.push(workspace_picker_modal(dispatch, picker))
   }
-  // A lost connection covers everything: with no event stream and every API
-  // call failing, the app behind it can do nothing, so an honest dead-end
-  // beats a half-broken UI.
-  if model.bridge_state() is BridgeLost(message) {
+  // On the desktop a lost connection covers everything: with no event
+  // stream and every API call failing, the app behind it can do nothing,
+  // so an honest dead-end beats a half-broken UI. The console never gets
+  // the overlay — its other devices stay usable, so the drop reads as the
+  // group header's status plus the composer banner.
+  if model.is_desktop && model.bridge_state() is BridgeLost(message) {
     children.push(bridge_lost_overlay(message))
   }
   @html.div(

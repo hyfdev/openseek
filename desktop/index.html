@@ -816,6 +816,45 @@
         line-height: 20px;
       }
 
+      /* one roster device's group header on the console sidebar */
+      .device-heading {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 10px;
+        text-transform: none;
+        letter-spacing: normal;
+      }
+      .device-heading .device-name {
+        flex: 0 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--ink-1);
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .device-dot {
+        flex: none;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--ink-3);
+        opacity: 0.5;
+      }
+      .device-dot.online {
+        background: var(--accent);
+        opacity: 1;
+      }
+      .device-status {
+        flex: none;
+        color: var(--ink-3);
+        font-size: 10.5px;
+        letter-spacing: normal;
+        text-transform: none;
+      }
+
       .conversation-row {
         display: flex;
         align-items: center;
@@ -2071,6 +2110,22 @@
       }
 
       /* transient notice docked above the composer (e.g. compaction) */
+      /* the console's connection banner: a permanent composer child whose
+         class flips visibility, so the textarea's index never shifts */
+      .composer-banner {
+        max-width: 820px;
+        margin: 0 auto 8px;
+        padding: 6px 12px;
+        border: 1px solid var(--warn);
+        border-radius: var(--radius);
+        background: var(--surface-2);
+        color: var(--ink-1);
+        font-size: 12.5px;
+      }
+      .composer-banner.hidden {
+        display: none;
+      }
+
       .composer-notice {
         display: flex;
         align-items: center;

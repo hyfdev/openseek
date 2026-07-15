@@ -389,6 +389,62 @@ test "a refreshed roster retires revoked devices and refocuses a survivor" {
 }
 
 ///|
+test "opening another device's session moves focus and resets the mirrors" {
+  let dispatch = test_dispatch()
+  let (_, signed) = update(
+    dispatch,
+    Console(MeLoaded(login="o", avatar="")),
+    console_test_model(),
+  )
+  let metas : Array[DeviceMeta] = [
+    { id: "d_a", name: "A", hostname: None, online: true },
+    { id: "d_b", name: "B", hostname: None, online: true },
+  ]
+  let (_, listed) = update(dispatch, Console(RosterLoaded(metas)), signed)
+  assert_true(listed.focused == Remote("d_a"))
+  let seeded = {
+    ..listed.replace_conversation(
+      empty_conversation(@interop.ChannelId::Remote("d_b"), "s-b"),
+    ),
+    host_wsl: true,
+  }
+  let (_, opened) = update(dispatch, OpenSession(Remote("d_b"), "s-b"), seeded)
+  assert_true(opened.focused == Remote("d_b"))
+  inspect(opened.active_session, content="s-b")
+  // The focused-scoped mirror reset rode the switch.
+  inspect(opened.host_wsl, content="false")
+  // Re-opening on the already-focused device leaves the mirrors alone.
+  let (_, again) = update(dispatch, OpenSession(Remote("d_b"), "s-b"), {
+    ..opened,
+    host_wsl: true,
+  })
+  inspect(again.host_wsl, content="true")
+}
+
+///|
+test "a row click that raced its device's removal is dropped" {
+  let dispatch = test_dispatch()
+  let (_, signed) = update(
+    dispatch,
+    Console(MeLoaded(login="o", avatar="")),
+    console_test_model(),
+  )
+  let metas : Array[DeviceMeta] = [
+    { id: "d_a", name: "A", hostname: None, online: true },
+  ]
+  let (_, listed) = update(dispatch, Console(RosterLoaded(metas)), signed)
+  let (_, next) = update(dispatch, OpenSession(Remote("gone"), "s-x"), listed)
+  assert_true(next.focused == Remote("d_a"))
+  inspect(
+    next.conversations
+    .iter()
+    .filter(conv => conv.device == Remote("gone"))
+    .count(),
+    content="0",
+  )
+}
+
+///|
 test "a roster failure reports without leaving the signed-in frame" {
   let dispatch = test_dispatch()
   let (_, signed) = update(
